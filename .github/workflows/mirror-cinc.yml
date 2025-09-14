@@ -1,7 +1,5 @@
 name: Mirror Cinc Packages to GHCR
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       min_version:
