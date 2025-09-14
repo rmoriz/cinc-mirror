@@ -441,8 +441,23 @@ main() {
                 log_info "Number of files: $(echo "$files" | wc -l)"
 
                 for file in $files; do
-                    log_info "Loop iteration - file: '$file' (length: ${#file})"
+                    log_info "Processing file: $file"
+
+                    # Skip if file is empty
                     [ -z "$file" ] && log_info "WARNING: Empty file variable!" && continue
+
+                    # Skip symlinks (files containing ->)
+                    if [[ "$file" == *' -> '* ]]; then
+                        log_info "Skipping symlink: $file"
+                        continue
+                    fi
+
+                    # Skip metadata files for now (we'll handle them separately)
+                    if [[ "$file" == *.metadata.json ]]; then
+                        log_info "Skipping metadata file: $file"
+                        continue
+                    fi
+
                     log_info "About to increment total_files (current: $total_files)"
                     if [ -z "${total_files+x}" ]; then
                         log_error "total_files variable is not set!"
