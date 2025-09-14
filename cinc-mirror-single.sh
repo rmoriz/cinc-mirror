@@ -10,13 +10,14 @@ CHANNEL="${CHANNEL:-stable}"
 PROJECT="${PROJECT:-cinc}"
 VERSIONS="${VERSIONS:-18.8.11}"
 FTP_BASE="ftp.osuosl.org"
+HTTPS_BASE="https://downloads.cinc.sh/files"
 TARGET_REGISTRY="ghcr.io"
 TARGET_ORG="${TARGET_ORG:-rmoriz}"
 TARGET_REPO="${TARGET_REPO:-cinc-mirror}"
 
 # For prototyping - limit to debian/13
 PLATFORM_FILTER="${PLATFORM_FILTER:-debian}"
-PLATFORM_VERSION_FILTER="${PLATFORM_VERSION_FILTER:-13}"
+PLATFORM_VERSION_FILTER="${PLATFORM_VERSION_FILTER:-*}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -73,15 +74,28 @@ parse_metadata() {
     fi
 }
 
-# Download file from FTP (plain FTP; server does not support FTPS/AUTH TLS)
+# Download file from FTP or HTTPS (use HTTPS for metadata.json files for security)
 download_file() {
     local ftp_path="$1"
     local local_path="$2"
-    
+
     mkdir -p "$(dirname "$local_path")"
-    
-    log_info "Downloading (plain FTP): $ftp_path"
-    local url="ftp://$FTP_BASE/$ftp_path"
+
+    local url
+    local protocol
+
+    # Use HTTPS for metadata.json files for security
+    if [[ "$ftp_path" == *.metadata.json ]]; then
+        # Remove the "pub/cinc/files/" prefix for HTTPS URLs
+        local https_path="${ftp_path#pub/cinc/files/}"
+        url="$HTTPS_BASE/$https_path"
+        protocol="HTTPS"
+    else
+        url="ftp://$FTP_BASE/$ftp_path"
+        protocol="FTP"
+    fi
+
+    log_info "Downloading ($protocol): $ftp_path"
     local cmd="curl -s $url -o $local_path"
     log_info "Executing: $cmd"
     if curl -s "$url" -o "$local_path"; then
@@ -89,6 +103,61 @@ download_file() {
         return 0
     else
         log_error "Failed to download: $ftp_path"
+        return 1
+    fi
+}
+
+# Check if blob already exists in GHCR
+check_blob_exists() {
+    local sha256="$1"
+    local version="$2"
+    local platform="$3"
+    local platform_version="$4"
+    local machine="$5"
+
+    local tag="$version-$platform-$platform_version-$machine"
+    local oci_ref="$TARGET_REGISTRY/$TARGET_ORG/$TARGET_REPO/$PROJECT:$tag"
+    local blob_digest="sha256:$sha256"
+
+    log_info "Checking if blob $blob_digest already exists in registry"
+
+    # Construct the blob URL directly (similar to fetch-blob.sh)
+    local blob_url="https://$TARGET_REGISTRY/v2/$TARGET_ORG/$TARGET_REPO/$PROJECT/blobs/$blob_digest"
+
+    # Get authentication token if needed (similar to fetch-blob.sh)
+    local token=""
+    local repo_path="$TARGET_ORG/$TARGET_REPO/$PROJECT"
+    local auth_url="https://$TARGET_REGISTRY/token?service=$TARGET_REGISTRY&scope=repository:$repo_path:pull"
+
+    local token_response
+    token_response=$(curl -s "$auth_url" 2>/dev/null || echo "")
+    if [ -n "$token_response" ]; then
+        token=$(echo "$token_response" | grep -o '"token":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
+    fi
+
+    # Make a HEAD request to check if the blob exists
+    local head_response
+    local curl_exit_code
+
+    if [ -n "$token" ]; then
+        head_response=$(curl -s -I -H "Authorization: Bearer $token" "$blob_url" 2>/dev/null)
+        curl_exit_code=$?
+    else
+        head_response=$(curl -s -I "$blob_url" 2>/dev/null)
+        curl_exit_code=$?
+    fi
+
+    # Debug: log the response
+    local status_line=$(echo "$head_response" | head -1)
+    log_info "HEAD response: $status_line (curl exit: $curl_exit_code)"
+
+    # Check for successful response (200) with proper content-type indicating it's actually a blob
+    if echo "$status_line" | grep -q "200" && echo "$head_response" | grep -q "content-type.*tar"; then
+        log_info "Blob $blob_digest already exists in registry"
+        return 0
+    else
+        # Any non-200 response or missing content-type means blob doesn't exist
+        log_info "Blob $blob_digest not found in registry ($status_line)"
         return 1
     fi
 }
@@ -237,7 +306,13 @@ process_version() {
                         
                         if [ -n "$basename" ] && [ -n "$sha256" ]; then
                             log_info "Metadata parsed - basename: $basename, sha256: $sha256"
-                            
+
+                            # Check if blob already exists in GHCR
+                            if check_blob_exists "$sha256" "$version" "$platform" "$platform_version" "$machine"; then
+                                log_info "Skipping download of $basename - blob already exists in registry"
+                                continue
+                            fi
+
                             # Download the actual file
                             local file_path="$ftp_base_path/$platform/$platform_version/$basename"
                             local local_file="./temp_$basename"
@@ -303,18 +378,39 @@ main() {
         log_info "Getting all available versions..."
         local all_versions
         all_versions=$(get_ftp_listing "pub/cinc/files/$CHANNEL/$PROJECT")
-        
+
         for version in $all_versions; do
             process_version "$version"
         done
     else
-        # Process specified versions (comma-separated)
-        IFS=',' read -ra VERSION_ARRAY <<< "$VERSIONS"
-        for version in "${VERSION_ARRAY[@]}"; do
-            # Trim whitespace
-            version=$(echo "$version" | xargs)
-            process_version "$version"
-        done
+        # Check if VERSIONS contains wildcards
+        if [[ "$VERSIONS" == *"*"* ]]; then
+            # Process wildcard patterns
+            log_info "Processing wildcard pattern: $VERSIONS"
+            local all_versions
+            all_versions=$(get_ftp_listing "pub/cinc/files/$CHANNEL/$PROJECT")
+
+            # Convert wildcard pattern to regex
+            local pattern="${VERSIONS//./\\.}"  # Escape dots
+            pattern="${pattern//\*/.*}"         # Convert * to .*
+
+            log_info "Using regex pattern: ^$pattern$"
+
+            for version in $all_versions; do
+                if [[ "$version" =~ ^$pattern$ ]]; then
+                    log_info "Version $version matches pattern $VERSIONS"
+                    process_version "$version"
+                fi
+            done
+        else
+            # Process specified versions (comma-separated)
+            IFS=',' read -ra VERSION_ARRAY <<< "$VERSIONS"
+            for version in "${VERSION_ARRAY[@]}"; do
+                # Trim whitespace
+                version=$(echo "$version" | xargs)
+                process_version "$version"
+            done
+        fi
     fi
     
     log_info "Mirror process completed"
@@ -327,7 +423,7 @@ usage() {
     echo "Options:"
     echo "  CHANNEL=<channel>              Set channel (default: stable)"
     echo "  PROJECT=<project>              Set project (default: cinc)"
-    echo "  VERSIONS=<versions>            Set versions (default: 18.8.11, use '*' for all)"
+    echo "  VERSIONS=<versions>            Set versions (default: 18.8.11, use '*' for all, or wildcards like '18.*')"
     echo "  TARGET_ORG=<org>               Set target GitHub org (default: rmoriz)"
     echo "  TARGET_REPO=<repo>             Set target repository (default: cinc-mirror)"
     echo "  PLATFORM_FILTER=<platform>    Set platform filter (default: debian)"
@@ -336,6 +432,7 @@ usage() {
     echo "Examples:"
     echo "  $0"
     echo "  VERSIONS='18.8.11,18.8.9' $0"
+    echo "  VERSIONS='18.*' $0"
     echo "  VERSIONS='*' PLATFORM_FILTER='*' PLATFORM_VERSION_FILTER='*' $0"
 }
 
