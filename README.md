@@ -22,13 +22,9 @@ curl -sSL https://cinc-mirror.github.io/install.sh | bash
 - `install.sh` - Main installation script, hosted at https://cinc-mirror.github.io/install.sh
 - `install-debian13-arm.sh` - Debian 13 ARM-specific installer (just for testing)
 - `cinc-mirror-single.sh` - Single package mirror script
-- `fetch-blob.sh` - Blob fetching utility (example how to download a blob by sha256 hash)
+- `fetch-blob.sh` - Blob fetching example using curl (example how to download a blob by sha256 hash). If you are serious, just get [ORAS](https://oras.land/)
 
-## GitHub Actions
-
-This repository uses automated workflows for:
-- Mirroring CINC packages (`mirror-cinc.yml`)
-- Cleaning up old packages (`delete-packages.yml`)
+## GitHub Actions (not yet)
 
 ## License
 
