@@ -38,36 +38,50 @@ jobs:
           PACKAGE_NAME="cinc-packages"
           PACKAGE_TYPE="container"
 
-          echo "Listing packages for user: $USER"
+          echo "Searching for package: $PACKAGE_NAME for user: $USER"
 
-          # Get package details (user packages don't have IDs like org packages)
-          PACKAGE_INFO=$(gh api "/users/$USER/packages?package_type=$PACKAGE_TYPE" --jq ".[] | select(.name == \"$PACKAGE_NAME\")" || echo "")
+          # Check if package exists with proper error handling
+          if ! gh api "/users/$USER/packages?package_type=$PACKAGE_TYPE" --jq ".[] | select(.name == \"$PACKAGE_NAME\")" > /tmp/package_info 2>/dev/null; then
+            echo "Failed to list packages or package not found."
+            exit 0
+          fi
 
-          if [ -z "$PACKAGE_INFO" ]; then
+          if [ ! -s /tmp/package_info ]; then
             echo "Package $PACKAGE_NAME not found for user $USER."
             exit 0
           fi
 
           echo "Found package: $PACKAGE_NAME"
 
-          # List versions
-          VERSIONS=$(gh api "/users/$USER/packages/$PACKAGE_TYPE/$PACKAGE_NAME/versions" --jq '.[].id' || echo "")
+          # List versions with proper error handling
+          if ! gh api "/users/$USER/packages/$PACKAGE_TYPE/$PACKAGE_NAME/versions" --jq '.[].id' > /tmp/versions 2>/dev/null; then
+            echo "Failed to list versions or package has no versions."
+            exit 0
+          fi
 
-          if [ -z "$VERSIONS" ]; then
+          if [ ! -s /tmp/versions ]; then
             echo "No versions found for package $PACKAGE_NAME."
             exit 0
           fi
 
-          echo "Found $(echo "$VERSIONS" | wc -l) versions to delete"
+          VERSION_COUNT=$(wc -l < /tmp/versions)
+          echo "Found $VERSION_COUNT versions to delete"
 
           # Delete each version
-          for VERSION_ID in $VERSIONS; do
-            echo "Deleting version ID: $VERSION_ID"
-            if gh api -X DELETE "/users/$USER/packages/$PACKAGE_TYPE/$PACKAGE_NAME/versions/$VERSION_ID"; then
-              echo "Successfully deleted version ID: $VERSION_ID"
+          while read -r VERSION_ID; do
+            if [ -n "$VERSION_ID" ] && [[ "$VERSION_ID" =~ ^[0-9]+$ ]]; then
+              echo "Deleting version ID: $VERSION_ID"
+              if gh api -X DELETE "/users/$USER/packages/$PACKAGE_TYPE/$PACKAGE_NAME/versions/$VERSION_ID" 2>/dev/null; then
+                echo "Successfully deleted version ID: $VERSION_ID"
+              else
+                echo "Failed to delete version ID: $VERSION_ID (may already be deleted)"
+              fi
             else
-              echo "Failed to delete version ID: $VERSION_ID (may already be deleted)"
+              echo "Skipping invalid version ID: $VERSION_ID"
             fi
-          done
+          done < /tmp/versions
 
-          echo "All versions of $PACKAGE_NAME deleted from user $USER account."
+          # Clean up temp files
+          rm -f /tmp/package_info /tmp/versions
+
+          echo "All versions of $PACKAGE_NAME processed for user $USER account."
