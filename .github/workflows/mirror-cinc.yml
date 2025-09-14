@@ -17,10 +17,44 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Test mirror workflow
+    - name: Make scripts executable
       run: |
-        echo "🧪 Testing Cinc mirror workflow..."
-        echo "This is a simplified test to verify the workflow runs correctly."
-        echo ""
-        echo "✅ Workflow executed successfully!"
-        echo "Next step: Gradually add back the full mirror functionality."
+        chmod +x mirror-cinc.sh
+        chmod +x security-incident-response.sh
+
+    - name: Set mirror configuration
+      id: config
+      run: |
+        # Set default values
+        MIN_VERSION="18"
+
+        # Override with input if provided
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.min_version }}" ]; then
+          MIN_VERSION="${{ github.event.inputs.min_version }}"
+        fi
+
+        echo "min_version=$MIN_VERSION" >> $GITHUB_OUTPUT
+        echo "Using minimum version: $MIN_VERSION"
+
+    - name: Run Cinc mirror script
+      env:
+        GHCR_ORG: ${{ github.repository_owner }}
+        GHCR_REPO: cinc-packages
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        MIRROR_DIR: ./cinc-mirror
+        MIN_VERSION: ${{ steps.config.outputs.min_version }}
+        TARGET_DISTROS: debian ubuntu
+        FTP_BASE: ftp://downloads.cinc.sh/pub/cinc/files/stable/cinc
+      run: |
+        echo "🚀 Starting Cinc mirror process..."
+        echo "GHCR_ORG: $GHCR_ORG"
+        echo "MIN_VERSION: $MIN_VERSION"
+        echo "TARGET_DISTROS: $TARGET_DISTROS"
+
+        # Run the mirror script
+        if ./mirror-cinc.sh; then
+          echo "✅ Mirror process completed successfully"
+        else
+          echo "❌ Mirror process failed"
+          exit 1
+        fi
