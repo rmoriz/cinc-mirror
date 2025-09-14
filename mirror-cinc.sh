@@ -44,30 +44,29 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Get list of versions from FTP
+# Get list of versions from FTP (logs -> stderr, data -> stdout)
 get_versions() {
-    log_info "Fetching available versions from FTP..."
-    local versions
-    versions=$(curl -s -l "$FTP_BASE/" | sort -V)
-
-    # Filter versions >= MIN_VERSION
-    local filtered_versions=()
-    for version in $versions; do
-        if [[ $version =~ ^([0-9]+)\. ]]; then
-            local major_version="${BASH_REMATCH[1]}"
-            if (( major_version >= MIN_VERSION )); then
-                filtered_versions+=("$version")
+    log_info "Fetching available versions from FTP..." >&2
+    local raw
+    raw=$(curl -s -l "$FTP_BASE/" | sort -V) || return 1
+    local filtered=()
+    for v in $raw; do
+        if [[ $v =~ ^([0-9]+)\. ]]; then
+            local major="${BASH_REMATCH[1]}"
+            if (( major >= MIN_VERSION )); then
+                filtered+=("$v")
             fi
         fi
     done
-
-    echo "${filtered_versions[@]}"
+    echo "${filtered[@]}"
 }
 
 # Get distros for a version
 get_distros() {
     local version="$1"
-    curl -s -l "$FTP_BASE/$version/" | grep -E "^($(IFS=\|; echo "${TARGET_DISTROS_ARRAY[*]}"))$"
+    local pattern
+    pattern="$(IFS=\|; echo "${TARGET_DISTROS_ARRAY[*]}")"
+    curl -s -l "$FTP_BASE/$version/" | grep -E "^(${pattern})$" || true
 }
 
 # Get distro versions for a distro
@@ -117,39 +116,6 @@ authenticate_ghcr() {
             exit 1
         }
     }
-}
-
-# Get list of versions from FTP
-get_versions() {
-    log_info "Fetching available versions from FTP..."
-    local versions
-    versions=$(curl -s -l "$FTP_BASE/" | sort -V)
-
-    # Filter versions >= MIN_VERSION
-    local filtered_versions=()
-    for version in $versions; do
-        if [[ $version =~ ^([0-9]+)\. ]]; then
-            local major_version="${BASH_REMATCH[1]}"
-            if (( major_version >= MIN_VERSION )); then
-                filtered_versions+=("$version")
-            fi
-        fi
-    done
-
-    echo "${filtered_versions[@]}"
-}
-
-# Get distros for a version
-get_distros() {
-    local version="$1"
-    curl -s -l "$FTP_BASE/$version/" | grep -E "^($(IFS=\|; echo "${TARGET_DISTROS_ARRAY[*]}"))$"
-}
-
-# Get distro versions for a distro
-get_distro_versions() {
-    local version="$1"
-    local distro="$2"
-    curl -s -l "$FTP_BASE/$version/$distro/"
 }
 
 # Download file from FTP
