@@ -3,7 +3,7 @@
 # Single Script Cinc Mirror Solution
 # Mirrors Cinc packages from FTP to GitHub Container Registry using metadata.json files
 
-set -ex
+set -e
 
 # Configuration with defaults
 CHANNEL="${CHANNEL:-stable}"
@@ -25,15 +25,15 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+    echo -e "${GREEN}[INFO]${NC} $1" >&2
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+    echo -e "${YELLOW}[WARN]${NC} $1" >&2
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}[ERROR]${NC} $1" >&2
 }
 
 # Check dependencies
@@ -102,16 +102,20 @@ upload_to_ghcr() {
     local machine="$5"
     local metadata_file="$6"
     
-    local filename=$(basename "$local_file")
+    local original_filename=$(basename "$local_file")
+    # Remove temp_ prefix if present
+    local clean_filename="${original_filename#temp_}"
     local tag="$version-$platform-$platform_version-$machine"
     local oci_ref="$TARGET_REGISTRY/$TARGET_ORG/$TARGET_REPO/$PROJECT:$tag"
     
-    log_info "Uploading $filename to $oci_ref"
+    log_info "Uploading $clean_filename to $oci_ref"
     
     # Create temporary directory for ORAS
     local temp_dir=$(mktemp -d)
     log_info "Created temp dir: $temp_dir"
-    cp "$local_file" "$temp_dir/$filename"
+    
+    # Copy file with clean filename
+    cp "$local_file" "$temp_dir/$clean_filename"
     
     # Copy metadata.json if provided
     if [ -f "$metadata_file" ]; then
@@ -124,8 +128,8 @@ upload_to_ghcr() {
     
     # Build ORAS push command
     local push_cmd=(oras push "$oci_ref"
-        --artifact-type "application/octet-stream"
-        --annotation "org.opencontainers.artifact.title=$filename"
+        --artifact-type "application/vnd.cinc.package.v1+json"
+        --annotation "org.opencontainers.artifact.title=$clean_filename"
         --annotation "org.opencontainers.artifact.description.platform=$platform"
         --annotation "org.opencontainers.artifact.description.platform-version=$platform_version"
         --annotation "org.opencontainers.artifact.description.machine=$machine"
@@ -133,7 +137,7 @@ upload_to_ghcr() {
         --disable-path-validation)
     
     # Add files to upload
-    push_cmd+=("$filename")
+    push_cmd+=("$clean_filename")
     if [ -f "metadata.json" ]; then
         push_cmd+=("metadata.json")
     fi
@@ -141,13 +145,13 @@ upload_to_ghcr() {
     log_info "Executing ORAS command: ${push_cmd[*]}"
     local push_output
     if push_output=$("${push_cmd[@]}" 2>&1); then
-        log_info "Successfully uploaded $filename to GHCR"
+        log_info "Successfully uploaded $clean_filename to GHCR"
         log_info "Push output: $push_output"
         popd > /dev/null
         rm -rf "$temp_dir"
         return 0
     else
-        log_error "Failed to upload $filename to GHCR"
+        log_error "Failed to upload $clean_filename to GHCR"
         log_error "ORAS output: $push_output"
         popd > /dev/null
         rm -rf "$temp_dir"
@@ -196,82 +200,88 @@ process_version() {
             
             log_info "Processing platform version: $platform_version"
             
-            # Get machine directories
-            local machines
-            machines=$(get_ftp_listing "$ftp_base_path/$platform/$platform_version")
+            # Get files directly in platform/version directory
+            local files
+            files=$(get_ftp_listing "$ftp_base_path/$platform/$platform_version")
             
-            for machine in $machines; do
-                log_info "Processing machine: $machine"
-                
-                # Get files in machine directory
-                local files
-                files=$(get_ftp_listing "$ftp_base_path/$platform/$platform_version/$machine")
-                
-                # Process metadata.json files
-                for file in $files; do
-                    if [[ "$file" == *.metadata.json ]]; then
-                        log_info "Found metadata file: $file"
-                        
-                        local metadata_path="$ftp_base_path/$platform/$platform_version/$machine/$file"
-                        local local_metadata_file="./temp_metadata.json"
-                        
-                        # Download metadata.json
-                        if download_file "$metadata_path" "$local_metadata_file"; then
-                            # Parse metadata to get basename and sha256
-                            local metadata_info
-                            metadata_info=$(parse_metadata "$local_metadata_file")
-                            
-                            local basename sha256
-                            eval "$metadata_info"
-                            
-                            if [ -n "$basename" ] && [ -n "$sha256" ]; then
-                                log_info "Metadata parsed - basename: $basename, sha256: $sha256"
-                                
-                                # Download the actual file
-                                local file_path="$ftp_base_path/$platform/$platform_version/$machine/$basename"
-                                local local_file="./temp_$basename"
-                                
-                                if download_file "$file_path" "$local_file"; then
-                                    # Verify SHA256 if possible
-                                    local calculated_sha256
-                                    if command -v sha256sum >/dev/null 2>&1; then
-                                        log_info "Calculating SHA256 with sha256sum"
-                                        calculated_sha256=$(sha256sum "$local_file" | awk '{print $1}')
-                                    elif command -v shasum >/dev/null 2>&1; then
-                                        log_info "Calculating SHA256 with shasum"
-                                        calculated_sha256=$(shasum -a 256 "$local_file" | awk '{print $1}')
-                                    fi
-                                    
-                                    if [ -n "$calculated_sha256" ] && [ "$calculated_sha256" != "$sha256" ]; then
-                                        log_error "SHA256 mismatch for $basename"
-                                        log_error "Expected: $sha256"
-                                        log_error "Calculated: $calculated_sha256"
-                                        continue
-                                    fi
-                                    
-                                    # Upload to GHCR
-                                    if upload_to_ghcr "$local_file" "$version" "$platform" "$platform_version" "$machine" "$local_metadata_file"; then
-                                        log_info "Successfully processed $basename"
-                                    else
-                                        log_error "Failed to upload $basename"
-                                    fi
-                                    
-                                    # Clean up local file
-                                    rm -f "$local_file"
-                                else
-                                    log_error "Failed to download $basename"
-                                fi
-                            else
-                                log_error "Failed to parse metadata from $file"
-                            fi
-                            
-                            # Clean up metadata file
-                            rm -f "$local_metadata_file"
-                        else
-                            log_error "Failed to download metadata file $file"
-                        fi
+            # Process metadata.json files
+            for file in $files; do
+                if [[ "$file" == *.metadata.json ]]; then
+                    log_info "Found metadata file: $file"
+                    
+                    # Extract machine architecture from filename
+                    # e.g., cinc_18.8.11-1_arm64.deb.metadata.json -> arm64
+                    local machine=""
+                    if [[ "$file" =~ _([^_]+)\.deb\.metadata\.json$ ]]; then
+                        machine="${BASH_REMATCH[1]}"
+                    elif [[ "$file" =~ _([^_]+)\.rpm\.metadata\.json$ ]]; then
+                        machine="${BASH_REMATCH[1]}"
+                    else
+                        # Try to extract from other patterns
+                        machine="unknown"
                     fi
-                done
+                    
+                    log_info "Extracted machine architecture: $machine"
+                    
+                    local metadata_path="$ftp_base_path/$platform/$platform_version/$file"
+                    local local_metadata_file="./temp_metadata.json"
+                    
+                    # Download metadata.json
+                    if download_file "$metadata_path" "$local_metadata_file"; then
+                        # Parse metadata to get basename and sha256
+                        local metadata_info
+                        metadata_info=$(parse_metadata "$local_metadata_file")
+                        
+                        local basename sha256
+                        eval "$metadata_info"
+                        
+                        if [ -n "$basename" ] && [ -n "$sha256" ]; then
+                            log_info "Metadata parsed - basename: $basename, sha256: $sha256"
+                            
+                            # Download the actual file
+                            local file_path="$ftp_base_path/$platform/$platform_version/$basename"
+                            local local_file="./temp_$basename"
+                            
+                            if download_file "$file_path" "$local_file"; then
+                                # Verify SHA256 if possible
+                                local calculated_sha256
+                                if command -v sha256sum >/dev/null 2>&1; then
+                                    log_info "Calculating SHA256 with sha256sum"
+                                    calculated_sha256=$(sha256sum "$local_file" | awk '{print $1}')
+                                elif command -v shasum >/dev/null 2>&1; then
+                                    log_info "Calculating SHA256 with shasum"
+                                    calculated_sha256=$(shasum -a 256 "$local_file" | awk '{print $1}')
+                                fi
+                                
+                                if [ -n "$calculated_sha256" ] && [ "$calculated_sha256" != "$sha256" ]; then
+                                    log_error "SHA256 mismatch for $basename"
+                                    log_error "Expected: $sha256"
+                                    log_error "Calculated: $calculated_sha256"
+                                    continue
+                                fi
+                                
+                                # Upload to GHCR
+                                if upload_to_ghcr "$local_file" "$version" "$platform" "$platform_version" "$machine" "$local_metadata_file"; then
+                                    log_info "Successfully processed $basename"
+                                else
+                                    log_error "Failed to upload $basename"
+                                fi
+                                
+                                # Clean up local file
+                                rm -f "$local_file"
+                            else
+                                log_error "Failed to download $basename"
+                            fi
+                        else
+                            log_error "Failed to parse metadata from $file"
+                        fi
+                        
+                        # Clean up metadata file
+                        rm -f "$local_metadata_file"
+                    else
+                        log_error "Failed to download metadata file $file"
+                    fi
+                fi
             done
         done
     done
