@@ -18,6 +18,7 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.log
+temp_metadata.json
 
 # packaages
 *.deb
