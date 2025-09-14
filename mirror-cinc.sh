@@ -467,7 +467,7 @@ main() {
                                  if store_checksum "$local_path" "$remote_path"; then
                                      # Upload to GHCR
                                      if upload_to_ghcr "$local_path" "$remote_path"; then
-                                         ((new_files++))
+                                         new_files=$((new_files + 1))
                                          log_info "Successfully mirrored: $remote_path"
                                      else
                                          log_error "Failed to upload to GHCR: $remote_path"
