@@ -52,7 +52,7 @@ get_versions() {
     local filtered=()
 
     # Only include specific versions for stability
-    local allowed_versions=("18.8.9" "18.8.11")
+    local allowed_versions=("18.8.9" "18.8.11" "18.8.92")
 
     for v in $raw; do
         if [[ " ${allowed_versions[@]} " =~ " $v " ]]; then
@@ -190,6 +190,7 @@ upload_to_ghcr() {
         # Extract digest from output
         local digest=$(echo "$push_output" | grep "Pushed" | sed 's/.*@sha256://')
         log_info "Successfully uploaded $filename to GHCR with digest: $digest"
+        log_info "Push output: $push_output"
         popd > /dev/null
         rm -rf "$temp_dir"
         echo "$digest"
@@ -292,17 +293,28 @@ mirror_version() {
 EOF
 
         for i in "${!digests[@]}"; do
+            # Validate data before adding to JSON
+            local digest="${digests[$i]}"
+            local size="${sizes[$i]}"
+            local os="${platforms_os[$i]}"
+            local arch="${platforms_arch[$i]}"
+
+            if [ -z "$digest" ] || [ -z "$size" ] || [ -z "$os" ] || [ -z "$arch" ]; then
+                log_error "Skipping invalid manifest data: digest='$digest', size='$size', os='$os', arch='$arch'"
+                continue
+            fi
+
             if [ $i -gt 0 ]; then
                 echo "," >> "$index_json"
             fi
             cat >> "$index_json" << EOF
     {
       "mediaType": "application/vnd.oci.artifact.manifest.v1+json",
-      "digest": "sha256:${digests[$i]}",
-      "size": ${sizes[$i]},
+      "digest": "sha256:${digest}",
+      "size": ${size},
       "platform": {
-        "os": "${platforms_os[$i]}",
-        "architecture": "${platforms_arch[$i]}"
+        "os": "${os}",
+        "architecture": "${arch}"
       }
     }
 EOF
@@ -313,10 +325,25 @@ EOF
 }
 EOF
 
+        # Validate JSON before pushing
+        if command -v jq &> /dev/null; then
+            if ! jq empty "$index_json" 2>/dev/null; then
+                log_error "Generated JSON is invalid:"
+                cat "$index_json"
+                rm "$index_json"
+                return 1
+            fi
+        fi
+
+        log_info "Generated index JSON:"
+        cat "$index_json"
+
         if oras manifest push "$index_ref" "$index_json"; then
             log_info "Successfully pushed multi-arch index for version $version"
         else
             log_error "Failed to push multi-arch index for version $version"
+            log_error "Index JSON content:"
+            cat "$index_json"
         fi
 
         rm "$index_json"
