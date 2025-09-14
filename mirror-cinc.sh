@@ -338,9 +338,13 @@ should_process_file() {
     local local_path="$1"
     local remote_path="$2"
 
+    log_info "Checking if file should be processed: $remote_path"
+
     # Always verify integrity first
     verify_file_integrity "$local_path" "$remote_path"
     local integrity_result=$?
+
+    log_info "Integrity check result: $integrity_result"
 
     case $integrity_result in
         0)
