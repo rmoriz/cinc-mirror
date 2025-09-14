@@ -28,6 +28,10 @@ jobs:
 
           echo "Searching for package: $PACKAGE_NAME for user: $USER"
 
+          # Debug: List all packages first
+          echo "All packages for user $USER:"
+          gh api "/users/$USER/packages?package_type=$PACKAGE_TYPE" --jq '.[] | .name' || echo "Failed to list packages"
+
           # Check if package exists with proper error handling
           if ! gh api "/users/$USER/packages?package_type=$PACKAGE_TYPE" --jq ".[] | select(.name == \"$PACKAGE_NAME\")" > /tmp/package_info 2>/dev/null; then
             echo "Failed to list packages or package not found."
