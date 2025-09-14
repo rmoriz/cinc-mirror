@@ -124,7 +124,7 @@ check_blob_exists() {
     # Construct the blob URL directly (similar to fetch-blob.sh)
     local blob_url="https://$TARGET_REGISTRY/v2/$TARGET_ORG/$TARGET_REPO/$PROJECT/blobs/$blob_digest"
 
-    # Get authentication token if needed (similar to fetch-blob.sh)
+    # Check if blob exists with fresh authentication
     local token=""
     local repo_path="$TARGET_ORG/$TARGET_REPO/$PROJECT"
     local auth_url="https://$TARGET_REGISTRY/token?service=$TARGET_REGISTRY&scope=repository:$repo_path:pull"
