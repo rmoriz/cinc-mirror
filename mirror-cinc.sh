@@ -404,11 +404,11 @@ main() {
     log_info "Found versions to mirror: $versions"
 
     # Track statistics
-    local total_files=0
-    local new_files=0
-    local skipped_files=0
-    local integrity_violations=0
-    local security_alerts=0
+    total_files=0
+    new_files=0
+    skipped_files=0
+    integrity_violations=0
+    security_alerts=0
 
     # Mirror each version
     for version in $versions; do
