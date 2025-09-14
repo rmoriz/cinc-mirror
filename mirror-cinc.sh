@@ -151,29 +151,21 @@ upload_to_ghcr() {
     local temp_dir=$(mktemp -d)
     cp "$local_path" "$temp_dir/$filename"
 
-    # Create a simple artifact manifest
-    cat > "$temp_dir/artifact.yaml" << EOF
-{
-  "mediaType": "application/vnd.oci.artifact.manifest.v1+json",
-  "artifactType": "application/octet-stream",
-  "blobs": [],
-  "annotations": {
-    "org.opencontainers.artifact.title": "$filename",
-    "org.opencontainers.artifact.description": "Cinc package $filename"
-  }
-}
-EOF
+    # Change to temp dir to avoid exposing temp path in annotations
+    pushd "$temp_dir" > /dev/null
 
     if oras push "$oci_ref" \
         --artifact-type "application/octet-stream" \
         --annotation "org.opencontainers.artifact.title=$filename" \
         --disable-path-validation \
-        "$temp_dir/$filename"; then
+        "$filename"; then
         log_info "Successfully uploaded $filename to GHCR"
+        popd > /dev/null
         rm -rf "$temp_dir"
         return 0
     else
         log_error "Failed to upload $filename to GHCR - aborting workflow"
+        popd > /dev/null
         rm -rf "$temp_dir"
         exit 1  # Fail fast on upload errors
     fi
