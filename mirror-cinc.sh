@@ -141,7 +141,9 @@ upload_to_ghcr() {
     local remote_path="$2"
 
     local filename=$(basename "$local_path")
-    local oci_ref="ghcr.io/$GHCR_ORG/$GHCR_REPO:$remote_path"
+    # Sanitize the remote path for use as a tag (replace slashes with hyphens)
+    local sanitized_path=$(echo "$remote_path" | tr '/' '-')
+    local oci_ref="ghcr.io/$GHCR_ORG/$GHCR_REPO:$sanitized_path"
 
     log_info "Uploading $filename to $oci_ref"
 
