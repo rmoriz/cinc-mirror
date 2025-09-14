@@ -664,7 +664,7 @@ if test "x$download_url_override" = "x"; then
 
   metadata_filename="$tmp_dir/metadata.txt"
   metadata_url="https://omnitruck.cinc.sh/$channel/$project/metadata?v=$version&p=$platform&pv=$platform_version&m=$machine"
-   blob_url="ghcr.io/rmoriz/cinc-mirror/cinc@sha256"
+  blob_url="ghcr.io/rmoriz/cinc-mirror/cinc@sha256"
   do_download "$metadata_url"  "$metadata_filename"
 
   cat "$metadata_filename"
