@@ -28,9 +28,20 @@ jobs:
 
         # Install ORAS for OCI artifact management
         echo "Installing ORAS..."
-        curl -LO https://github.com/oras-project/oras/releases/latest/download/oras_linux_amd64.tar.gz
+        # Get the latest release version
+        ORAS_VERSION=$(curl -s https://api.github.com/repos/oras-project/oras/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+
+        if [ -z "$ORAS_VERSION" ]; then
+          echo "Failed to get ORAS version, using fallback"
+          ORAS_VERSION="v1.1.0"
+        fi
+
+        echo "Using ORAS version: $ORAS_VERSION"
+
+        # Download and install ORAS
+        curl -LO "https://github.com/oras-project/oras/releases/download/${ORAS_VERSION}/oras_linux_amd64.tar.gz"
         mkdir -p oras-install/
-        tar -zxf oras_linux_amd64.tar.gz -C oras-install/
+        tar -zxf "oras_linux_amd64.tar.gz" -C oras-install/
         sudo mv oras-install/oras /usr/local/bin/
         rm -rf oras-install/ oras_linux_amd64.tar.gz
 
