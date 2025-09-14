@@ -23,7 +23,7 @@ jobs:
       - name: Delete all packages
         run: |
           USER="rmoriz"
-          PACKAGE_NAME="cinc-packages"
+          PACKAGE_NAME="cinc-packages/cinc"
           PACKAGE_TYPE="container"
 
           echo "Searching for package: $PACKAGE_NAME for user: $USER"
@@ -41,8 +41,10 @@ jobs:
 
           echo "Found package: $PACKAGE_NAME"
 
-          # List versions with proper error handling
-          if ! gh api "/users/$USER/packages/$PACKAGE_TYPE/$PACKAGE_NAME/versions" --jq '.[].id' > /tmp/versions 2>/dev/null; then
+          # List versions with proper error handling  
+          # Note: URL encode the package name for the API call
+          ENCODED_PACKAGE_NAME=$(echo "$PACKAGE_NAME" | sed 's|/|%2F|g')
+          if ! gh api "/users/$USER/packages/$PACKAGE_TYPE/$ENCODED_PACKAGE_NAME/versions" --jq '.[].id' > /tmp/versions 2>/dev/null; then
             echo "Failed to list versions or package has no versions."
             exit 0
           fi
@@ -59,7 +61,7 @@ jobs:
           while read -r VERSION_ID; do
             if [ -n "$VERSION_ID" ] && [[ "$VERSION_ID" =~ ^[0-9]+$ ]]; then
               echo "Deleting version ID: $VERSION_ID"
-              if gh api -X DELETE "/users/$USER/packages/$PACKAGE_TYPE/$PACKAGE_NAME/versions/$VERSION_ID" 2>/dev/null; then
+              if gh api -X DELETE "/users/$USER/packages/$PACKAGE_TYPE/$ENCODED_PACKAGE_NAME/versions/$VERSION_ID" 2>/dev/null; then
                 echo "Successfully deleted version ID: $VERSION_ID"
               else
                 echo "Failed to delete version ID: $VERSION_ID (may already be deleted)"
