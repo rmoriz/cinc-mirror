@@ -2,15 +2,23 @@
 
 ![CINC Mirror Logo](cinc-mirror.jpeg)
 
-This repository provides a mirror for CINC packages and installation scripts.
+This repository provides a mirror for CINC packages.
+Metadata and packages will be retrieved from downloads.cinc.sh / ftp.osuosl.org and stored on GHCR as OCI blobs. Kind of the same homebrew does.
 
-## Installation
 
-To install CINC, run the following command:
+## Trademark / Remarks
+
+This project is neither affiliated nor approved by Progress Chef and/or the Cinc community project. Use at your own risk. Feel free to open issues but don't expect a SLA. Service may stop/break at any time. Solaris? AIX? 10 year old OS versions? Sorry, won't work.
+
+## Usage/Installation
+
+To install the mirrored CINC packages, run the following command:
 
 ```bash
 curl -sSL https://cinc-mirror.github.io/install.sh | bash
 ```
+
+The actual script is at https://github.com/cinc-mirror/cinc-mirror.github.io and should replace https://omnitruck.cinc.sh/install.sh - metadata is still retreived from cinc.sh, only packages are retrieved from ghcr. 
 
 **Requirements:**
 - curl must be installed
@@ -25,6 +33,10 @@ curl -sSL https://cinc-mirror.github.io/install.sh | bash
 - `fetch-blob.sh` - Blob fetching example using curl (example how to download a blob by sha256 hash). If you are serious, just get [ORAS](https://oras.land/)
 
 ## GitHub Actions (not yet)
+
+## Why?
+
+Proof of concept. OSUOSL is doing an awesome job, just their connection with Cogent is terrible slow. In Germany you get speeds below 1Mbit/s which sucks on CI/CD or mass rollouts. Why not offload such traffic to Microsoft GitHub(TM) ;)
 
 ## License
 
