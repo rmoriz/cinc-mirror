@@ -91,7 +91,7 @@ jobs:
       - name: Run Cinc mirror script
         env:
           GHCR_ORG: ${{ github.repository_owner }}
-          GHCR_REPO: cinc-packages
+          GHCR_REPO: cinc-mirror
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MIRROR_DIR: ./cinc-mirror
           MIN_VERSION: ${{ steps.config.outputs.min_version }}

@@ -12,7 +12,7 @@ VERSIONS="${VERSIONS:-18.8.11}"
 FTP_BASE="ftp.osuosl.org"
 TARGET_REGISTRY="ghcr.io"
 TARGET_ORG="${TARGET_ORG:-rmoriz}"
-TARGET_REPO="${TARGET_REPO:-cinc-packages}"
+TARGET_REPO="${TARGET_REPO:-cinc-mirror}"
 
 # For prototyping - limit to debian/13
 PLATFORM_FILTER="${PLATFORM_FILTER:-debian}"
@@ -329,7 +329,7 @@ usage() {
     echo "  PROJECT=<project>              Set project (default: cinc)"
     echo "  VERSIONS=<versions>            Set versions (default: 18.8.11, use '*' for all)"
     echo "  TARGET_ORG=<org>               Set target GitHub org (default: rmoriz)"
-    echo "  TARGET_REPO=<repo>             Set target repository (default: cinc-packages)"
+    echo "  TARGET_REPO=<repo>             Set target repository (default: cinc-mirror)"
     echo "  PLATFORM_FILTER=<platform>    Set platform filter (default: debian)"
     echo "  PLATFORM_VERSION_FILTER=<ver> Set platform version filter (default: 13)"
     echo ""

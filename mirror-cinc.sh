@@ -13,7 +13,7 @@ fi
 # Configuration (with defaults)
 FTP_BASE="${FTP_BASE:-ftps://downloads.cinc.sh/pub/cinc/files/stable/cinc}"
 GHCR_ORG="${GHCR_ORG:-your-github-org}"  # Set your GitHub org/username
-GHCR_REPO="${GHCR_REPO:-cinc-packages}"  # Repository name for packages
+GHCR_REPO="${GHCR_REPO:-cinc-mirror}"  # Repository name for packages
 MIRROR_DIR="${MIRROR_DIR:-./cinc-mirror}"
 MIN_VERSION="${MIN_VERSION:-18}"  # Minimum version to mirror
 

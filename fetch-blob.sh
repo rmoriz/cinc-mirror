@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
     echo "Usage: $0 <registry>/<namespace>/<repository>@<digest> -o <output_file>"
-    echo "Example: $0 ghcr.io/rmoriz/cinc-packages/cinc@sha256:81a46c0ae31de496d73bc9f02f8245fcd4e6a3c54f9e4490aabbc6195612951a -o file.deb"
+    echo "Example: $0 ghcr.io/rmoriz/cinc-mirror/cinc@sha256:81a46c0ae31de496d73bc9f02f8245fcd4e6a3c54f9e4490aabbc6195612951a -o file.deb"
     exit 1
 }
 

@@ -52,7 +52,7 @@ This mirror implements a **strict immutability policy** for security:
 2. **Set environment variables**:
    ```bash
    export GHCR_ORG="your-github-username-or-org"
-   export GHCR_REPO="cinc-packages"  # Optional, defaults to "cinc-packages"
+    export GHCR_REPO="cinc-mirror"  # Optional, defaults to "cinc-mirror"
    export GITHUB_TOKEN="your-github-personal-access-token"
    export MIRROR_DIR="./cinc-mirror"  # Optional, defaults to "./cinc-mirror"
    ```
@@ -120,7 +120,7 @@ You can also trigger the workflow manually:
 The script can be configured via environment variables:
 
 - `GHCR_ORG`: Your GitHub organization or username (required)
-- `GHCR_REPO`: Repository name for packages (default: "cinc-packages")
+- `GHCR_REPO`: Repository name for packages (default: "cinc-mirror")
 - `MIRROR_DIR`: Local directory for downloaded files (default: "./cinc-mirror")
 - `MIN_VERSION`: Minimum version to mirror (default: "18")
 
@@ -153,7 +153,7 @@ ghcr.io/{org}/{repo}:{version}/{distro}/{distro_version}/{filename}
 
 Example:
 ```
-ghcr.io/myorg/cinc-packages:18.8.11/debian/12/cinc_18.8.11-1_amd64.deb
+ghcr.io/myorg/cinc-mirror:18.8.11/debian/12/cinc_18.8.11-1_amd64.deb
 ```
 
 ## Security Incident Response

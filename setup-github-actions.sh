@@ -52,7 +52,7 @@ else
 
 # GitHub Container Registry settings (will be set automatically in GitHub Actions)
 GHCR_ORG="your-github-username-or-org"
-GHCR_REPO="cinc-packages"
+GHCR_REPO="cinc-mirror"
 
 # GitHub Personal Access Token (will use GITHUB_TOKEN in Actions)
 GITHUB_TOKEN="your-github-personal-access-token"
