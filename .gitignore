@@ -1,0 +1,23 @@
+# Mirror files
+cinc-mirror/
+logs/
+
+# Security files (keep for incident response)
+# Uncomment the lines below if you want to commit security files for audit
+# cinc-mirror/.security-alert
+# cinc-mirror/.integrity.log
+# cinc-mirror/.checksums.sha256
+
+# Configuration with secrets
+config.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+
+# Incident reports
+security-incident-report-*.md

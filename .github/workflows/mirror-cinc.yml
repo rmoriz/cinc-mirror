@@ -1,0 +1,273 @@
+name: Mirror Cinc Packages to GHCR
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allow manual triggering
+    inputs:
+      min_version:
+        description: 'Minimum version to mirror (default: 18)'
+        required: false
+        default: '18'
+      force_full_sync:
+        description: 'Force full sync instead of incremental'
+        required: false
+        default: 'false'
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        # Fetch full history for incremental updates
+        fetch-depth: 0
+
+    - name: Set up Docker
+      uses: docker/setup-buildx-action@v3
+
+    - name: Install dependencies
+      run: |
+        # Install ORAS for OCI artifact management
+        curl -LO https://github.com/oras-project/oras/releases/latest/download/oras_linux_amd64.tar.gz
+        mkdir -p oras-install/
+        tar -zxf oras_linux_amd64.tar.gz -C oras-install/
+        sudo mv oras-install/oras /usr/local/bin/
+        rm -rf oras-install/ oras_linux_amd64.tar.gz
+
+        # Verify installations
+        oras version
+
+    - name: Configure Git
+      run: |
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+
+    - name: Create mirror directory
+      run: |
+        mkdir -p cinc-mirror
+        mkdir -p logs
+
+    - name: Get last successful run date
+      id: last_run
+      run: |
+        # Get the date of the last successful run
+        LAST_RUN=$(git log -1 --grep="Mirror update" --format="%ci" 2>/dev/null || echo "")
+        if [ -n "$LAST_RUN" ]; then
+          LAST_DATE=$(date -d "$LAST_RUN" +%Y%m%d)
+          echo "last_date=$LAST_DATE" >> $GITHUB_OUTPUT
+          echo "Last successful run: $LAST_RUN"
+        else
+          echo "last_date=" >> $GITHUB_OUTPUT
+          echo "No previous successful run found"
+        fi
+
+    - name: Run Cinc mirror script
+      env:
+        GHCR_ORG: ${{ github.repository_owner }}
+        GHCR_REPO: cinc-packages
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        MIRROR_DIR: ./cinc-mirror
+        MIN_VERSION: ${{ github.event.inputs.min_version || '18' }}
+        TARGET_DISTROS: debian ubuntu
+        FTP_BASE: ftp://downloads.cinc.sh/pub/cinc/files/stable/cinc
+        FORCE_FULL_SYNC: ${{ github.event.inputs.force_full_sync || 'false' }}
+        LAST_RUN_DATE: ${{ steps.last_run.outputs.last_date }}
+      run: |
+        echo "Starting Cinc mirror process..."
+        echo "GHCR_ORG: $GHCR_ORG"
+        echo "MIN_VERSION: $MIN_VERSION"
+        echo "FORCE_FULL_SYNC: $FORCE_FULL_SYNC"
+
+        # Run the mirror script with error handling
+        if ./mirror-cinc.sh; then
+          echo "Mirror process completed successfully"
+        else
+          echo "Mirror process failed, but continuing with commit attempt"
+        fi
+
+    - name: Check for changes and security alerts
+      id: status
+      run: |
+        # Check for security alerts
+        if [ -f "cinc-mirror/.security-alert" ]; then
+          echo "security_alert=true" >> $GITHUB_OUTPUT
+          echo "🚨 Security alert detected!"
+        else
+          echo "security_alert=false" >> $GITHUB_OUTPUT
+        fi
+
+        # Check for repository changes
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "changes=true" >> $GITHUB_OUTPUT
+          echo "Changes detected in repository"
+        else
+          echo "changes=false" >> $GITHUB_OUTPUT
+          echo "No changes detected"
+        fi
+
+    - name: Handle security alerts
+      if: steps.status.outputs.security_alert == 'true'
+      run: |
+        echo "🚨 SECURITY ALERT DETECTED - IMMEDIATE ACTION REQUIRED 🚨"
+        echo
+
+        # Read security alert details
+        if [ -f "cinc-mirror/.security-alert" ]; then
+          cat cinc-mirror/.security-alert
+          echo
+        fi
+
+        # Read integrity log
+        if [ -f "cinc-mirror/.integrity.log" ]; then
+          echo "=== Integrity Log ==="
+          tail -20 cinc-mirror/.integrity.log
+          echo
+        fi
+
+        echo "⚠️  This indicates a potential security incident!"
+        echo "   - Source files have changed after being mirrored"
+        echo "   - This violates the immutability policy"
+        echo "   - Manual security review is required"
+        echo
+        echo "Next steps:"
+        echo "1. Review the changed files manually"
+        echo "2. Verify the source FTP site integrity"
+        echo "3. Check for potential supply chain attacks"
+        echo "4. Decide whether to trust the new source files"
+
+    - name: Generate mirror report
+      if: steps.status.outputs.changes == 'true' || steps.status.outputs.security_alert == 'true'
+      run: |
+        if [ "${{ steps.status.outputs.security_alert }}" = "true" ]; then
+          echo "# 🚨 Cinc Mirror Security Alert Report" > mirror-report.md
+        else
+          echo "# Cinc Mirror Update Report" > mirror-report.md
+        fi
+
+        echo "" >> mirror-report.md
+        echo "**Run Date:** $(date)" >> mirror-report.md
+        echo "**Triggered by:** ${{ github.event_name }}" >> mirror-report.md
+        echo "**Minimum Version:** $MIN_VERSION" >> mirror-report.md
+        echo "" >> mirror-report.md
+
+        # Security status
+        if [ -f "cinc-mirror/.security-alert" ]; then
+          echo "## 🚨 SECURITY ALERT" >> mirror-report.md
+          echo "Security incidents detected! Manual review required." >> mirror-report.md
+          echo "" >> mirror-report.md
+          cat cinc-mirror/.security-alert >> mirror-report.md
+          echo "" >> mirror-report.md
+        fi
+
+        # Count files in mirror directory
+        TOTAL_FILES=$(find cinc-mirror -type f -name "*.deb" | wc -l)
+        TOTAL_METADATA=$(find cinc-mirror -type f -name "*.metadata.json" | wc -l)
+        TOTAL_SIZE=$(du -sh cinc-mirror | cut -f1)
+
+        echo "## Statistics" >> mirror-report.md
+        echo "- **Package files:** $TOTAL_FILES" >> mirror-report.md
+        echo "- **Metadata files:** $TOTAL_METADATA" >> mirror-report.md
+        echo "- **Total size:** $TOTAL_SIZE" >> mirror-report.md
+
+        # Add security statistics if available
+        if [ -n "${MIRROR_STATS_SECURITY_ALERTS}" ]; then
+          echo "- **Security alerts:** ${MIRROR_STATS_SECURITY_ALERTS}" >> mirror-report.md
+        fi
+        if [ -n "${MIRROR_STATS_INTEGRITY_VIOLATIONS}" ]; then
+          echo "- **Integrity violations:** ${MIRROR_STATS_INTEGRITY_VIOLATIONS}" >> mirror-report.md
+        fi
+
+        echo "" >> mirror-report.md
+
+        # List new versions
+        echo "## Recent Versions Mirrored" >> mirror-report.md
+        find cinc-mirror -maxdepth 1 -type d -name "1*" | sort -V | tail -5 | while read dir; do
+          version=$(basename "$dir")
+          echo "- $version" >> mirror-report.md
+        done
+
+    - name: Commit and push changes
+      if: steps.status.outputs.changes == 'true'
+      run: |
+        # Determine commit message based on security status
+        if [ "${{ steps.status.outputs.security_alert }}" = "true" ]; then
+          COMMIT_MSG="🚨 SECURITY ALERT: Mirror update with incidents - $(date +%Y-%m-%d)
+
+⚠️  Security incidents detected during mirroring process
+Manual review required before proceeding with any updates
+
+- Mirrored Cinc packages >= v$MIN_VERSION
+- Security alerts: ${MIRROR_STATS_SECURITY_ALERTS:-0}
+- Integrity violations: ${MIRROR_STATS_INTEGRITY_VIOLATIONS:-0}
+- New files: ${MIRROR_STATS_NEW:-0}
+- Total mirror size: $(du -sh cinc-mirror | cut -f1)
+
+Auto-generated by GitHub Actions"
+        else
+          COMMIT_MSG="Mirror update: $(date +%Y-%m-%d)
+
+- Mirrored Cinc packages >= v$MIN_VERSION
+- New files: ${MIRROR_STATS_NEW:-0}
+- Files skipped: ${MIRROR_STATS_SKIPPED:-0}
+- Total mirror size: $(du -sh cinc-mirror | cut -f1)
+
+Auto-generated by GitHub Actions"
+        fi
+
+        git add .
+        git commit -m "$COMMIT_MSG"
+
+        # Push changes
+        git push origin main
+
+    - name: Create GitHub release for report
+      if: steps.status.outputs.changes == 'true' || steps.status.outputs.security_alert == 'true'
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: mirror-$(date +%Y%m%d-%H%M%S)
+        release_name: Cinc Mirror Update - $(date +%Y-%m-%d)${{ steps.status.outputs.security_alert == 'true' && ' 🚨 SECURITY ALERT' || '' }}
+        body_path: mirror-report.md
+        draft: ${{ steps.status.outputs.security_alert == 'true' }}
+        prerelease: ${{ steps.status.outputs.security_alert == 'true' }}
+
+    - name: Clean up old mirror files (keep last 30 days)
+      if: always()
+      run: |
+        echo "Cleaning up old mirror files..."
+        find cinc-mirror -type f -mtime +30 -delete
+        find cinc-mirror -type d -empty -delete
+
+    - name: Upload security alerts as artifacts
+      if: steps.status.outputs.security_alert == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-alert-${{ github.run_number }}
+        path: |
+          cinc-mirror/.security-alert
+          cinc-mirror/.integrity.log
+          cinc-mirror/.checksums.sha256
+        retention-days: 90
+
+    - name: Upload logs as artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: mirror-logs-${{ github.run_number }}
+        path: |
+          logs/
+          mirror-report.md
+        retention-days: 30
+
+    - name: Fail workflow on security alerts
+      if: steps.status.outputs.security_alert == 'true'
+      run: |
+        echo "🚨 WORKFLOW FAILED DUE TO SECURITY ALERTS 🚨"
+        echo "Manual intervention required to review and resolve security incidents."
+        echo "Check the security-alert artifact and mirror-report for details."
+        exit 1
