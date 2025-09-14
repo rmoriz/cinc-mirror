@@ -47,20 +47,20 @@ DIGEST="${BASH_REMATCH[3]}"
 
 echo "Fetching blob from $REGISTRY/$REPO_PATH with digest $DIGEST"
 
-# Get authentication token if needed
+# Construct the blob URL
+BLOB_URL="https://$REGISTRY/v2/$REPO_PATH/blobs/$DIGEST"
+
+# Fetch the blob with fresh authentication
+echo "Downloading to $OUTPUT_FILE..."
+
+# Get fresh authentication token
 TOKEN=""
-# Try to get authentication token from registry
 AUTH_URL="https://$REGISTRY/token?service=$REGISTRY&scope=repository:$REPO_PATH:pull"
 TOKEN_RESPONSE=$(curl -s "$AUTH_URL" || echo "")
 if [ -n "$TOKEN_RESPONSE" ]; then
     TOKEN=$(echo "$TOKEN_RESPONSE" | grep -o '"token":"[^"]*"' | cut -d'"' -f4 || echo "")
 fi
 
-# Construct the blob URL
-BLOB_URL="https://$REGISTRY/v2/$REPO_PATH/blobs/$DIGEST"
-
-# Fetch the blob
-echo "Downloading to $OUTPUT_FILE..."
 if [ -n "$TOKEN" ]; then
     curl -L -H "Authorization: Bearer $TOKEN" -o "$OUTPUT_FILE" "$BLOB_URL"
 else
