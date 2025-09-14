@@ -11,16 +11,15 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       packages: write
+      contents: read
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Authenticate with GitHub
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
-
       - name: Delete all packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           USER="rmoriz"
           PACKAGE_NAME="cinc-packages/cinc"
@@ -28,54 +27,74 @@ jobs:
 
           echo "Searching for package: $PACKAGE_NAME for user: $USER"
 
-          # Debug: List all packages first
-          echo "All packages for user $USER:"
-          gh api "/users/$USER/packages?package_type=$PACKAGE_TYPE" --jq '.[] | .name' || echo "Failed to list packages"
-
-          # Check if package exists with proper error handling
-          if ! gh api "/users/$USER/packages?package_type=$PACKAGE_TYPE" --jq ".[] | select(.name == \"$PACKAGE_NAME\")" > /tmp/package_info 2>/dev/null; then
-            echo "Failed to list packages or package not found."
-            exit 0
-          fi
-
-          if [ ! -s /tmp/package_info ]; then
-            echo "Package $PACKAGE_NAME not found for user $USER."
-            exit 0
-          fi
-
-          echo "Found package: $PACKAGE_NAME"
-
-          # List versions with proper error handling  
-          # Note: URL encode the package name for the API call
+          # First try the user packages API
+          echo "Attempting to delete package directly..."
+          
+          # Try to list versions directly
           ENCODED_PACKAGE_NAME=$(echo "$PACKAGE_NAME" | sed 's|/|%2F|g')
-          if ! gh api "/users/$USER/packages/$PACKAGE_TYPE/$ENCODED_PACKAGE_NAME/versions" --jq '.[].id' > /tmp/versions 2>/dev/null; then
-            echo "Failed to list versions or package has no versions."
-            exit 0
-          fi
+          echo "Encoded package name: $ENCODED_PACKAGE_NAME"
+          
+          if gh api "/users/$USER/packages/$PACKAGE_TYPE/$ENCODED_PACKAGE_NAME/versions" --jq '.[].id' > /tmp/versions 2>/dev/null; then
+            echo "Found package versions:"
+            cat /tmp/versions
+            
+            VERSION_COUNT=$(wc -l < /tmp/versions)
+            echo "Found $VERSION_COUNT versions to delete"
 
-          if [ ! -s /tmp/versions ]; then
-            echo "No versions found for package $PACKAGE_NAME."
-            exit 0
-          fi
-
-          VERSION_COUNT=$(wc -l < /tmp/versions)
-          echo "Found $VERSION_COUNT versions to delete"
-
-          # Delete each version
-          while read -r VERSION_ID; do
-            if [ -n "$VERSION_ID" ] && [[ "$VERSION_ID" =~ ^[0-9]+$ ]]; then
-              echo "Deleting version ID: $VERSION_ID"
-              if gh api -X DELETE "/users/$USER/packages/$PACKAGE_TYPE/$ENCODED_PACKAGE_NAME/versions/$VERSION_ID" 2>/dev/null; then
-                echo "Successfully deleted version ID: $VERSION_ID"
+            # Delete each version
+            while read -r VERSION_ID; do
+              if [ -n "$VERSION_ID" ] && [[ "$VERSION_ID" =~ ^[0-9]+$ ]]; then
+                echo "Deleting version ID: $VERSION_ID"
+                if gh api -X DELETE "/users/$USER/packages/$PACKAGE_TYPE/$ENCODED_PACKAGE_NAME/versions/$VERSION_ID" 2>/dev/null; then
+                  echo "Successfully deleted version ID: $VERSION_ID"
+                else
+                  echo "Failed to delete version ID: $VERSION_ID (may already be deleted)"
+                fi
               else
-                echo "Failed to delete version ID: $VERSION_ID (may already be deleted)"
+                echo "Skipping invalid version ID: $VERSION_ID"
+              fi
+            done < /tmp/versions
+          else
+            echo "Could not access package versions - trying alternative approach"
+            
+            # Try using the repository packages API
+            echo "Trying repository packages API..."
+            REPO_OWNER="rmoriz"
+            REPO_NAME="cinc-mirror"
+            
+            if gh api "/repos/$REPO_OWNER/$REPO_NAME/packages?package_type=$PACKAGE_TYPE" --jq ".[] | select(.name == \"$PACKAGE_NAME\") | .id" > /tmp/package_id 2>/dev/null; then
+              PACKAGE_ID=$(cat /tmp/package_id)
+              echo "Found package ID: $PACKAGE_ID"
+              
+              if gh api "/repos/$REPO_OWNER/$REPO_NAME/packages/$PACKAGE_TYPE/$PACKAGE_ID/versions" --jq '.[].id' > /tmp/versions 2>/dev/null; then
+                echo "Found package versions via repository API:"
+                cat /tmp/versions
+                
+                VERSION_COUNT=$(wc -l < /tmp/versions)
+                echo "Found $VERSION_COUNT versions to delete"
+
+                # Delete each version
+                while read -r VERSION_ID; do
+                  if [ -n "$VERSION_ID" ] && [[ "$VERSION_ID" =~ ^[0-9]+$ ]]; then
+                    echo "Deleting version ID: $VERSION_ID"
+                    if gh api -X DELETE "/repos/$REPO_OWNER/$REPO_NAME/packages/$PACKAGE_TYPE/$PACKAGE_ID/versions/$VERSION_ID" 2>/dev/null; then
+                      echo "Successfully deleted version ID: $VERSION_ID"
+                    else
+                      echo "Failed to delete version ID: $VERSION_ID (may already be deleted)"
+                    fi
+                  else
+                    echo "Skipping invalid version ID: $VERSION_ID"
+                  fi
+                done < /tmp/versions
+              else
+                echo "Could not access package versions via repository API either"
               fi
             else
-              echo "Skipping invalid version ID: $VERSION_ID"
+              echo "Package not found in repository packages"
             fi
-          done < /tmp/versions
+          fi
 
           # Clean up temp files
-          rm -f /tmp/package_info /tmp/versions
+          rm -f /tmp/package_info /tmp/versions /tmp/package_id
 
           echo "All versions of $PACKAGE_NAME processed for user $USER account."
