@@ -50,12 +50,13 @@ get_versions() {
     local raw
     raw=$(curl -s -l "$FTP_BASE/" | sort -V) || return 1
     local filtered=()
+
+    # Only include specific versions for stability
+    local allowed_versions=("18.8.9" "18.8.11")
+
     for v in $raw; do
-        if [[ $v =~ ^([0-9]+)\. ]]; then
-            local major="${BASH_REMATCH[1]}"
-            if (( major >= MIN_VERSION )); then
-                filtered+=("$v")
-            fi
+        if [[ " ${allowed_versions[@]} " =~ " $v " ]]; then
+            filtered+=("$v")
         fi
     done
     echo "${filtered[@]}"
@@ -169,9 +170,9 @@ EOF
         rm -rf "$temp_dir"
         return 0
     else
-        log_error "Failed to upload $filename to GHCR"
+        log_error "Failed to upload $filename to GHCR - aborting workflow"
         rm -rf "$temp_dir"
-        return 1
+        exit 1  # Fail fast on upload errors
     fi
 }
 
@@ -338,13 +339,9 @@ should_process_file() {
     local local_path="$1"
     local remote_path="$2"
 
-    log_info "Checking if file should be processed: $remote_path"
-
     # Always verify integrity first
     verify_file_integrity "$local_path" "$remote_path"
     local integrity_result=$?
-
-    log_info "Integrity check result: $integrity_result"
 
     case $integrity_result in
         0)
@@ -427,7 +424,6 @@ main() {
                 log_info "Processing $distro $distro_version"
 
                 local ftp_dir="$FTP_BASE/$version/$distro/$distro_version"
-                log_info "Listing files in: $ftp_dir"
                 local files
                 files=$(curl -s -l "$ftp_dir/")
 
@@ -436,46 +432,28 @@ main() {
                     continue
                 fi
 
-                log_info "Found files: $files"
-                log_info "Files variable contains: '${files}'"
-                log_info "Number of files: $(echo "$files" | wc -l)"
-
                 for file in $files; do
-                    log_info "Processing file: $file"
-
                     # Skip if file is empty
-                    [ -z "$file" ] && log_info "WARNING: Empty file variable!" && continue
+                    [ -z "$file" ] && continue
 
                     # Skip symlinks (files containing ->)
                     if [[ "$file" == *' -> '* ]]; then
-                        log_info "Skipping symlink: $file"
                         continue
                     fi
 
                     # Skip metadata files for now (we'll handle them separately)
                     if [[ "$file" == *.metadata.json ]]; then
-                        log_info "Skipping metadata file: $file"
                         continue
                     fi
 
-                    log_info "About to increment total_files (current: $total_files)"
-                    if [ -z "${total_files+x}" ]; then
-                        log_error "total_files variable is not set!"
-                        exit 1
-                    fi
                     total_files=$((total_files + 1))
-                    log_info "Successfully incremented total_files to: $total_files"
                     local ftp_path="$ftp_dir/$file"
                     local local_path="$MIRROR_DIR/$version/$distro/$distro_version/$file"
                     local remote_path="$version/$distro/$distro_version/$file"
 
-                    log_info "Processing file: $file"
-
                     # Check file integrity and determine action
                     should_process_file "$local_path" "$remote_path"
                     local process_result=$?
-
-                    log_info "Process result for $file: $process_result"
 
                     case $process_result in
                         0)
