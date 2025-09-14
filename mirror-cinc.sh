@@ -166,6 +166,7 @@ get_platform() {
 upload_to_ghcr() {
     local local_path="$1"
     local remote_path="$2"
+    local platform="$3"  # Optional: os/arch format like "linux/amd64"
 
     local filename=$(basename "$local_path")
     # Sanitize the remote path for use as a tag (replace slashes with hyphens)
@@ -181,12 +182,22 @@ upload_to_ghcr() {
     # Change to temp dir to avoid exposing temp path in annotations
     pushd "$temp_dir" > /dev/null
 
+    # Build ORAS push command
+    local push_cmd=(oras push "$oci_ref"
+        --artifact-type "application/octet-stream"
+        --annotation "org.opencontainers.artifact.title=$filename"
+        --disable-path-validation)
+
+    # Add platform if provided
+    if [ -n "$platform" ]; then
+        push_cmd+=(--artifact-platform "$platform")
+        log_info "Setting platform: $platform"
+    fi
+
+    push_cmd+=("$filename")
+
     local push_output
-    if push_output=$(oras push "$oci_ref" \
-        --artifact-type "application/octet-stream" \
-        --annotation "org.opencontainers.artifact.title=$filename" \
-        --disable-path-validation \
-        "$filename" 2>&1); then
+    if push_output=$("${push_cmd[@]}" 2>&1); then
         # Extract digest from output
         local digest=$(echo "$push_output" | grep "Pushed" | sed 's/.*@sha256://')
         log_info "Successfully uploaded $filename to GHCR with digest: $digest"
@@ -209,7 +220,7 @@ mirror_version() {
     local version="$1"
     log_info "Mirroring version: $version"
 
-    local refs=() digests=() sizes=() platforms_os=() platforms_arch=()
+    local refs=()
 
     local distros
     distros=$(get_distros "$version")
@@ -252,27 +263,20 @@ mirror_version() {
 
                 # Download file
                 if download_file "$ftp_path" "$local_path"; then
-                    # Upload to GHCR
+                    # Get platform info first
+                    local os arch
+                    read os arch <<< "$(get_platform "$remote_path")"
+                    local platform="${os}/${arch}"
+
+                    # Upload to GHCR with platform info
                     local digest
-                    digest=$(upload_to_ghcr "$local_path" "$remote_path")
+                    digest=$(upload_to_ghcr "$local_path" "$remote_path" "$platform")
                     if [ -n "$digest" ]; then
-                        # Get manifest size
+                        # Get manifest reference
                         local oci_ref="ghcr.io/$GHCR_ORG/$GHCR_REPO:$(echo "$remote_path" | tr '/' '-')"
-                        local manifest_file=$(mktemp)
-                        oras manifest fetch "$oci_ref" > "$manifest_file"
-                        local size=$(wc -c < "$manifest_file")
-                        rm "$manifest_file"
 
-                        # Get platform
-                        local os arch
-                        read os arch <<< "$(get_platform "$remote_path")"
-
-                        # Collect data
+                        # Collect data for index creation
                         refs+=("$oci_ref")
-                        digests+=("$digest")
-                        sizes+=("$size")
-                        platforms_os+=("$os")
-                        platforms_arch+=("$arch")
                     fi
                 fi
             done
@@ -282,71 +286,24 @@ mirror_version() {
     # Create multi-arch index if we have uploads
     if [ ${#refs[@]} -gt 0 ]; then
         local index_ref="ghcr.io/$GHCR_ORG/$GHCR_REPO:$version"
-        log_info "Creating multi-arch index for $index_ref"
+        log_info "Creating multi-arch index for $index_ref with ${#refs[@]} manifests"
 
-        local index_json=$(mktemp)
-        cat > "$index_json" << EOF
-{
-  "schemaVersion": 2,
-  "mediaType": "application/vnd.oci.image.index.v1+json",
-  "manifests": [
-EOF
+        # Use ORAS to create multi-arch index from the uploaded manifests
+        local index_cmd=(oras manifest index create "$index_ref"
+            --artifact-type "application/vnd.oci.image.index.v1+json"
+            --annotation "org.opencontainers.artifact.title=multi-arch-cinc-$version")
 
-        for i in "${!digests[@]}"; do
-            # Validate data before adding to JSON
-            local digest="${digests[$i]}"
-            local size="${sizes[$i]}"
-            local os="${platforms_os[$i]}"
-            local arch="${platforms_arch[$i]}"
+        # Add all manifest references
+        index_cmd+=("${refs[@]}")
 
-            if [ -z "$digest" ] || [ -z "$size" ] || [ -z "$os" ] || [ -z "$arch" ]; then
-                log_error "Skipping invalid manifest data: digest='$digest', size='$size', os='$os', arch='$arch'"
-                continue
-            fi
+        log_info "Running: ${index_cmd[*]}"
 
-            if [ $i -gt 0 ]; then
-                echo "," >> "$index_json"
-            fi
-            cat >> "$index_json" << EOF
-    {
-      "mediaType": "application/vnd.oci.artifact.manifest.v1+json",
-      "digest": "sha256:${digest}",
-      "size": ${size},
-      "platform": {
-        "os": "${os}",
-        "architecture": "${arch}"
-      }
-    }
-EOF
-        done
-
-        cat >> "$index_json" << EOF
-  ]
-}
-EOF
-
-        # Validate JSON before pushing
-        if command -v jq &> /dev/null; then
-            if ! jq empty "$index_json" 2>/dev/null; then
-                log_error "Generated JSON is invalid:"
-                cat "$index_json"
-                rm "$index_json"
-                return 1
-            fi
-        fi
-
-        log_info "Generated index JSON:"
-        cat "$index_json"
-
-        if oras manifest push "$index_ref" "$index_json"; then
-            log_info "Successfully pushed multi-arch index for version $version"
+        if "${index_cmd[@]}"; then
+            log_info "Successfully created multi-arch index for version $version"
         else
-            log_error "Failed to push multi-arch index for version $version"
-            log_error "Index JSON content:"
-            cat "$index_json"
+            log_error "Failed to create multi-arch index for version $version"
+            return 1
         fi
-
-        rm "$index_json"
     fi
 }
 
