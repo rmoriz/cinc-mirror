@@ -30,7 +30,7 @@ jobs:
         echo "Installing ORAS..."
 
         # Try multiple versions in case some don't exist
-        ORAS_VERSIONS=("v1.1.0" "v1.0.0" "v0.16.0")
+        ORAS_VERSIONS=("v1.3.0" "v1.1.0" "v1.0.0" "v0.16.0")
 
         for version in "${ORAS_VERSIONS[@]}"; do
           echo "Trying ORAS version: $version"
