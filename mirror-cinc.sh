@@ -469,7 +469,9 @@ main() {
                     log_info "About to call upload_to_ghcr for: $remote_path"
                     if upload_to_ghcr "$local_path" "$remote_path"; then
                         log_info "Upload function returned successfully"
-                        ((new_files++))
+                        log_info "new_files before increment: $new_files"
+                        new_files=$((new_files + 1))
+                        log_info "new_files after increment: $new_files"
                         log_info "Successfully mirrored: $remote_path"
                     else
                         log_error "Failed to upload to GHCR: $remote_path"
