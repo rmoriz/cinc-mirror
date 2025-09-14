@@ -28,26 +28,35 @@ jobs:
 
         # Install ORAS for OCI artifact management
         echo "Installing ORAS..."
-        # Get the latest release version
-        ORAS_VERSION=$(curl -s https://api.github.com/repos/oras-project/oras/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
 
-        if [ -z "$ORAS_VERSION" ]; then
-          echo "Failed to get ORAS version, using fallback"
-          ORAS_VERSION="v1.1.0"
-        fi
-
+        # Use a known working version
+        ORAS_VERSION="v1.2.0"
         echo "Using ORAS version: $ORAS_VERSION"
 
-        # Download and install ORAS
-        curl -LO "https://github.com/oras-project/oras/releases/download/${ORAS_VERSION}/oras_linux_amd64.tar.gz"
-        mkdir -p oras-install/
-        tar -zxf "oras_linux_amd64.tar.gz" -C oras-install/
-        sudo mv oras-install/oras /usr/local/bin/
-        rm -rf oras-install/ oras_linux_amd64.tar.gz
+        # Download and install ORAS with error handling
+        if ! curl -f -L -o oras_linux_amd64.tar.gz "https://github.com/oras-project/oras/releases/download/${ORAS_VERSION}/oras_linux_amd64.tar.gz"; then
+          echo "Failed to download ORAS, trying alternative method..."
+          # Try alternative download method
+          curl -f -L -o oras "https://github.com/oras-project/oras/releases/download/${ORAS_VERSION}/oras_linux_amd64"
+          chmod +x oras
+          sudo mv oras /usr/local/bin/
+        else
+          # Extract the tar.gz
+          mkdir -p oras-install/
+          tar -zxf oras_linux_amd64.tar.gz -C oras-install/
+          sudo mv oras-install/oras /usr/local/bin/
+          rm -rf oras-install/ oras_linux_amd64.tar.gz
+        fi
 
         # Verify installations
         echo "Verifying installations..."
-        oras version
+        if command -v oras >/dev/null 2>&1; then
+          oras version
+          echo "✅ ORAS installed successfully"
+        else
+          echo "❌ ORAS installation failed"
+          exit 1
+        fi
 
         echo "✅ All dependencies installed successfully"
 
