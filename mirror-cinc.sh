@@ -423,8 +423,16 @@ main() {
                 log_info "Processing $distro $distro_version"
 
                 local ftp_dir="$FTP_BASE/$version/$distro/$distro_version"
+                log_info "Listing files in: $ftp_dir"
                 local files
                 files=$(curl -s -l "$ftp_dir/")
+
+                if [ -z "$files" ]; then
+                    log_warn "No files found in: $ftp_dir"
+                    continue
+                fi
+
+                log_info "Found files: $files"
 
                 for file in $files; do
                     ((total_files++))
