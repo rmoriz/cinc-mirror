@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cinc Mirror - Installation Script</title>
+    <style>
+        body {
+            font-family: 'Courier New', monospace;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+            color: #333;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 2px solid #007acc;
+        }
+        .download-section {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .download-btn {
+            display: inline-block;
+            background: #007acc;
+            color: white;
+            padding: 12px 24px;
+            text-decoration: none;
+            border-radius: 5px;
+            font-weight: bold;
+            margin: 10px;
+        }
+        .download-btn:hover {
+            background: #005999;
+        }
+        .script-content {
+            background: #2d3748;
+            color: #e2e8f0;
+            padding: 20px;
+            border-radius: 5px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            font-size: 14px;
+            line-height: 1.4;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #ddd;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🍳 Cinc Mirror</h1>
+            <p>Installation script for Cinc (Chef alternative)</p>
+        </div>
+        
+        <div class="download-section">
+            <h2>Download Installation Script</h2>
+            <p>Get the latest installation script for Cinc:</p>
+            <a href="./install.sh" class="download-btn" download>📥 Download install.sh</a>
+            <a href="https://github.com/rmoriz/cinc-mirror" class="download-btn" target="_blank">📖 View on GitHub</a>
+        </div>
+        
+        <h2>Installation Script Content</h2>
+        <div class="script-content" id="script-content">
+            Loading script content...
+        </div>
+        
+        <div class="footer">
+            <p>
+                This script is served from the <a href="https://github.com/rmoriz/cinc-mirror/tree/gh-pages">gh-pages branch</a> of the 
+                <a href="https://github.com/rmoriz/cinc-mirror">cinc-mirror repository</a>.
+            </p>
+            <p>
+                For more information about Cinc, visit <a href="https://cinc.sh">cinc.sh</a>
+            </p>
+        </div>
+    </div>
+
+    <script>
+        // Load the install.sh script content
+        fetch('./install.sh')
+            .then(response => response.text())
+            .then(content => {
+                document.getElementById('script-content').textContent = content;
+            })
+            .catch(error => {
+                document.getElementById('script-content').textContent = 
+                    'Error loading script content: ' + error.message + '\n\n' +
+                    'You can still download the script using the button above.';
+            });
+    </script>
+</body>
+</html>
