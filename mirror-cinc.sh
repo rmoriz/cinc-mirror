@@ -440,9 +440,13 @@ main() {
                     local local_path="$MIRROR_DIR/$version/$distro/$distro_version/$file"
                     local remote_path="$version/$distro/$distro_version/$file"
 
+                    log_info "Processing file: $file"
+
                     # Check file integrity and determine action
                     should_process_file "$local_path" "$remote_path"
                     local process_result=$?
+
+                    log_info "Process result for $file: $process_result"
 
                     case $process_result in
                         0)
