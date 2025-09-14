@@ -433,8 +433,11 @@ main() {
                 fi
 
                 log_info "Found files: $files"
+                log_info "Files variable contains: '${files}'"
+                log_info "Number of files: $(echo "$files" | wc -l)"
 
                 for file in $files; do
+                    log_info "Loop iteration - file: '$file'"
                     ((total_files++))
                     local ftp_path="$ftp_dir/$file"
                     local local_path="$MIRROR_DIR/$version/$distro/$distro_version/$file"
