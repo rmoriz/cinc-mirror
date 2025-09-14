@@ -444,7 +444,11 @@ main() {
                     log_info "Loop iteration - file: '$file' (length: ${#file})"
                     [ -z "$file" ] && log_info "WARNING: Empty file variable!" && continue
                     log_info "About to increment total_files (current: $total_files)"
-                    ((total_files++))
+                    if [ -z "${total_files+x}" ]; then
+                        log_error "total_files variable is not set!"
+                        exit 1
+                    fi
+                    total_files=$((total_files + 1))
                     log_info "Successfully incremented total_files to: $total_files"
                     local ftp_path="$ftp_dir/$file"
                     local local_path="$MIRROR_DIR/$version/$distro/$distro_version/$file"
