@@ -98,7 +98,7 @@ jobs:
           MIRROR_DIR: ./cinc-mirror
           MIN_VERSION: ${{ steps.config.outputs.min_version }}
           TARGET_DISTROS: debian
-          FTP_BASE: ftp://downloads.cinc.sh/pub/cinc/files/stable/cinc
+          FTP_BASE: ftps://downloads.cinc.sh/pub/cinc/files/stable/cinc
         run: |
           echo "🚀 Starting Cinc mirror process..."
           echo "GHCR_ORG: $GHCR_ORG"

@@ -102,9 +102,9 @@ echo
 
 # Test 4: Check FTP connectivity
 echo "4. Checking FTP connectivity..."
-FTP_BASE="${FTP_BASE:-ftp://downloads.cinc.sh/pub/cinc/files/stable/cinc}"
+FTP_BASE="${FTP_BASE:-ftps://downloads.cinc.sh/pub/cinc/files/stable/cinc}"
 
-if curl -s --connect-timeout 10 "$FTP_BASE/" &> /dev/null; then
+if curl -s --ftp-ssl --connect-timeout 10 "$FTP_BASE/" &> /dev/null; then
     log_success "FTP site is accessible"
 else
     log_error "Cannot connect to FTP site"
@@ -116,7 +116,7 @@ echo
 
 # Test 5: Check available versions
 echo "5. Checking available versions..."
-versions=$(curl -s -l "$FTP_BASE/" 2>/dev/null | sort -V)
+versions=$(curl -s --ftp-ssl -l "$FTP_BASE/" 2>/dev/null | sort -V)
 if [ -n "$versions" ]; then
     log_success "Found versions on FTP site"
     echo "Sample versions: $(echo "$versions" | tail -5 | tr '\n' ' ')"

@@ -112,7 +112,7 @@ verify_file() {
 # Function to compare with remote source
 compare_with_remote() {
     local remote_path="$1"
-    local ftp_base="${FTP_BASE:-ftp://downloads.cinc.sh/pub/cinc/files/stable/cinc}"
+    local ftp_base="${FTP_BASE:-ftps://downloads.cinc.sh/pub/cinc/files/stable/cinc}"
     local ftp_url="$ftp_base/$remote_path"
     local local_path="$MIRROR_DIR/$remote_path"
 
@@ -120,7 +120,7 @@ compare_with_remote() {
 
     # Get remote file info
     local remote_info
-    remote_info=$(curl -s -I "$ftp_url")
+    remote_info=$(curl -s --ftp-ssl -I "$ftp_url")
 
     if [ $? -ne 0 ]; then
         log_error "Failed to connect to remote: $ftp_url"

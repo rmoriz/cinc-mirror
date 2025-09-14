@@ -66,8 +66,8 @@ MIN_VERSION="18"
 # Target distributions to mirror (space-separated)
 TARGET_DISTROS="debian ubuntu"
 
-# FTP base URL
-FTP_BASE="ftp://downloads.cinc.sh/pub/cinc/files/stable/cinc"
+# FTPS base URL
+FTP_BASE="ftps://downloads.cinc.sh/pub/cinc/files/stable/cinc"
 EOF
     echo "✓ Created config.env template"
     echo "  Please edit config.env with your GitHub username/organization"

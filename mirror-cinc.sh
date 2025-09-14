@@ -11,7 +11,7 @@ if [ -f "config.env" ]; then
 fi
 
 # Configuration (with defaults)
-FTP_BASE="${FTP_BASE:-ftp://downloads.cinc.sh/pub/cinc/files/stable/cinc}"
+FTP_BASE="${FTP_BASE:-ftps://downloads.cinc.sh/pub/cinc/files/stable/cinc}"
 GHCR_ORG="${GHCR_ORG:-your-github-org}"  # Set your GitHub org/username
 GHCR_REPO="${GHCR_REPO:-cinc-packages}"  # Repository name for packages
 MIRROR_DIR="${MIRROR_DIR:-./cinc-mirror}"
@@ -44,11 +44,11 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Get list of versions from FTP (logs -> stderr, data -> stdout)
+# Get list of versions from FTPS (logs -> stderr, data -> stdout)
 get_versions() {
-    log_info "Fetching available versions from FTP..." >&2
+    log_info "Fetching available versions from FTPS..." >&2
     local raw
-    raw=$(curl -s -l "$FTP_BASE/" | sort -V) || return 1
+    raw=$(curl -s --ftp-ssl -l "$FTP_BASE/" | sort -V) || return 1
     local filtered=()
 
     # Only include specific versions for stability
@@ -67,14 +67,14 @@ get_distros() {
     local version="$1"
     local pattern
     pattern="$(IFS=\|; echo "${TARGET_DISTROS_ARRAY[*]}")"
-    curl -s -l "$FTP_BASE/$version/" | grep -E "^(${pattern})$" || true
+    curl -s --ftp-ssl -l "$FTP_BASE/$version/" | grep -E "^(${pattern})$" || true
 }
 
 # Get distro versions for a distro
 get_distro_versions() {
     local version="$1"
     local distro="$2"
-    curl -s -l "$FTP_BASE/$version/$distro/"
+    curl -s --ftp-ssl -l "$FTP_BASE/$version/$distro/"
 }
 
 # Check dependencies
@@ -123,14 +123,14 @@ authenticate_ghcr() {
     }
 }
 
-# Download file from FTP
+# Download file from FTPS
 download_file() {
     local ftp_path="$1"
     local local_path="$2"
 
     mkdir -p "$(dirname "$local_path")"
 
-    if curl -s "$ftp_path" -o "$local_path"; then
+    if curl -s --ftp-ssl "$ftp_path" -o "$local_path"; then
         log_info "Downloaded: $ftp_path -> $local_path"
         return 0
     else
@@ -251,7 +251,7 @@ mirror_version() {
 
             local ftp_dir="$FTP_BASE/$version/$distro/$distro_version"
             local files
-            files=$(curl -s -l "$ftp_dir/")
+            files=$(curl -s --ftp-ssl -l "$ftp_dir/")
 
             for file in $files; do
                 # Skip if file is empty
@@ -392,7 +392,7 @@ verify_file_integrity() {
 
     # Check if remote file has changed
     local remote_checksum
-    remote_checksum=$(curl -s -I "$FTP_BASE/$remote_path" | grep -i "content-length" | awk '{print $2}' | tr -d '\r')
+    remote_checksum=$(curl -s --ftp-ssl -I "$FTP_BASE/$remote_path" | grep -i "content-length" | awk '{print $2}' | tr -d '\r')
 
     if [ -n "$remote_checksum" ]; then
         local local_size

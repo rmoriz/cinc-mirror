@@ -1,0 +1,4 @@
+sha1	0f41819c41f7430723d3b88ea3e42302a4dc6571
+sha256	247877e8509dbfff18f4efb6f31a026eb1ec0a1a6dc6177863adef0fdee7c07f
+url	https://packages.cinc.sh/files/stable/cinc/18.8.11/ubuntu/20.04/cinc_18.8.11-1_amd64.deb
+version	18.8.11

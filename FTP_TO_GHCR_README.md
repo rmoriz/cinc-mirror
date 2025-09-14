@@ -5,7 +5,7 @@ This script mirrors Cinc packages from the official FTP site to GitHub Container
 ## Features
 
 - **Immutable Mirroring**: Once mirrored, files are never updated - changes trigger security alerts
-- Mirrors Cinc packages from `ftp://downloads.cinc.sh/pub/cinc/files/stable/cinc/`
+- Mirrors Cinc packages from `ftps://downloads.cinc.sh/pub/cinc/files/stable/cinc/`
 - Filters versions 18 and above (configurable)
 - Only processes Debian and Ubuntu distributions
 - Downloads all package files and metadata
@@ -124,11 +124,11 @@ The script can be configured via environment variables:
 - `MIRROR_DIR`: Local directory for downloaded files (default: "./cinc-mirror")
 - `MIN_VERSION`: Minimum version to mirror (default: "18")
 
-## FTP Structure
+## FTPS Structure
 
 The script processes this structure:
 ```
-ftp://downloads.cinc.sh/pub/cinc/files/stable/cinc/
+ftps://downloads.cinc.sh/pub/cinc/files/stable/cinc/
 ├── 18.0.169/
 │   ├── debian/
 │   │   ├── 11/
