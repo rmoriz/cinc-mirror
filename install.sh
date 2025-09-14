@@ -799,22 +799,20 @@ do_ghcr_blob_download() {
   
   echo "Fetching blob from $blob_ref"
   
-  # Get authentication token if needed
-  local token=""
-  if command -v docker >/dev/null 2>&1; then
-    # Try to get token from docker credentials
-    local auth_url="https://$registry/token?service=$registry&scope=repository:$repo_path:pull"
-    local token_response=$(curl -s "$auth_url" 2>/dev/null || echo "")
-    if test -n "$token_response"; then
-      token=$(echo "$token_response" | grep -o '"token":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
-    fi
-  fi
-  
   # Construct the blob URL
   local blob_url="https://$registry/v2/$repo_path/blobs/sha256:$sha256_hash"
-  
-  # Fetch the blob
+
+  # Fetch the blob with fresh authentication
   echo "Downloading to $output_file..."
+
+  # Get fresh authentication token
+  local token=""
+  local auth_url="https://$registry/token?service=$registry&scope=repository:$repo_path:pull"
+  local token_response=$(curl -s "$auth_url" 2>/dev/null || echo "")
+  if test -n "$token_response"; then
+    token=$(echo "$token_response" | grep -o '"token":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
+  fi
+
   if test -n "$token"; then
     curl -L -H "Authorization: Bearer $token" -o "$output_file" "$blob_url"
   else
