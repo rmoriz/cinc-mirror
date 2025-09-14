@@ -22,6 +22,24 @@ jobs:
         chmod +x mirror-cinc.sh
         chmod +x security-incident-response.sh
 
+    - name: Install dependencies
+      run: |
+        echo "📦 Installing required dependencies..."
+
+        # Install ORAS for OCI artifact management
+        echo "Installing ORAS..."
+        curl -LO https://github.com/oras-project/oras/releases/latest/download/oras_linux_amd64.tar.gz
+        mkdir -p oras-install/
+        tar -zxf oras_linux_amd64.tar.gz -C oras-install/
+        sudo mv oras-install/oras /usr/local/bin/
+        rm -rf oras-install/ oras_linux_amd64.tar.gz
+
+        # Verify installations
+        echo "Verifying installations..."
+        oras version
+
+        echo "✅ All dependencies installed successfully"
+
     - name: Set mirror configuration
       id: config
       run: |
