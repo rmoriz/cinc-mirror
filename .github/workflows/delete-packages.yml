@@ -5,11 +5,6 @@ name: Delete Cinc Packages (rmoriz/cinc-packages)
 
 on:
   workflow_dispatch:
-    inputs:
-      confirm:
-        description: 'Type "DELETE_CINC_PACKAGES" to confirm deletion of all cinc-packages from rmoriz account'
-        required: true
-        type: string
 
 jobs:
   delete-packages:
@@ -24,13 +19,6 @@ jobs:
       - name: Authenticate with GitHub
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
-
-      - name: Confirm deletion
-        run: |
-          if [ "${{ github.event.inputs.confirm }}" != "DELETE_CINC_PACKAGES" ]; then
-            echo "Confirmation failed. Expected 'DELETE_CINC_PACKAGES' but got '${{ github.event.inputs.confirm }}'."
-            exit 1
-          fi
 
       - name: Delete all packages
         run: |
