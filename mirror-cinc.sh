@@ -22,8 +22,8 @@ if [ -n "$TARGET_DISTROS" ] && [ "${TARGET_DISTROS:0:1}" != "(" ]; then
     # TARGET_DISTROS is a string, convert to array
     IFS=' ' read -r -a TARGET_DISTROS_ARRAY <<< "$TARGET_DISTROS"
 else
-    # Use default array
-    TARGET_DISTROS_ARRAY=("debian" "ubuntu")
+    # Use default array (limited to debian for testing)
+    TARGET_DISTROS_ARRAY=("debian")
 fi
 
 # Colors for output
@@ -220,6 +220,11 @@ mirror_version() {
         distro_versions=$(get_distro_versions "$version" "$distro")
 
         for distro_version in $distro_versions; do
+            # For testing, limit to debian 12 only
+            if [ "$distro" = "debian" ] && [ "$distro_version" != "12" ]; then
+                log_info "Skipping $distro $distro_version (testing limited to debian 12)"
+                continue
+            fi
             log_info "Processing $distro $distro_version"
 
             local ftp_dir="$FTP_BASE/$version/$distro/$distro_version"
