@@ -1,0 +1,73 @@
+name: Delete All Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "DELETE_ALL_PACKAGES" to confirm deletion'
+        required: true
+        type: string
+
+jobs:
+  delete-packages:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup GitHub CLI
+        run: |
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update
+          sudo apt install gh
+
+      - name: Authenticate with GitHub
+        run: |
+          echo ${{ secrets.GITHUB_TOKEN }} | gh auth login --with-token
+
+      - name: Confirm deletion
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "DELETE_ALL_PACKAGES" ]; then
+            echo "Confirmation failed. Aborting."
+            exit 1
+          fi
+
+      - name: Delete all packages
+        run: |
+          ORG="rmoriz"
+          PACKAGE_NAME="cinc-packages"
+          PACKAGE_TYPE="container"
+
+          echo "Listing packages for org: $ORG"
+
+          # Get package ID
+          PACKAGE_ID=$(gh api "/orgs/$ORG/packages?package_type=$PACKAGE_TYPE" --jq ".[] | select(.name == \"$PACKAGE_NAME\") | .id")
+
+          if [ -z "$PACKAGE_ID" ]; then
+            echo "Package $PACKAGE_NAME not found."
+            exit 0
+          fi
+
+          echo "Found package ID: $PACKAGE_ID"
+
+          # List versions
+          VERSIONS=$(gh api "/orgs/$ORG/packages/$PACKAGE_TYPE/$PACKAGE_NAME/versions" --jq '.[].id')
+
+          if [ -z "$VERSIONS" ]; then
+            echo "No versions found for package $PACKAGE_NAME."
+            exit 0
+          fi
+
+          echo "Deleting versions: $VERSIONS"
+
+          # Delete each version
+          for VERSION_ID in $VERSIONS; do
+            echo "Deleting version ID: $VERSION_ID"
+            gh api -X DELETE "/orgs/$ORG/packages/$PACKAGE_TYPE/$PACKAGE_NAME/versions/$VERSION_ID"
+          done
+
+          echo "All versions deleted."
