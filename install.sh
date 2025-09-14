@@ -664,7 +664,7 @@ if test "x$download_url_override" = "x"; then
 
   metadata_filename="$tmp_dir/metadata.txt"
   metadata_url="https://omnitruck.cinc.sh/$channel/$project/metadata?v=$version&p=$platform&pv=$platform_version&m=$machine"
-   blob_url="ghcr.io/rmoriz/cinc-mirror/cinc@sha256"
+   blob_url="ghcr.io/rmoriz/cinc-packages/cinc@sha256"
   do_download "$metadata_url"  "$metadata_filename"
 
   cat "$metadata_filename"
@@ -794,7 +794,7 @@ do_ghcr_blob_download() {
   local sha256_hash="$1"
   local output_file="$2"
   local registry="ghcr.io"
-  local repo_path="rmoriz/cinc-mirror/cinc"
+  local repo_path="rmoriz/cinc-packages/cinc"
   local blob_ref="${registry}/${repo_path}@sha256:${sha256_hash}"
   
   echo "Fetching blob from $blob_ref"
