@@ -167,6 +167,8 @@ upload_to_ghcr() {
     local local_path="$1"
     local remote_path="$2"
     local platform="$3"  # Optional: os/arch format like "linux/amd64"
+    local distro="$4"    # Optional: distro name like "debian"
+    local distro_version="$5"  # Optional: distro version like "12"
 
     local filename=$(basename "$local_path")
     # Sanitize the remote path for use as a tag (replace slashes with hyphens)
@@ -192,6 +194,14 @@ upload_to_ghcr() {
     if [ -n "$platform" ]; then
         push_cmd+=(--artifact-platform "$platform")
         log_info "Setting platform: $platform"
+    fi
+
+    # Add distro annotations if provided
+    if [ -n "$distro" ]; then
+        push_cmd+=(--annotation "org.opencontainers.artifact.description.distro=$distro")
+    fi
+    if [ -n "$distro_version" ]; then
+        push_cmd+=(--annotation "org.opencontainers.artifact.description.distro-version=$distro_version")
     fi
 
     push_cmd+=("$filename")
@@ -268,9 +278,9 @@ mirror_version() {
                     read os arch <<< "$(get_platform "$remote_path")"
                     local platform="${os}/${arch}"
 
-                    # Upload to GHCR with platform info
+                    # Upload to GHCR with platform and distro info
                     local digest
-                    digest=$(upload_to_ghcr "$local_path" "$remote_path" "$platform")
+                    digest=$(upload_to_ghcr "$local_path" "$remote_path" "$platform" "$distro" "$distro_version")
                     if [ -n "$digest" ]; then
                         # Get manifest reference
                         local oci_ref="ghcr.io/$GHCR_ORG/$GHCR_REPO:$(echo "$remote_path" | tr '/' '-')"
@@ -291,7 +301,8 @@ mirror_version() {
         # Use ORAS to create multi-arch index from the uploaded manifests
         local index_cmd=(oras manifest index create "$index_ref"
             --artifact-type "application/vnd.oci.image.index.v1+json"
-            --annotation "org.opencontainers.artifact.title=multi-arch-cinc-$version")
+            --annotation "org.opencontainers.artifact.title=multi-arch-cinc-$version"
+            --annotation "org.opencontainers.artifact.description.version=$version")
 
         # Add all manifest references
         index_cmd+=("${refs[@]}")
