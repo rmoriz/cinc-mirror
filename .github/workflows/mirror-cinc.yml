@@ -93,6 +93,43 @@ jobs:
         echo "min_version=$MIN_VERSION" >> $GITHUB_OUTPUT
         echo "Using minimum version: $MIN_VERSION"
 
+    - name: Debug FTP structure
+      run: |
+        echo "🔍 Debugging FTP structure..."
+        echo "Testing FTP connection and directory listing..."
+
+        # Test basic FTP connection
+        if curl -s -l "ftp://downloads.cinc.sh/pub/cinc/files/stable/cinc/" | head -10; then
+          echo "✅ FTP connection successful"
+        else
+          echo "❌ FTP connection failed"
+          exit 1
+        fi
+
+        # Test version directory
+        if curl -s -l "ftp://downloads.cinc.sh/pub/cinc/files/stable/cinc/18.0.169/" | head -5; then
+          echo "✅ Version directory accessible"
+        else
+          echo "❌ Version directory access failed"
+          exit 1
+        fi
+
+        # Test distro directory
+        if curl -s -l "ftp://downloads.cinc.sh/pub/cinc/files/stable/cinc/18.0.169/debian/" | head -5; then
+          echo "✅ Distro directory accessible"
+        else
+          echo "❌ Distro directory access failed"
+          exit 1
+        fi
+
+        # Test distro version directory
+        if curl -s -l "ftp://downloads.cinc.sh/pub/cinc/files/stable/cinc/18.0.169/debian/10/" | head -5; then
+          echo "✅ Distro version directory accessible"
+        else
+          echo "❌ Distro version directory access failed"
+          exit 1
+        fi
+
     - name: Run Cinc mirror script
       env:
         GHCR_ORG: ${{ github.repository_owner }}
@@ -108,8 +145,8 @@ jobs:
         echo "MIN_VERSION: $MIN_VERSION"
         echo "TARGET_DISTROS: $TARGET_DISTROS"
 
-        # Run the mirror script
-        if ./mirror-cinc.sh; then
+        # Run the mirror script with error output
+        if ./mirror-cinc.sh 2>&1; then
           echo "✅ Mirror process completed successfully"
         else
           echo "❌ Mirror process failed"
