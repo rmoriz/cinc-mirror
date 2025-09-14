@@ -465,13 +465,16 @@ main() {
                             if download_file "$ftp_path" "$local_path"; then
                                 # Store checksum before uploading
                                 if store_checksum "$local_path" "$remote_path"; then
-                                    # Upload to GHCR
-                                    if upload_to_ghcr "$local_path" "$remote_path"; then
-                                        ((new_files++))
-                                        log_info "Successfully mirrored: $remote_path"
-                                    else
-                                        log_error "Failed to upload to GHCR: $remote_path"
-                                    fi
+                    # Upload to GHCR
+                    log_info "About to call upload_to_ghcr for: $remote_path"
+                    if upload_to_ghcr "$local_path" "$remote_path"; then
+                        log_info "Upload function returned successfully"
+                        ((new_files++))
+                        log_info "Successfully mirrored: $remote_path"
+                    else
+                        log_error "Failed to upload to GHCR: $remote_path"
+                    fi
+                    log_info "Finished processing file: $file"
                                 else
                                     log_error "Failed to store checksum for: $remote_path"
                                 fi
