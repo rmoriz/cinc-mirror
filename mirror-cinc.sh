@@ -93,6 +93,10 @@ check_dependencies() {
         missing_deps+=("oras (OCI Registry as Storage)")
     fi
 
+    if ! command -v docker &> /dev/null && ! command -v podman &> /dev/null; then
+        missing_deps+=("docker or podman (for multi-arch manifests)")
+    fi
+
     if [ ${#missing_deps[@]} -ne 0 ]; then
         log_error "Missing dependencies: ${missing_deps[*]}"
         log_info "Please install missing dependencies and try again."
@@ -135,6 +139,29 @@ download_file() {
     fi
 }
 
+# Get platform from remote path
+get_platform() {
+    local remote_path="$1"
+    local os="linux"
+    local arch=""
+
+    if [[ "$remote_path" == *amd64* ]]; then
+        arch="amd64"
+    elif [[ "$remote_path" == *arm64* ]]; then
+        arch="arm64"
+    elif [[ "$remote_path" == *i386* ]]; then
+        arch="386"
+    elif [[ "$remote_path" == *riscv64* ]]; then
+        arch="riscv64"
+    elif [[ "$remote_path" == *ppc64el* ]]; then
+        arch="ppc64le"
+    else
+        arch="unknown"
+    fi
+
+    echo "$os $arch"
+}
+
 # Upload file to GHCR using ORAS
 upload_to_ghcr() {
     local local_path="$1"
@@ -154,17 +181,22 @@ upload_to_ghcr() {
     # Change to temp dir to avoid exposing temp path in annotations
     pushd "$temp_dir" > /dev/null
 
-    if oras push "$oci_ref" \
+    local push_output
+    if push_output=$(oras push "$oci_ref" \
         --artifact-type "application/octet-stream" \
         --annotation "org.opencontainers.artifact.title=$filename" \
         --disable-path-validation \
-        "$filename"; then
-        log_info "Successfully uploaded $filename to GHCR"
+        "$filename" 2>&1); then
+        # Extract digest from output
+        local digest=$(echo "$push_output" | grep "Pushed" | sed 's/.*@sha256://')
+        log_info "Successfully uploaded $filename to GHCR with digest: $digest"
         popd > /dev/null
         rm -rf "$temp_dir"
+        echo "$digest"
         return 0
     else
         log_error "Failed to upload $filename to GHCR - aborting workflow"
+        log_error "ORAS output: $push_output"
         popd > /dev/null
         rm -rf "$temp_dir"
         exit 1  # Fail fast on upload errors
@@ -175,6 +207,8 @@ upload_to_ghcr() {
 mirror_version() {
     local version="$1"
     log_info "Mirroring version: $version"
+
+    local refs=() digests=() sizes=() platforms_os=() platforms_arch=()
 
     local distros
     distros=$(get_distros "$version")
@@ -193,6 +227,19 @@ mirror_version() {
             files=$(curl -s -l "$ftp_dir/")
 
             for file in $files; do
+                # Skip if file is empty
+                [ -z "$file" ] && continue
+
+                # Skip symlinks (files containing ->)
+                if [[ "$file" == *' -> '* ]]; then
+                    continue
+                fi
+
+                # Skip metadata files for now (we'll handle them separately)
+                if [[ "$file" == *.metadata.json ]]; then
+                    continue
+                fi
+
                 local ftp_path="$ftp_dir/$file"
                 local local_path="$MIRROR_DIR/$version/$distro/$distro_version/$file"
                 local remote_path="$version/$distro/$distro_version/$file"
@@ -200,11 +247,75 @@ mirror_version() {
                 # Download file
                 if download_file "$ftp_path" "$local_path"; then
                     # Upload to GHCR
-                    upload_to_ghcr "$local_path" "$remote_path"
+                    local digest
+                    digest=$(upload_to_ghcr "$local_path" "$remote_path")
+                    if [ -n "$digest" ]; then
+                        # Get manifest size
+                        local oci_ref="ghcr.io/$GHCR_ORG/$GHCR_REPO:$(echo "$remote_path" | tr '/' '-')"
+                        local manifest_file=$(mktemp)
+                        oras manifest fetch "$oci_ref" > "$manifest_file"
+                        local size=$(wc -c < "$manifest_file")
+                        rm "$manifest_file"
+
+                        # Get platform
+                        local os arch
+                        read os arch <<< "$(get_platform "$remote_path")"
+
+                        # Collect data
+                        refs+=("$oci_ref")
+                        digests+=("$digest")
+                        sizes+=("$size")
+                        platforms_os+=("$os")
+                        platforms_arch+=("$arch")
+                    fi
                 fi
             done
         done
     done
+
+    # Create multi-arch index if we have uploads
+    if [ ${#refs[@]} -gt 0 ]; then
+        local index_ref="ghcr.io/$GHCR_ORG/$GHCR_REPO:$version"
+        log_info "Creating multi-arch index for $index_ref"
+
+        local index_json=$(mktemp)
+        cat > "$index_json" << EOF
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "manifests": [
+EOF
+
+        for i in "${!digests[@]}"; do
+            if [ $i -gt 0 ]; then
+                echo "," >> "$index_json"
+            fi
+            cat >> "$index_json" << EOF
+    {
+      "mediaType": "application/vnd.oci.artifact.manifest.v1+json",
+      "digest": "sha256:${digests[$i]}",
+      "size": ${sizes[$i]},
+      "platform": {
+        "os": "${platforms_os[$i]}",
+        "architecture": "${platforms_arch[$i]}"
+      }
+    }
+EOF
+        done
+
+        cat >> "$index_json" << EOF
+  ]
+}
+EOF
+
+        if oras manifest push "$index_ref" "$index_json"; then
+            log_info "Successfully pushed multi-arch index for version $version"
+        else
+            log_error "Failed to push multi-arch index for version $version"
+        fi
+
+        rm "$index_json"
+    fi
 }
 
 # Checksum storage and verification
@@ -395,131 +506,12 @@ main() {
 
     log_info "Found versions to mirror: $versions"
 
-    # Track statistics
-    total_files=0
-    new_files=0
-    skipped_files=0
-    integrity_violations=0
-    security_alerts=0
-
     # Mirror each version
     for version in $versions; do
-        log_info "Processing version: $version"
-
-        local distros
-        distros=$(get_distros "$version")
-
-        for distro in $distros; do
-            log_info "Processing distro: $distro"
-
-            local distro_versions
-            distro_versions=$(get_distro_versions "$version" "$distro")
-
-            for distro_version in $distro_versions; do
-                log_info "Processing $distro $distro_version"
-
-                local ftp_dir="$FTP_BASE/$version/$distro/$distro_version"
-                local files
-                files=$(curl -s -l "$ftp_dir/")
-
-                if [ -z "$files" ]; then
-                    log_warn "No files found in: $ftp_dir"
-                    continue
-                fi
-
-                for file in $files; do
-                    # Skip if file is empty
-                    [ -z "$file" ] && continue
-
-                    # Skip symlinks (files containing ->)
-                    if [[ "$file" == *' -> '* ]]; then
-                        continue
-                    fi
-
-                    # Skip metadata files for now (we'll handle them separately)
-                    if [[ "$file" == *.metadata.json ]]; then
-                        continue
-                    fi
-
-                    total_files=$((total_files + 1))
-                    local ftp_path="$ftp_dir/$file"
-                    local local_path="$MIRROR_DIR/$version/$distro/$distro_version/$file"
-                    local remote_path="$version/$distro/$distro_version/$file"
-
-                    # Check file integrity and determine action
-                    should_process_file "$local_path" "$remote_path"
-                    local process_result=$?
-
-                    case $process_result in
-                        0)
-                            # File doesn't exist, download and store
-                            log_info "Downloading new file: $remote_path"
-                             if download_file "$ftp_path" "$local_path"; then
-                                 # Store checksum before uploading
-                                 if store_checksum "$local_path" "$remote_path"; then
-                                     # Upload to GHCR
-                                     if upload_to_ghcr "$local_path" "$remote_path"; then
-                                         new_files=$((new_files + 1))
-                                         log_info "Successfully mirrored: $remote_path"
-                                     else
-                                         log_error "Failed to upload to GHCR: $remote_path"
-                                     fi
-                                 else
-                                     log_error "Failed to store checksum for: $remote_path"
-                                 fi
-                             else
-                                 log_error "Failed to download: $ftp_path"
-                             fi
-                            ;;
-                        1)
-                            # File exists and verified, skip
-                            ((skipped_files++))
-                            ;;
-                        2)
-                            # Local integrity violation
-                            ((integrity_violations++))
-                            log_error "SKIPPING FILE DUE TO LOCAL INTEGRITY VIOLATION: $remote_path"
-                            ;;
-                        3)
-                            # Remote change detected - security incident
-                            ((security_alerts++))
-                            log_error "SECURITY INCIDENT: Remote change detected for immutable file: $remote_path"
-                            ;;
-                        *)
-                            log_error "Unknown processing result ($process_result) for: $remote_path"
-                            ;;
-                    esac
-                done
-            done
-        done
+        mirror_version "$version"
     done
 
-    # Log final statistics
     log_info "Mirror process completed"
-    log_info "Statistics:"
-    log_info "  - Total files processed: $total_files"
-    log_info "  - New files mirrored: $new_files"
-    log_info "  - Files skipped (already exist): $skipped_files"
-    log_info "  - Integrity violations detected: $integrity_violations"
-    log_info "  - Security alerts triggered: $security_alerts"
-
-    # Security summary
-    if [ $security_alerts -gt 0 ]; then
-        log_error "🚨 SECURITY INCIDENTS DETECTED: $security_alerts files have changed on the source!"
-        log_error "These files have been left unchanged in the mirror for security review."
-    fi
-
-    if [ $integrity_violations -gt 0 ]; then
-        log_error "⚠️  INTEGRITY VIOLATIONS DETECTED: $integrity_violations local files are corrupted!"
-        log_error "These files should be investigated and potentially re-downloaded."
-    fi
-
-    # Save statistics for GitHub Actions
-    echo "MIRROR_STATS_TOTAL=$total_files" >> $GITHUB_ENV
-    echo "MIRROR_STATS_NEW=$new_files" >> $GITHUB_ENV
-    echo "MIRROR_STATS_SKIPPED=$skipped_files" >> $GITHUB_ENV
-    echo "MIRROR_STATS_INTEGRITY_VIOLATIONS=$integrity_violations" >> $GITHUB_ENV
-    echo "MIRROR_STATS_SECURITY_ALERTS=$security_alerts" >> $GITHUB_ENV
 }
 
 # Run main function
