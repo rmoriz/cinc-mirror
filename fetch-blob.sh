@@ -49,13 +49,11 @@ echo "Fetching blob from $REGISTRY/$REPO_PATH with digest $DIGEST"
 
 # Get authentication token if needed
 TOKEN=""
-if command -v docker >/dev/null 2>&1; then
-    # Try to get token from docker credentials
-    AUTH_URL="https://$REGISTRY/token?service=$REGISTRY&scope=repository:$REPO_PATH:pull"
-    TOKEN_RESPONSE=$(curl -s "$AUTH_URL" || echo "")
-    if [ -n "$TOKEN_RESPONSE" ]; then
-        TOKEN=$(echo "$TOKEN_RESPONSE" | grep -o '"token":"[^"]*"' | cut -d'"' -f4 || echo "")
-    fi
+# Try to get authentication token from registry
+AUTH_URL="https://$REGISTRY/token?service=$REGISTRY&scope=repository:$REPO_PATH:pull"
+TOKEN_RESPONSE=$(curl -s "$AUTH_URL" || echo "")
+if [ -n "$TOKEN_RESPONSE" ]; then
+    TOKEN=$(echo "$TOKEN_RESPONSE" | grep -o '"token":"[^"]*"' | cut -d'"' -f4 || echo "")
 fi
 
 # Construct the blob URL
