@@ -1,10 +1,13 @@
-name: Delete All Packages
+name: Delete Cinc Packages (rmoriz/cinc-packages)
+
+# This workflow deletes all versions of the cinc-packages container package
+# from the rmoriz personal GitHub account. Use with caution!
 
 on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type "DELETE_ALL_PACKAGES" to confirm deletion'
+        description: 'Type "DELETE_CINC_PACKAGES" to confirm deletion of all cinc-packages from rmoriz account'
         required: true
         type: string
 
@@ -31,43 +34,43 @@ jobs:
 
       - name: Confirm deletion
         run: |
-          if [ "${{ github.event.inputs.confirm }}" != "DELETE_ALL_PACKAGES" ]; then
-            echo "Confirmation failed. Aborting."
+          if [ "${{ github.event.inputs.confirm }}" != "DELETE_CINC_PACKAGES" ]; then
+            echo "Confirmation failed. Expected 'DELETE_CINC_PACKAGES' but got '${{ github.event.inputs.confirm }}'."
             exit 1
           fi
 
       - name: Delete all packages
         run: |
-          ORG="rmoriz"
+          USER="rmoriz"
           PACKAGE_NAME="cinc-packages"
           PACKAGE_TYPE="container"
 
-          echo "Listing packages for org: $ORG"
+          echo "Listing packages for user: $USER"
 
-          # Get package ID
-          PACKAGE_ID=$(gh api "/orgs/$ORG/packages?package_type=$PACKAGE_TYPE" --jq ".[] | select(.name == \"$PACKAGE_NAME\") | .id")
+          # Get package details (user packages don't have IDs like org packages)
+          PACKAGE_INFO=$(gh api "/users/$USER/packages?package_type=$PACKAGE_TYPE" --jq ".[] | select(.name == \"$PACKAGE_NAME\")")
 
-          if [ -z "$PACKAGE_ID" ]; then
-            echo "Package $PACKAGE_NAME not found."
+          if [ -z "$PACKAGE_INFO" ]; then
+            echo "Package $PACKAGE_NAME not found for user $USER."
             exit 0
           fi
 
-          echo "Found package ID: $PACKAGE_ID"
+          echo "Found package: $PACKAGE_INFO"
 
           # List versions
-          VERSIONS=$(gh api "/orgs/$ORG/packages/$PACKAGE_TYPE/$PACKAGE_NAME/versions" --jq '.[].id')
+          VERSIONS=$(gh api "/users/$USER/packages/$PACKAGE_TYPE/$PACKAGE_NAME/versions" --jq '.[].id')
 
           if [ -z "$VERSIONS" ]; then
             echo "No versions found for package $PACKAGE_NAME."
             exit 0
           fi
 
-          echo "Deleting versions: $VERSIONS"
+          echo "Found $(echo "$VERSIONS" | wc -l) versions to delete"
 
           # Delete each version
           for VERSION_ID in $VERSIONS; do
             echo "Deleting version ID: $VERSION_ID"
-            gh api -X DELETE "/orgs/$ORG/packages/$PACKAGE_TYPE/$PACKAGE_NAME/versions/$VERSION_ID"
+            gh api -X DELETE "/users/$USER/packages/$PACKAGE_TYPE/$PACKAGE_NAME/versions/$VERSION_ID"
           done
 
-          echo "All versions deleted."
+          echo "All versions of $PACKAGE_NAME deleted from user $USER account."
