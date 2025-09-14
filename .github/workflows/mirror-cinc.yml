@@ -66,16 +66,9 @@ jobs:
     - name: Set mirror configuration
       id: config
       run: |
-        # Set default values for inputs that might not be provided
-        MIN_VERSION="${{ github.event.inputs.min_version }}"
-        if [ -z "$MIN_VERSION" ]; then
-          MIN_VERSION="18"
-        fi
-
-        FORCE_FULL_SYNC="${{ github.event.inputs.force_full_sync }}"
-        if [ -z "$FORCE_FULL_SYNC" ]; then
-          FORCE_FULL_SYNC="false"
-        fi
+        # Set default values
+        MIN_VERSION="18"
+        FORCE_FULL_SYNC="false"
 
         echo "min_version=$MIN_VERSION" >> $GITHUB_OUTPUT
         echo "force_full_sync=$FORCE_FULL_SYNC" >> $GITHUB_OUTPUT
@@ -225,7 +218,7 @@ jobs:
       id: release_config
       if: steps.status.outputs.changes == 'true' || steps.status.outputs.security_alert == 'true'
       run: |
-        if [ "${{ steps.status.outputs.security_alert }}" == "true" ]; then
+        if [ "${{ steps.status.outputs.security_alert }}" = "true" ]; then
           echo "is_security_alert=true" >> $GITHUB_OUTPUT
           echo "release_suffix= 🚨 SECURITY ALERT" >> $GITHUB_OUTPUT
           echo "is_draft=true" >> $GITHUB_OUTPUT
