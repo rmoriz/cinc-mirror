@@ -165,6 +165,7 @@ EOF
     if oras push "$oci_ref" \
         --artifact-type "application/octet-stream" \
         --annotation "org.opencontainers.artifact.title=$filename" \
+        --disable-path-validation \
         "$temp_dir/$filename"; then
         log_info "Successfully uploaded $filename to GHCR"
         rm -rf "$temp_dir"
