@@ -19,5 +19,12 @@ Thumbs.db
 *.tmp
 *.log
 
+# packaages
+*.deb
+*.rpm
+*.tar.gz
+*.pkg
+*.dmg
+
 # Incident reports
 security-incident-report-*.md
