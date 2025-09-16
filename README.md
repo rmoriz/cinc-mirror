@@ -38,12 +38,47 @@ The actual script is at https://github.com/cinc-mirror/cinc-mirror.github.io and
 # mirror
 PROJECT="cinc-workstation" PLATFORM_FILTER="ubuntu" VERSIONS="25.*" ./cinc-mirror-single.sh
 
-# test
+# test, make sure CPU arch is available
 docker run --rm -it ubuntu bash -c "apt-get update && apt-get install -y curl && curl -L https://cinc-mirror.github.io/install.sh | bash -s -- -P cinc-workstation" 
 
+# NOTE When adding new projects, you have to set them manually to public!
+#
+# e.g. https://github.com/users/rmoriz/packages/container/package/cinc-mirror%2Fcinc-workstation
+# => Package settings
+# => Change package visibility
+# => public
+# => confirm...
 ```
 
-## GitHub Actions (not yet)
+## GitHub Actions
+
+
+*.github/workflows/ci.yml*
+```yaml
+---
+name: ci
+
+"on":
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  simple-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+      - name: Install cinc
+        uses: actionshub/chef-install@3.0.1
+        with:
+          omnitruckUrl: cinc-mirror.github.io
+          project: cinc-workstation
+      - name: Check cinc version
+        run: cinc --version
+```
 
 ## Why?
 
