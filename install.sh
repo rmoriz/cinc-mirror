@@ -664,7 +664,7 @@ if test "x$download_url_override" = "x"; then
 
   metadata_filename="$tmp_dir/metadata.txt"
   metadata_url="https://omnitruck.cinc.sh/$channel/$project/metadata?v=$version&p=$platform&pv=$platform_version&m=$machine"
-  blob_url="ghcr.io/rmoriz/cinc-mirror/cinc@sha256"
+  blob_url="ghcr.io/rmoriz/cinc-mirror/$project@sha256"
   do_download "$metadata_url"  "$metadata_filename"
 
   cat "$metadata_filename"
@@ -793,8 +793,9 @@ download_dir=`dirname $download_filename`
 do_ghcr_blob_download() {
   local sha256_hash="$1"
   local output_file="$2"
+  local project="$3"
   local registry="ghcr.io"
-  local repo_path="rmoriz/cinc-mirror/cinc"
+  local repo_path="rmoriz/cinc-mirror/${project}"
   local blob_ref="${registry}/${repo_path}@sha256:${sha256_hash}"
   
   echo "Fetching blob from $blob_ref"
@@ -802,24 +803,60 @@ do_ghcr_blob_download() {
   # Construct the blob URL
   local blob_url="https://$registry/v2/$repo_path/blobs/sha256:$sha256_hash"
 
-  # Fetch the blob with fresh authentication
+  # Fetch the blob with authentication
   echo "Downloading to $output_file..."
 
-  # Get fresh authentication token
+  # Get authentication token
   local token=""
   local auth_url="https://$registry/token?service=$registry&scope=repository:$repo_path:pull"
-  local token_response=$(curl -s "$auth_url" 2>/dev/null || echo "")
-  if test -n "$token_response"; then
-    token=$(echo "$token_response" | grep -o '"token":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
+  
+  # Try to get token with error handling
+  if exists curl; then
+    local token_response=$(curl -s -f "$auth_url" 2>/dev/null)
+    local curl_rc=$?
+    if test $curl_rc -eq 0 && test -n "$token_response"; then
+      # Extract token using more portable method
+      token=$(echo "$token_response" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+    fi
   fi
 
+  # Download the blob
+  local download_rc=1
   if test -n "$token"; then
-    curl -L -H "Authorization: Bearer $token" -o "$output_file" "$blob_url"
+    echo "Using authenticated request..."
+    if exists curl; then
+      curl -A "User-Agent: mixlib-install/3.12.30" --retry 5 -sL -f -H "Authorization: Bearer $token" -o "$output_file" "$blob_url" 2>$tmp_dir/stderr
+      download_rc=$?
+    fi
   else
-    curl -L -o "$output_file" "$blob_url"
+    echo "Using unauthenticated request..."
+    if exists curl; then
+      curl -A "User-Agent: mixlib-install/3.12.30" --retry 5 -sL -f -o "$output_file" "$blob_url" 2>$tmp_dir/stderr
+      download_rc=$?
+    fi
   fi
   
-  return $?
+  # Check if download was successful and file has reasonable size
+  if test $download_rc -eq 0 && test -s "$output_file"; then
+    local file_size=$(wc -c < "$output_file" 2>/dev/null || echo "0")
+    # Check if file is suspiciously small (likely an error response)
+    if test "$file_size" -lt 1000; then
+      echo "Downloaded file is too small ($file_size bytes), likely an error response"
+      if test -f "$output_file"; then
+        echo "File contents:"
+        cat "$output_file"
+      fi
+      return 1
+    fi
+    return 0
+  else
+    echo "Download failed or resulted in empty file"
+    if test -f $tmp_dir/stderr; then
+      echo "Error details:"
+      cat $tmp_dir/stderr
+    fi
+    return 1
+  fi
 }
 
 # check if we have that file locally available and if so verify the checksum
@@ -844,11 +881,18 @@ if test "x$cached_file_available" != "xtrue"; then
     # Use traditional download method for URL override
     do_download "$download_url_override" "$download_filename"
   else
-    # Use GHCR blob download with SHA256
-    do_ghcr_blob_download "$sha256" "$download_filename"
-    if test $? -ne 0; then
-      echo "Error: Failed to download blob from GHCR"
-      unable_to_retrieve_package
+    # Try GHCR blob download with SHA256 first
+    echo "Attempting to download from GHCR mirror..."
+    do_ghcr_blob_download "$sha256" "$download_filename" "$project"
+    ghcr_rc=$?
+    
+    if test $ghcr_rc -ne 0; then
+      echo "GHCR download failed, falling back to original URL: $download_url"
+      do_download "$download_url" "$download_filename"
+      if test $? -ne 0; then
+        echo "Error: Both GHCR mirror and original URL failed"
+        unable_to_retrieve_package
+      fi
     fi
     
     # For DMG files, the blob contains the actual DMG data

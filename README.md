@@ -32,6 +32,17 @@ The actual script is at https://github.com/cinc-mirror/cinc-mirror.github.io and
 - `cinc-mirror-single.sh` - Single package mirror script
 - `fetch-blob.sh` - Blob fetching example using curl (example how to download a blob by sha256 hash). If you are serious, just get [ORAS](https://oras.land/)
 
+## Mirroring
+
+```bash
+# mirror
+PROJECT="cinc-workstation" PLATFORM_FILTER="ubuntu" VERSIONS="25.*" ./cinc-mirror-single.sh
+
+# test
+docker run --rm -it ubuntu bash -c "apt-get update && apt-get install -y curl && curl -L https://cinc-mirror.github.io/install.sh | bash -s -- -P cinc-workstation" 
+
+```
+
 ## GitHub Actions (not yet)
 
 ## Why?
