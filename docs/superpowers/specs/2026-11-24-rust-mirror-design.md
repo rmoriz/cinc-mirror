@@ -45,7 +45,9 @@ intent is kept here and made durable.
 
 - Serving files to installers (existing `install.sh` keeps doing that).
 - Windows, Solaris and AIX **installers**; `.msi` artifacts are mirrored like
-  any other package, only the consumer-side support stays unchanged.
+  any other package, only the consumer-side support stays unchanged. A Windows
+  client would be a PowerShell counterpart to `install.sh` in the
+  `cinc-mirror.github.io` repo, not part of this binary.
 - Implementing the rsync wire protocol from scratch (the binary shells out to
   `rsync`; everything else is native Rust).
 - Signing (minisign/sigstore) and SBOM generation — later.
@@ -86,10 +88,12 @@ intent is kept here and made durable.
 
 ### OCI client
 
-1. **`oci-client` (oras-rs) for transport, our own config/auth layer (chosen).**
-   Push/pull and bearer-token flow are solved, less wire-protocol risk.
-2. Hand-rolled `reqwest` client. Full control over every header and auth
-   scheme, but re-implements upload chunking, token scopes and retries.
+1. **`oci-client` for auth and manifests, our own streaming blob upload (chosen).**
+   Token scopes, challenge parsing and manifest JSON come from a maintained
+   crate; layer uploads stream from disk over `reqwest` because packages reach
+   hundreds of megabytes and must not be buffered whole.
+2. Hand-rolled client for everything. Full control, but re-implements token
+   scopes, challenges and manifest handling.
 3. Shell out to `oras`. Rejected: the point of the rewrite is removing it.
 
 ### Ledger storage
@@ -282,10 +286,13 @@ The canonical artifact key is
 `upstream_path` is indexed but not unique, so a superseded artifact can coexist
 with its replacement.
 
-Tag: `<version>-<platform>-<platform_version>-<mapped_arch>`, lowercased,
+Tag: `<version>-<platform>-<platform_version>-<mapped_arch>`, plus
+`-r<iteration>` when `iteration` is not `1` (upstream publishes e.g.
+`cinc-19.4.46-2-x64.msi` beside `-1` for the same version). Lowercased,
 `+`/`:` → `_`, capped at 128 characters. A superseded artifact is published as
 `<tag>-<shortsha>` (12 characters) and, for rsync,
-`<basename>.superseded-<shortsha>`.
+`<basename>.superseded-<shortsha>`. Existing iteration-1 tags keep their
+current names, so bootstrap matches them.
 
 Arch mapping keeps the existing public namespace: `x86_64`→`amd64`,
 `aarch64`→`arm64`, `armv7l`/`armv7hl`→`armv7`, `ppc64le`→`ppc64le`,
@@ -342,8 +349,9 @@ ledger explains itself without the original shell history.
 events(id INTEGER PRIMARY KEY, run_id TEXT, seq INTEGER, ts TEXT, kind TEXT,
        artifact_key TEXT, target TEXT, detail_json TEXT)
 artifacts(key TEXT PRIMARY KEY, upstream_path TEXT, sha256 TEXT,
-          size INTEGER, basename TEXT, project TEXT, channel TEXT,          version TEXT, platform TEXT, platform_version TEXT, arch TEXT,
-          metadata_json TEXT, first_seen TEXT, last_seen TEXT,
+          size INTEGER, basename TEXT, project TEXT, channel TEXT,
+          version TEXT, iteration TEXT, platform TEXT, platform_version TEXT,
+          arch TEXT, metadata_json TEXT, first_seen TEXT, last_seen TEXT,
           superseded_by TEXT, supersedes TEXT)
 publications(artifact_key TEXT, target TEXT, status TEXT, remote_ref TEXT,
              remote_digest TEXT, attempts INTEGER, next_attempt_at TEXT,
@@ -522,7 +530,8 @@ lease busy, `5` config/auth, `64` usage.
 
 ## Testing
 
-- Unit: tag/key/path sanitisation, version comparison and glob semantics,
+- Unit: tag/key/path sanitisation (including iteration suffixes and `.msi`
+  names), version comparison and glob semantics,
   per-project policy intersection and `--set` precedence, `--limit-bytes`
   counting and deterministic ordering, `local_gc` handling, metadata parsing
   (including hostile `basename`), hash-ladder comparison, arch mapping,
