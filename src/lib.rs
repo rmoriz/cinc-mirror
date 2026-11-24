@@ -7,7 +7,9 @@
 pub mod artifact;
 pub mod cli;
 pub mod config;
+pub mod hash;
 pub mod scope;
+pub mod source;
 pub mod version;
 
 pub use artifact::{
@@ -19,5 +21,7 @@ pub use config::{
     Config, ConfigError, LedgerConfig, ProjectPolicy, Selection, TargetAuth, TargetConfig,
     TargetKind, TransportKind,
 };
+pub use hash::{hash_file, hash_reader, ExpectedHashes, Hashes, VerifyOutcome};
 pub use scope::{PlatformVersion, ResolvedPolicy, ResolvedScope, ScopeArgs, ScopeError};
+pub use source::metadata::{Metadata, MetadataError};
 pub use version::{Segment, Version, VersionError, VersionGlob, VersionGlobError};
