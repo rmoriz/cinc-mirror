@@ -38,6 +38,7 @@ fn source_config(base: &str) -> SourceConfig {
     SourceConfig {
         https_base: Url::parse(base).expect("base url"),
         ftp_host: "ftp.osuosl.org".to_string(),
+        ftp_port: 21,
         ftp_base_path: "pub/cinc/files".to_string(),
         transports: vec![TransportKind::Https],
     }

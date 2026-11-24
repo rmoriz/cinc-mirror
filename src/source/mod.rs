@@ -14,12 +14,15 @@
 //! host, so a listed or metadata response cannot quietly move the crawl to a
 //! third party.
 //!
-//! The client construction is not async; only [`Source::list`] and
-//! [`Source::metadata`] perform I/O. Both read through [`Fetcher`], which keeps
-//! the scheme enforcement in [`Source`] testable without a TLS server.
+//! The client construction is not async; only [`Source::list`],
+//! [`Source::metadata`] and [`Source::sizes`] perform I/O. The first two read
+//! through [`Fetcher`], which keeps the scheme enforcement in [`Source`]
+//! testable without a TLS server; sizes additionally use the configured FTP
+//! host as a cheap source of advisory byte counts.
 
 pub mod index;
 pub mod metadata;
+pub mod size;
 
 use std::fmt;
 use std::sync::Arc;
@@ -39,6 +42,8 @@ pub use index::{parse_index, IndexEntry};
 pub const DEFAULT_HTTPS_BASE: &str = "https://downloads.cinc.sh/files";
 /// Upstream FTP host used by the payload transports.
 pub const DEFAULT_FTP_HOST: &str = "ftp.osuosl.org";
+/// Upstream FTP control port.
+pub const DEFAULT_FTP_PORT: u16 = 21;
 /// Upstream FTP path below [`DEFAULT_FTP_HOST`].
 pub const DEFAULT_FTP_BASE_PATH: &str = "pub/cinc/files";
 
@@ -55,6 +60,8 @@ pub struct SourceConfig {
     pub https_base: Url,
     /// FTP host for payload transfers, e.g. `ftp.osuosl.org`.
     pub ftp_host: String,
+    /// FTP control port, normally `21`.
+    pub ftp_port: u16,
     /// Path below the FTP host, e.g. `pub/cinc/files`.
     pub ftp_base_path: String,
     /// Payload transports in ladder order.
@@ -86,6 +93,7 @@ impl SourceConfig {
         Ok(Self {
             https_base,
             ftp_host: DEFAULT_FTP_HOST.to_string(),
+            ftp_port: DEFAULT_FTP_PORT,
             ftp_base_path: DEFAULT_FTP_BASE_PATH.to_string(),
             transports: config.transport.clone(),
         })
@@ -113,6 +121,13 @@ pub struct Fetched {
 pub trait Fetcher: Send + Sync {
     /// Fetch `url` and return its body and final URL.
     async fn get(&self, url: &Url) -> Result<Fetched, SourceError>;
+
+    /// Read the `Content-Length` of `url` without downloading it.
+    ///
+    /// The caller is responsible for passing an HTTPS URL; the production
+    /// fetcher additionally refuses redirect targets that are cleartext or on
+    /// another host. `Ok(None)` means the response carried no usable length.
+    async fn head_len(&self, url: &Url) -> Result<Option<u64>, SourceError>;
 }
 
 /// [`Fetcher`] backed by a `reqwest` client.
@@ -182,13 +197,48 @@ impl Fetcher for HttpFetcher {
 
         Ok(Fetched { body, final_url })
     }
+
+    async fn head_len(&self, url: &Url) -> Result<Option<u64>, SourceError> {
+        let response = self
+            .client
+            .head(url.clone())
+            .send()
+            .await
+            .map_err(|source| SourceError::Http {
+                url: url.to_string(),
+                source,
+            })?;
+
+        let final_url = response.url().clone();
+        let status = response.status();
+        if !status.is_success() {
+            return Err(SourceError::HttpStatus {
+                url: final_url.to_string(),
+                status: status.as_u16(),
+            });
+        }
+
+        // A HEAD response has an empty body, so `content_length()` reports 0;
+        // the header is the only truthful source of the advertised length.
+        let length = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
+
+        Ok(length)
+    }
 }
 
-/// HTTPS access to the upstream index and metadata.
+/// HTTPS access to the upstream index and metadata, plus the FTP endpoint used
+/// for advisory sizes.
 #[derive(Clone)]
 pub struct Source {
     fetcher: Arc<dyn Fetcher>,
     https_base: Url,
+    ftp_host: String,
+    ftp_port: u16,
+    ftp_base_path: String,
 }
 
 impl fmt::Debug for Source {
@@ -213,21 +263,43 @@ impl Source {
     /// [`SourceError::Http`] when the HTTP client cannot be built.
     pub fn new(config: &SourceConfig) -> Result<Self, SourceError> {
         let fetcher = HttpFetcher::new(config)?;
-        Ok(Self::with_fetcher(
-            Arc::new(fetcher),
-            config.https_base.clone(),
-        ))
+        Ok(
+            Self::with_fetcher(Arc::new(fetcher), config.https_base.clone()).with_ftp(
+                config.ftp_host.clone(),
+                config.ftp_port,
+                config.ftp_base_path.clone(),
+            ),
+        )
     }
 
     /// Build a source over an arbitrary fetcher.
     ///
-    /// Used by tests to inject a final URL or body; production goes through
-    /// [`Source::new`].
-    pub(crate) fn with_fetcher(fetcher: Arc<dyn Fetcher>, https_base: Url) -> Self {
+    /// This is the seam tests use to serve listings and metadata without a TLS
+    /// server. It starts with the upstream FTP defaults; override them with
+    /// [`Source::with_ftp`]. Production goes through [`Source::new`].
+    #[must_use]
+    pub fn with_fetcher(fetcher: Arc<dyn Fetcher>, https_base: Url) -> Self {
         Self {
             fetcher,
             https_base,
+            ftp_host: DEFAULT_FTP_HOST.to_string(),
+            ftp_port: DEFAULT_FTP_PORT,
+            ftp_base_path: DEFAULT_FTP_BASE_PATH.to_string(),
         }
+    }
+
+    /// Point size resolution at another FTP endpoint.
+    #[must_use]
+    pub fn with_ftp(
+        mut self,
+        host: impl Into<String>,
+        port: u16,
+        base_path: impl Into<String>,
+    ) -> Self {
+        self.ftp_host = host.into();
+        self.ftp_port = port;
+        self.ftp_base_path = base_path.into();
+        self
     }
 
     /// List the entries directly below `dir`.
@@ -426,6 +498,7 @@ mod tests {
         SourceConfig {
             https_base: Url::parse(DEFAULT_HTTPS_BASE).expect("base url"),
             ftp_host: DEFAULT_FTP_HOST.to_string(),
+            ftp_port: DEFAULT_FTP_PORT,
             ftp_base_path: DEFAULT_FTP_BASE_PATH.to_string(),
             transports: vec![TransportKind::Https],
         }
@@ -540,6 +613,10 @@ mod tests {
                 final_url: self.final_url.clone(),
             })
         }
+
+        async fn head_len(&self, _url: &Url) -> Result<Option<u64>, SourceError> {
+            Ok(None)
+        }
     }
 
     fn fake_source(final_url: &str, body: &str) -> Source {
@@ -610,6 +687,63 @@ mod tests {
             .expect("https response is accepted");
 
         assert_eq!(metadata.basename, "cinc_19.4.46-1_amd64.deb");
+    }
+
+    #[tokio::test]
+    async fn head_len_reads_content_length_and_maps_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/cinc.deb"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-length", "51993096"))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/absent.deb"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpFetcher {
+            client: Client::new(),
+        };
+        let url = Url::parse(&format!("{}/cinc.deb", server.uri())).expect("url");
+        assert_eq!(
+            fetcher.head_len(&url).await.expect("head"),
+            Some(51_993_096),
+            "HEAD Content-Length is the last rung of size resolution"
+        );
+
+        let missing = Url::parse(&format!("{}/absent.deb", server.uri())).expect("url");
+        let error = fetcher
+            .head_len(&missing)
+            .await
+            .expect_err("a 404 must not be read as an unknown size");
+        assert!(matches!(error, SourceError::HttpStatus { status: 404, .. }));
+    }
+
+    #[tokio::test]
+    async fn sizes_refuses_a_cleartext_listing_after_ftp_is_unreachable() {
+        let source = Source::with_fetcher(
+            Arc::new(FakeFetcher {
+                final_url: Url::parse("http://downloads.cinc.sh/files/stable/cinc/").expect("url"),
+                body: r#"<a href="x.deb.metadata.json">x</a>"#.to_string(),
+            }),
+            Url::parse(DEFAULT_HTTPS_BASE).expect("base url"),
+        )
+        .with_ftp("127.0.0.1", 1, "pub/cinc/files");
+
+        let error = source
+            .sizes("stable/cinc/19.4.46/debian/13")
+            .await
+            .expect_err("the fallback listing must still be HTTPS");
+
+        assert!(
+            matches!(error, SourceError::Insecure { .. }),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

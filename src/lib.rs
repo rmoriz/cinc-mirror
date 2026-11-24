@@ -7,7 +7,9 @@
 pub mod artifact;
 pub mod cli;
 pub mod config;
+pub mod crawl;
 pub mod hash;
+pub mod plan;
 pub mod scope;
 pub mod source;
 pub mod version;
@@ -21,7 +23,9 @@ pub use config::{
     Config, ConfigError, LedgerConfig, ProjectPolicy, Selection, TargetAuth, TargetConfig,
     TargetKind, TransportKind,
 };
+pub use crawl::{crawl, CrawlError};
 pub use hash::{hash_file, hash_reader, ExpectedHashes, Hashes, VerifyOutcome};
+pub use plan::{build, GroupTotals, Plan, PlanError, SpaceCheck};
 pub use scope::{PlatformVersion, ResolvedPolicy, ResolvedScope, ScopeArgs, ScopeError};
 pub use source::index::{parse_index, IndexEntry};
 pub use source::metadata::{Metadata, MetadataError};
