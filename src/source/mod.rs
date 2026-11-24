@@ -8,19 +8,25 @@
 //!   [`Source::metadata`].
 //!
 //! The mirror never falls back to cleartext. The request URL is checked before
-//! anything is sent and the *final* URL is checked again after redirects, so a
-//! redirect from `https` to `http` is still refused. Redirects are additionally
-//! limited to ten hops and to the configured host, so a listed or metadata
-//! response cannot quietly move the crawl to a third party.
+//! anything is sent, a redirect to a non-HTTPS URL is refused before it is
+//! followed, and the *final* URL is checked again after redirects as defense in
+//! depth. Redirects are additionally limited to ten hops and to the configured
+//! host, so a listed or metadata response cannot quietly move the crawl to a
+//! third party.
 //!
 //! The client construction is not async; only [`Source::list`] and
-//! [`Source::metadata`] perform I/O.
+//! [`Source::metadata`] perform I/O. Both read through [`Fetcher`], which keeps
+//! the scheme enforcement in [`Source`] testable without a TLS server.
 
 pub mod index;
 pub mod metadata;
 
+use std::fmt;
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use reqwest::redirect::Policy;
-use reqwest::{Client, Response};
+use reqwest::Client;
 use thiserror::Error;
 use url::Url;
 
@@ -86,19 +92,40 @@ impl SourceConfig {
     }
 }
 
-/// HTTPS access to the upstream index and metadata.
-#[derive(Debug, Clone)]
-pub struct Source {
-    client: Client,
-    https_base: Url,
+/// A response body together with the URL it was finally read from.
+///
+/// The final URL differs from the request URL when a redirect was followed, and
+/// is the value [`Source`] re-checks before the body is trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fetched {
+    /// Response body as text.
+    pub body: String,
+    /// URL the response was actually served from.
+    pub final_url: Url,
 }
 
-impl Source {
-    /// Build a source client for `config`.
+/// The transport [`Source`] reads through.
+///
+/// The trait exists so scheme enforcement can be tested without a TLS server:
+/// production uses [`HttpFetcher`], tests substitute a fetcher that reports an
+/// arbitrary final URL.
+#[async_trait]
+pub trait Fetcher: Send + Sync {
+    /// Fetch `url` and return its body and final URL.
+    async fn get(&self, url: &Url) -> Result<Fetched, SourceError>;
+}
+
+/// [`Fetcher`] backed by a `reqwest` client.
+#[derive(Debug, Clone)]
+pub struct HttpFetcher {
+    client: Client,
+}
+
+impl HttpFetcher {
+    /// Build the HTTPS client for `config`.
     ///
-    /// The base scheme is not enforced here; every request URL and final URL is
-    /// checked in [`Source::list`] and [`Source::metadata`], so a cleartext base
-    /// is rejected before any bytes are sent.
+    /// The client is restricted to HTTPS redirect targets, at most
+    /// [`MAX_REDIRECTS`] hops and the configured host.
     ///
     /// # Errors
     ///
@@ -122,10 +149,85 @@ impl Source {
                 source,
             })?;
 
-        Ok(Self {
-            client,
-            https_base: config.https_base.clone(),
-        })
+        Ok(Self { client })
+    }
+}
+
+#[async_trait]
+impl Fetcher for HttpFetcher {
+    async fn get(&self, url: &Url) -> Result<Fetched, SourceError> {
+        let response = self
+            .client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|source| SourceError::Http {
+                url: url.to_string(),
+                source,
+            })?;
+
+        let final_url = response.url().clone();
+        let status = response.status();
+        if !status.is_success() {
+            return Err(SourceError::HttpStatus {
+                url: final_url.to_string(),
+                status: status.as_u16(),
+            });
+        }
+
+        let body = response.text().await.map_err(|source| SourceError::Http {
+            url: final_url.to_string(),
+            source,
+        })?;
+
+        Ok(Fetched { body, final_url })
+    }
+}
+
+/// HTTPS access to the upstream index and metadata.
+#[derive(Clone)]
+pub struct Source {
+    fetcher: Arc<dyn Fetcher>,
+    https_base: Url,
+}
+
+impl fmt::Debug for Source {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Source")
+            .field("https_base", &self.https_base)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Source {
+    /// Build a source client for `config`.
+    ///
+    /// The base scheme is not enforced here; every request URL and final URL is
+    /// checked in [`Source::list`] and [`Source::metadata`], so a cleartext base
+    /// is rejected before any bytes are sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceError::Config`] when the base URL has no host, and
+    /// [`SourceError::Http`] when the HTTP client cannot be built.
+    pub fn new(config: &SourceConfig) -> Result<Self, SourceError> {
+        let fetcher = HttpFetcher::new(config)?;
+        Ok(Self::with_fetcher(
+            Arc::new(fetcher),
+            config.https_base.clone(),
+        ))
+    }
+
+    /// Build a source over an arbitrary fetcher.
+    ///
+    /// Used by tests to inject a final URL or body; production goes through
+    /// [`Source::new`].
+    pub(crate) fn with_fetcher(fetcher: Arc<dyn Fetcher>, https_base: Url) -> Self {
+        Self {
+            fetcher,
+            https_base,
+        }
     }
 
     /// List the entries directly below `dir`.
@@ -144,17 +246,13 @@ impl Source {
     /// [`SourceError::Index`] when the body is not a directory listing.
     pub async fn list(&self, dir: &str) -> Result<Vec<IndexEntry>, SourceError> {
         let url = ensure_https(join_path(&self.https_base, dir, true)?)?;
-        let response = self.get(&url).await?;
-        let url = response.url().clone();
-        let body = response.text().await.map_err(|source| SourceError::Http {
-            url: url.to_string(),
-            source,
-        })?;
+        let fetched = self.fetcher.get(&url).await?;
+        ensure_https(fetched.final_url.clone())?;
 
-        let anchors = index::parse_anchors(&body);
+        let anchors = index::parse_anchors(&fetched.body);
         if anchors.is_empty() {
             return Err(SourceError::Index {
-                url: url.to_string(),
+                url: fetched.final_url.to_string(),
                 reason: "response contains no <a> tags".to_string(),
             });
         }
@@ -178,41 +276,10 @@ impl Source {
     /// [`SourceError::Metadata`] when the document cannot be parsed.
     pub async fn metadata(&self, path: &str) -> Result<Metadata, SourceError> {
         let url = ensure_https(join_path(&self.https_base, path, false)?)?;
-        let response = self.get(&url).await?;
-        let url = response.url().clone();
-        let body = response.text().await.map_err(|source| SourceError::Http {
-            url: url.to_string(),
-            source,
-        })?;
+        let fetched = self.fetcher.get(&url).await?;
+        ensure_https(fetched.final_url.clone())?;
 
-        metadata_from_body(&url, &body)
-    }
-
-    /// Send a GET request and apply the checks shared by listings and metadata.
-    async fn get(&self, url: &Url) -> Result<Response, SourceError> {
-        let response = self
-            .client
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|source| SourceError::Http {
-                url: url.to_string(),
-                source,
-            })?;
-
-        // Redirects are followed before `send` returns, so re-check the final
-        // scheme rather than trusting the request URL alone.
-        ensure_https(response.url().clone())?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(SourceError::HttpStatus {
-                url: response.url().to_string(),
-                status: status.as_u16(),
-            });
-        }
-
-        Ok(response)
+        metadata_from_body(&fetched.final_url, &fetched.body)
     }
 }
 
@@ -334,13 +401,16 @@ fn redirect_policy(allowed_host: &str) -> Policy {
 
 /// Decide whether a redirect target may be followed.
 ///
-/// HTTPS is not enforced here on purpose: a same-host redirect to `http` is
-/// followed and then rejected by the post-response scheme check, so the
-/// rejection is reported as [`SourceError::Insecure`] rather than as an opaque
-/// transport error.
+/// A cleartext target is refused here, before the request is sent, so no
+/// forbidden transfer takes place. The post-response scheme check in
+/// [`Source::list`] and [`Source::metadata`] stays as defense in depth for a
+/// fetcher that does not apply this policy.
 fn check_redirect(allowed_host: &str, previous: usize, target: &Url) -> Result<(), &'static str> {
     if previous >= MAX_REDIRECTS {
         return Err("redirect limit exceeded");
+    }
+    if target.scheme() != "https" {
+        return Err("refusing a redirect to a cleartext URL");
     }
     if target.host_str() != Some(allowed_host) {
         return Err("refusing a redirect to another host");
@@ -440,17 +510,106 @@ mod tests {
     }
 
     #[test]
-    fn redirects_stay_on_the_configured_host_and_within_the_limit() {
+    fn redirects_must_stay_https_on_the_configured_host_and_within_the_limit() {
         let same_host = Url::parse("https://downloads.cinc.sh/files/x").expect("url");
         let cleartext = Url::parse("http://downloads.cinc.sh/files/x").expect("url");
         let foreign = Url::parse("https://evil.example/x").expect("url");
 
         assert!(check_redirect("downloads.cinc.sh", 0, &same_host).is_ok());
-        // A cleartext *same-host* hop is allowed here so the post-response
-        // scheme check reports it as `Insecure` instead of a transport error.
-        assert!(check_redirect("downloads.cinc.sh", 0, &cleartext).is_ok());
+        assert!(
+            check_redirect("downloads.cinc.sh", 0, &cleartext).is_err(),
+            "a cleartext redirect target must never be followed"
+        );
         assert!(check_redirect("downloads.cinc.sh", 0, &foreign).is_err());
         assert!(check_redirect("downloads.cinc.sh", MAX_REDIRECTS, &same_host).is_err());
+    }
+
+    /// A fetcher that returns a pre-baked response, including an arbitrary final
+    /// URL. This is how the post-response scheme check is exercised without a
+    /// TLS server.
+    struct FakeFetcher {
+        final_url: Url,
+        body: String,
+    }
+
+    #[async_trait]
+    impl Fetcher for FakeFetcher {
+        async fn get(&self, _url: &Url) -> Result<Fetched, SourceError> {
+            Ok(Fetched {
+                body: self.body.clone(),
+                final_url: self.final_url.clone(),
+            })
+        }
+    }
+
+    fn fake_source(final_url: &str, body: &str) -> Source {
+        Source::with_fetcher(
+            Arc::new(FakeFetcher {
+                final_url: Url::parse(final_url).expect("final url"),
+                body: body.to_string(),
+            }),
+            Url::parse(DEFAULT_HTTPS_BASE).expect("base url"),
+        )
+    }
+
+    const TEST_METADATA: &str = r#"{
+        "basename": "cinc_19.4.46-1_amd64.deb",
+        "sha256": "83ad6e1b905a348909e1f312bc4f2f5061c566469a4ec77b041746378975d2a9",
+        "platform": "debian",
+        "platform_version": "13",
+        "arch": "x86_64",
+        "version": "19.4.46"
+    }"#;
+
+    #[tokio::test]
+    async fn rejects_cleartext_final_url_from_fetcher() {
+        let source = fake_source(
+            "http://downloads.cinc.sh/files/x.metadata.json",
+            TEST_METADATA,
+        );
+
+        let error = source
+            .metadata("x.metadata.json")
+            .await
+            .expect_err("a cleartext final URL must be refused");
+
+        assert!(
+            matches!(error, SourceError::Insecure { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_rejects_cleartext_final_url_from_fetcher() {
+        let source = fake_source(
+            "http://downloads.cinc.sh/files/stable/cinc/",
+            r#"<a href="19.4.46/">19.4.46/</a>"#,
+        );
+
+        let error = source
+            .list("stable/cinc")
+            .await
+            .expect_err("a cleartext final URL must be refused");
+
+        assert!(
+            matches!(error, SourceError::Insecure { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_an_https_final_url_from_fetcher() {
+        let source = fake_source(
+            "https://downloads.cinc.sh/files/x.metadata.json",
+            TEST_METADATA,
+        );
+
+        let metadata = source
+            .metadata("x.metadata.json")
+            .await
+            .expect("https response is accepted");
+
+        assert_eq!(metadata.basename, "cinc_19.4.46-1_amd64.deb");
     }
 
     #[test]
