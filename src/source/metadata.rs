@@ -11,6 +11,8 @@
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
+use crate::artifact::ArtifactInput;
+
 /// The subset of an upstream `*.metadata.json` the mirror uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Metadata {
@@ -63,6 +65,23 @@ impl Metadata {
             md5: raw.md5,
             iteration: raw.iteration,
         })
+    }
+
+    /// Project the metadata into the values [`crate::artifact::Artifact`] needs.
+    ///
+    /// The crawl context supplies channel, project and version; this carries
+    /// the upstream identity and digests beside it.
+    #[must_use]
+    pub fn to_input(&self) -> ArtifactInput {
+        ArtifactInput {
+            basename: self.basename.clone(),
+            sha256: self.sha256.clone(),
+            platform: self.platform.clone(),
+            platform_version: self.platform_version.clone(),
+            version: self.version.clone(),
+            iteration: self.iteration.clone(),
+            raw_arch: self.arch.clone(),
+        }
     }
 }
 

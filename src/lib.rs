@@ -23,5 +23,7 @@ pub use config::{
 };
 pub use hash::{hash_file, hash_reader, ExpectedHashes, Hashes, VerifyOutcome};
 pub use scope::{PlatformVersion, ResolvedPolicy, ResolvedScope, ScopeArgs, ScopeError};
+pub use source::index::{parse_index, IndexEntry};
 pub use source::metadata::{Metadata, MetadataError};
+pub use source::{Source, SourceConfig, SourceError};
 pub use version::{Segment, Version, VersionError, VersionGlob, VersionGlobError};
