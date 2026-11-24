@@ -6,9 +6,13 @@
 
 pub mod cli;
 pub mod config;
+pub mod scope;
+pub mod version;
 
 pub use cli::{Cli, Command};
 pub use config::{
     Config, ConfigError, LedgerConfig, ProjectPolicy, Selection, TargetAuth, TargetConfig,
     TargetKind, TransportKind,
 };
+pub use scope::{PlatformVersion, ResolvedPolicy, ResolvedScope, ScopeArgs, ScopeError};
+pub use version::{Segment, Version, VersionError, VersionGlob, VersionGlobError};

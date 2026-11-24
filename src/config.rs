@@ -15,6 +15,8 @@ use serde::de::{self, SeqAccess, Unexpected, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
+use crate::version::{Version, VersionGlob};
+
 /// Name of the configuration file discovered in the working directory when no
 /// explicit path is given.
 pub const DEFAULT_CONFIG_FILE: &str = "mirror.toml";
@@ -59,6 +61,12 @@ pub enum ConfigError {
          such as `19.4.46`"
     )]
     InvalidVersionBound { value: String },
+
+    #[error(
+        "invalid version glob `{value}`: expected dot-separated numeric segments, \
+         `*` or `?`"
+    )]
+    InvalidVersionGlob { value: String },
 
     #[error("{context}: min_version `{min}` is above max_version `{max}`")]
     MinAboveMax {
@@ -302,7 +310,13 @@ impl ProjectPolicy {
             }
             "min_version" => self.min_version = Some(checked_version_bound(value)?),
             "max_version" => self.max_version = Some(checked_version_bound(value)?),
-            "versions" => self.versions = parse_list(key, value)?,
+            "versions" => {
+                let values = parse_list(key, value)?;
+                for glob in &values {
+                    parse_version_glob(glob)?;
+                }
+                self.versions = values;
+            }
             "all_versions" => self.all_versions = parse_bool(key, value)?,
             "platforms" => self.platforms = parse_selection(key, value)?,
             "arches" => self.arches = parse_selection(key, value)?,
@@ -590,6 +604,9 @@ impl Config {
             {
                 parse_version_bound(bound)?;
             }
+            for glob in &policy.versions {
+                parse_version_glob(glob)?;
+            }
 
             let fallback = if policy.all_versions {
                 None
@@ -722,42 +739,20 @@ fn trim_optional(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-fn parse_version_bound(value: &str) -> Result<Vec<u64>, ConfigError> {
-    let invalid = || ConfigError::InvalidVersionBound {
+fn parse_version_bound(value: &str) -> Result<Version, ConfigError> {
+    Version::from_str(value).map_err(|_| ConfigError::InvalidVersionBound {
         value: value.to_string(),
-    };
+    })
+}
 
-    if value.is_empty() {
-        return Err(invalid());
-    }
-
-    value
-        .split('.')
-        .map(|segment| {
-            if segment.is_empty() || !segment.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(invalid());
-            }
-            segment.parse::<u64>().map_err(|_| invalid())
-        })
-        .collect()
+fn parse_version_glob(value: &str) -> Result<VersionGlob, ConfigError> {
+    VersionGlob::from_str(value).map_err(|_| ConfigError::InvalidVersionGlob {
+        value: value.to_string(),
+    })
 }
 
 fn compare_version_bounds(left: &str, right: &str) -> Result<Ordering, ConfigError> {
-    let left = parse_version_bound(left)?;
-    let right = parse_version_bound(right)?;
-
-    for index in 0..left.len().max(right.len()) {
-        let ordering = left
-            .get(index)
-            .copied()
-            .unwrap_or(0)
-            .cmp(&right.get(index).copied().unwrap_or(0));
-        if ordering != Ordering::Equal {
-            return Ok(ordering);
-        }
-    }
-
-    Ok(Ordering::Equal)
+    Ok(parse_version_bound(left)?.cmp(&parse_version_bound(right)?))
 }
 
 fn set_value_error(key: &str, value: &str, expected: &'static str) -> ConfigError {

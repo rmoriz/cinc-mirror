@@ -214,6 +214,63 @@ fn rejects_malformed_version_bounds() {
 }
 
 #[test]
+fn rejects_malformed_version_globs() {
+    for glob in ["", "19..*", "19.x", "19.*x"] {
+        let error = validated(&format!(
+            r#"
+            [[projects]]
+            id = "cinc"
+            project = "cinc"
+            channel = "stable"
+            versions = ["{glob}"]
+            "#
+        ))
+        .expect_err("malformed version glob must be rejected by validation");
+
+        assert!(
+            matches!(error, ConfigError::InvalidVersionGlob { ref value } if value == glob),
+            "glob {glob:?} produced {error}"
+        );
+    }
+
+    validated(
+        r#"
+        [[projects]]
+        id = "cinc"
+        project = "cinc"
+        channel = "stable"
+        versions = ["18.8.*", "19.?.0", "19.4.46"]
+        "#,
+    )
+    .expect("numeric segments, `*` and `?` are valid globs");
+}
+
+#[test]
+fn set_rejects_malformed_version_globs() {
+    let mut config = Config::default();
+    config
+        .projects
+        .push(policy("cinc-stable", "cinc", "stable"));
+
+    let error = config
+        .apply_overrides(&overrides(&["cinc-stable.versions=19.*,19..*"]))
+        .expect_err("a malformed glob in --set must not be stored");
+
+    assert!(
+        matches!(error, ConfigError::InvalidVersionGlob { ref value } if value == "19..*"),
+        "unexpected error: {error}"
+    );
+
+    config
+        .apply_overrides(&overrides(&["cinc-stable.versions=19.*,18.8.?"]))
+        .expect("valid globs apply");
+    assert_eq!(
+        config.projects[0].versions,
+        vec!["19.*".to_string(), "18.8.?".to_string()]
+    );
+}
+
+#[test]
 fn empty_config_uses_documented_defaults() {
     let config = Config::default();
     config.validate().expect("defaults are valid");
