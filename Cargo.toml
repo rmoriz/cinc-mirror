@@ -1,0 +1,48 @@
+[package]
+name = "cinc-mirror"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Mirror CINC packages from upstream to OCI registries and rsync targets"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+humantime = "2"
+indicatif = "0.17"
+oci-client = "0.14"
+percent-encoding = "2"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+suppaftp = { version = "6", features = ["async", "async-rustls"] }
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "process"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+url = "2"
+
+[lints.cargo]
+# Dependencies are declared up front by the implementation plan and are wired
+# into the modules task by task; the manifest lint would otherwise fire until
+# the last of them is used.
+unused_dependencies = "allow"
+
+[dev-dependencies]
+assert_cmd = "2"
+axum = "0.7"
+libunftp = "0.20"
+predicates = "3"
+tempfile = "3"
+# 0.6.5 uses let-chains (Rust 1.88); keep the test suite buildable on the 1.80 MSRV.
+wiremock = "=0.6.4"
