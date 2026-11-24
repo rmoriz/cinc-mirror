@@ -273,10 +273,24 @@ fn parses_transports_and_wildcards() {
         Selection::Only(vec!["amd64".to_string(), "arm64".to_string()])
     );
 
-    let error = load_str(r#"platforms = "debian""#)
-        .and_then(|config| config.validate())
-        .expect_err("a bare string is not a valid selection");
-    assert!(matches!(error, ConfigError::Parse { .. }), "{error}");
+    let error = load_str(
+        r#"
+        [[projects]]
+        id = "cinc"
+        project = "cinc"
+        channel = "stable"
+        platforms = "debian"
+        "#,
+    )
+    .expect_err("a bare string is not a valid selection");
+    assert!(
+        matches!(
+            error,
+            ConfigError::Parse { ref source, .. }
+                if source.to_string().contains("array of names")
+        ),
+        "expected the Selection visitor to reject the bare string, got: {error}"
+    );
 }
 
 #[test]
