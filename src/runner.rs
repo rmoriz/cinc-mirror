@@ -152,6 +152,17 @@ pub enum RunError {
     /// The incident flow failed.
     #[error(transparent)]
     Incident(#[from] IncidentError),
+
+    /// The only configured target cannot be used (bad configuration or
+    /// credentials). Continuing would fail every artifact the same way.
+    #[error("target `{target}` cannot be used: {source}")]
+    TargetUnusable {
+        /// Target that failed its probe or first publication.
+        target: String,
+        /// Underlying configuration or authentication error.
+        #[source]
+        source: TargetError,
+    },
 }
 
 impl RunError {
@@ -271,6 +282,8 @@ struct Job<'a> {
     downloads: &'a Arc<Semaphore>,
     uploads: &'a HashMap<String, Arc<Semaphore>>,
     seq: &'a Seq,
+    /// Set once the single configured target has been probed.
+    probed: &'a tokio::sync::OnceCell<()>,
 }
 
 impl Job<'_> {
@@ -401,6 +414,8 @@ impl Job<'_> {
                 .await?;
         }
 
+        self.ensure_target_usable().await?;
+
         let blob = self.ctx.store.path(&artifact.sha256)?;
         let mut published_now: Vec<String> = Vec::new();
         let mut published = 0;
@@ -438,6 +453,39 @@ impl Job<'_> {
             incidents,
             fully_published: failed == 0 && published_now.len() == self.targets.len(),
         })
+    }
+
+    /// Probe the only configured target once, after the first artifact is ready
+    /// and before publishing it.
+    ///
+    /// A credential helper the client cannot run, or another configuration
+    /// error, would otherwise fail every artifact in the queue. With a second
+    /// target configured the run continues and lets the other target publish.
+    async fn ensure_target_usable(&self) -> Result<(), RunError> {
+        if !self.ctx.targets.is_single() {
+            return Ok(());
+        }
+        let target = &self.ctx.targets.all()[0];
+        self.probed
+            .get_or_try_init(|| async {
+                match target.probe().await {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.is_unusable() => Err(RunError::TargetUnusable {
+                        target: target.name().to_string(),
+                        source: error,
+                    }),
+                    Err(error) => {
+                        tracing::warn!(
+                            target = target.name(),
+                            %error,
+                            "target probe failed; publication will report the error"
+                        );
+                        Ok(())
+                    }
+                }
+            })
+            .await?;
+        Ok(())
     }
 
     async fn publish_one(
@@ -490,6 +538,12 @@ impl Job<'_> {
             }
             Ok(None) => {}
             Err(error) => {
+                if self.ctx.targets.is_single() && error.is_unusable() {
+                    return Err(RunError::TargetUnusable {
+                        target: target.name().to_string(),
+                        source: error,
+                    });
+                }
                 tracing::warn!(
                     artifact = %artifact.key(),
                     target = target.name(),
@@ -563,6 +617,12 @@ impl Job<'_> {
                 Ok(PublishResult::Conflict { new })
             }
             Err(error) => {
+                if self.ctx.targets.is_single() && error.is_unusable() {
+                    return Err(RunError::TargetUnusable {
+                        target: target.name().to_string(),
+                        source: error,
+                    });
+                }
                 tracing::warn!(
                     artifact = %artifact.key(),
                     target = target.name(),
@@ -639,9 +699,11 @@ impl Job<'_> {
 /// # Errors
 ///
 /// Returns [`RunError::Usage`] for an unusable option, [`RunError::NoTargets`]
-/// when a live run has nowhere to publish, and the crawl, ledger, store or
-/// incident error that aborted the run. Per-artifact download and target
-/// failures are counted in the summary instead of aborting.
+/// when a live run has nowhere to publish, [`RunError::TargetUnusable`] when the
+/// only configured target has a configuration or authentication error, and the
+/// crawl, ledger, store or incident error that aborted the run. Other
+/// per-artifact download and target failures are counted in the summary instead
+/// of aborting.
 pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
     if opts.max_artifacts == Some(0) {
         return Err(RunError::Usage {
@@ -793,6 +855,7 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
         .iter()
         .map(|name| (name.clone(), Arc::new(Semaphore::new(upload_limit))))
         .collect();
+    let probed = tokio::sync::OnceCell::new();
 
     let job = Job {
         ctx,
@@ -801,6 +864,7 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
         downloads: &downloads,
         uploads: &uploads,
         seq: &seq,
+        probed: &probed,
     };
 
     // A capped run is sequential: with parallel workers each could start an

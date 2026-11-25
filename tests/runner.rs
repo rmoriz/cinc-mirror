@@ -24,7 +24,7 @@ use cinc_mirror::ledger::{
     self, Event, EventKind, IncidentFilter, IncidentKind, Ledger, PublicationStatus,
 };
 use cinc_mirror::net::RateLimiter;
-use cinc_mirror::oci::{OciAuth, OciConfig, Registry};
+use cinc_mirror::oci::{OciAuth, OciConfig, OciError, Registry};
 use cinc_mirror::runner::{run, Order, RunError, RunOpts};
 use cinc_mirror::scope::{ResolvedPolicy, ResolvedScope};
 use cinc_mirror::source::transport::{PayloadTransport, RetryPolicy, TransportError};
@@ -339,6 +339,8 @@ struct FakeTarget {
     puts: Mutex<Vec<PutRecord>>,
     attempts: AtomicUsize,
     fail_puts: AtomicUsize,
+    fail_probe: AtomicBool,
+    fail_exists: AtomicBool,
     delay_millis: AtomicUsize,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
@@ -353,6 +355,8 @@ impl FakeTarget {
             puts: Mutex::new(Vec::new()),
             attempts: AtomicUsize::new(0),
             fail_puts: AtomicUsize::new(0),
+            fail_probe: AtomicBool::new(false),
+            fail_exists: AtomicBool::new(false),
             delay_millis: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
@@ -366,6 +370,14 @@ impl FakeTarget {
 
     fn fail_next_puts(&self, count: usize) {
         self.fail_puts.store(count, Ordering::SeqCst);
+    }
+
+    fn fail_probe(&self) {
+        self.fail_probe.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_exists(&self) {
+        self.fail_exists.store(true, Ordering::SeqCst);
     }
 
     fn attempts(&self) -> usize {
@@ -418,10 +430,20 @@ impl Target for FakeTarget {
     }
 
     async fn probe(&self) -> Result<(), TargetError> {
+        if self.fail_probe.load(Ordering::SeqCst) {
+            return Err(TargetError::Oci(OciError::Config {
+                reason: "unusable test credentials".to_string(),
+            }));
+        }
         Ok(())
     }
 
     async fn exists(&self, artifact: &Artifact) -> Result<Option<String>, TargetError> {
+        if self.fail_exists.load(Ordering::SeqCst) {
+            return Err(TargetError::Oci(OciError::Config {
+                reason: "unusable test credentials".to_string(),
+            }));
+        }
         Ok(self.owner(&Self::reference(artifact)))
     }
 
@@ -1340,6 +1362,86 @@ async fn concurrency_never_exceeds_the_configured_maximum() {
             "uploads per target are bounded by upload_concurrency"
         );
     }
+}
+
+#[tokio::test]
+async fn a_single_unusable_target_aborts_after_the_first_download() {
+    let dir = TempDir::new().expect("state dir");
+    let specs: Vec<Spec> = (1..=3)
+        .map(|index| {
+            Spec::new(
+                &format!("19.4.{index}"),
+                &format!("cinc_19.4.{index}-1_amd64.deb"),
+                format!("package {index}").as_bytes(),
+            )
+        })
+        .collect();
+    let fixture = Fixture::new(dir.path(), &specs, &["t1"], 1, 1);
+    fixture.targets[0].fail_exists();
+    let payload = Arc::clone(&fixture.payload);
+    let ctx = fixture.ctx("run-1");
+
+    let error = run(&ctx, RunOpts::default())
+        .await
+        .expect_err("the only target is unusable");
+
+    assert!(
+        matches!(error, RunError::TargetUnusable { .. }),
+        "expected an unusable-target error, got {error:?}"
+    );
+    assert_eq!(
+        payload.calls(),
+        1,
+        "the run aborts after the first artifact instead of downloading the queue"
+    );
+}
+
+#[tokio::test]
+async fn a_single_target_probe_failure_aborts_before_publication() {
+    let dir = TempDir::new().expect("state dir");
+    let specs = vec![Spec::new(
+        "19.4.1",
+        "cinc_19.4.1-1_amd64.deb",
+        b"package one",
+    )];
+    let fixture = Fixture::new(dir.path(), &specs, &["t1"], 1, 1);
+    fixture.targets[0].fail_probe();
+    let target = Arc::clone(&fixture.targets[0]);
+    let payload = Arc::clone(&fixture.payload);
+    let ctx = fixture.ctx("run-1");
+
+    let error = run(&ctx, RunOpts::default())
+        .await
+        .expect_err("the only target cannot be probed");
+
+    assert!(
+        matches!(error, RunError::TargetUnusable { .. }),
+        "expected an unusable-target error, got {error:?}"
+    );
+    assert_eq!(payload.calls(), 1);
+    assert!(target.puts().is_empty());
+}
+
+#[tokio::test]
+async fn a_second_target_keeps_the_run_going_when_one_is_unusable() {
+    let dir = TempDir::new().expect("state dir");
+    let specs = vec![Spec::new(
+        "19.4.1",
+        "cinc_19.4.1-1_amd64.deb",
+        b"package one",
+    )];
+    let fixture = Fixture::new(dir.path(), &specs, &["t1", "t2"], 1, 1);
+    fixture.targets[0].fail_exists();
+    let second = Arc::clone(&fixture.targets[1]);
+    let ctx = fixture.ctx("run-1");
+
+    let summary = run(&ctx, RunOpts::default())
+        .await
+        .expect("a second target keeps the run alive");
+
+    assert_eq!(summary.published, 1, "the working target still publishes");
+    assert_eq!(summary.failed, 1, "the unusable target is reported");
+    assert_eq!(second.puts().len(), 1);
 }
 
 #[tokio::test]

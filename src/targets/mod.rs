@@ -129,6 +129,17 @@ pub enum TargetError {
     Oci(#[from] OciError),
 }
 
+impl TargetError {
+    /// Whether this is a configuration problem that no retry can fix.
+    ///
+    /// A run with no other target would otherwise download every artifact and
+    /// fail each publication on the same unusable credential.
+    #[must_use]
+    pub fn is_unusable(&self) -> bool {
+        matches!(self, Self::Oci(OciError::Config { .. } | OciError::Auth(_)))
+    }
+}
+
 /// One place artifacts are published to.
 ///
 /// Implementations are shared between workers, so they must be `Send + Sync`
@@ -218,6 +229,15 @@ impl TargetSet {
     #[must_use]
     pub fn all(&self) -> &[Arc<dyn Target>] {
         &self.targets
+    }
+
+    /// Whether exactly one target is enabled.
+    ///
+    /// A single unusable target aborts the run instead of failing every
+    /// artifact; with a second target the run keeps publishing there.
+    #[must_use]
+    pub fn is_single(&self) -> bool {
+        self.targets.len() == 1
     }
 }
 
