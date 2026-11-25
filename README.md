@@ -177,7 +177,10 @@ then publishes the replacement under the canonical name.
 
 `.github/workflows/ci.yml` runs formatting, clippy, tests on Linux and macOS, the
 MSRV build, `cargo audit`, rustdoc and an offline test run. It never touches the
-live upstream, a registry or GHCR.
+live upstream, a registry or GHCR. After the test matrix passes it builds
+release binaries for Linux amd64/arm64 and macOS arm64. On pushes to `main` it
+publishes them, plus `SHA256SUMS`, on the rolling `latest` GitHub Release,
+replacing the previous build so only the current commit's binaries remain.
 
 `.github/workflows/backfill.yml` is the only workflow that talks to the live
 CINC upstream and GHCR. It runs every six hours, and can also be started with
