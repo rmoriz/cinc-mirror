@@ -910,6 +910,32 @@ impl Ledger {
             .map_err(LedgerError::from)
     }
 
+    /// Write the resume cursor for `fingerprint` into the derived table.
+    ///
+    /// A backfill records its cursor through the `cursor` object of its
+    /// `run_finished` event, so the row is rebuildable by
+    /// [`Ledger::materialize`]. This is the same upsert for callers that need to
+    /// repair the projection without replaying the log; `None` values clear the
+    /// stored position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] when the upsert fails.
+    pub fn set_cursor(
+        &mut self,
+        fingerprint: &str,
+        last_version: Option<&str>,
+        last_artifact_key: Option<&str>,
+    ) -> Result<(), LedgerError> {
+        upsert_cursor(
+            &self.conn,
+            fingerprint,
+            last_version,
+            last_artifact_key,
+            &ts_text(Utc::now()),
+        )
+    }
+
     /// Canonical keys whose publication to `target` is `published`.
     ///
     /// The caller intersects the sets of every enabled target to decide whether
@@ -947,6 +973,25 @@ impl Ledger {
             .map_err(LedgerError::from)
     }
 
+    /// Every event one run appended, in sequence order.
+    ///
+    /// This is what the command layer writes to `runs/<run_id>.ndjson` after a
+    /// run finishes. The order is `seq`, not insertion order, because one
+    /// process may append the events of several interleaved commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] when the query fails.
+    pub fn events_for_run(&self, run_id: &str) -> Result<Vec<Event>, LedgerError> {
+        let mut statement = self.conn.prepare(
+            "SELECT run_id, seq, ts, kind, artifact_key, target, detail_json
+             FROM events WHERE run_id = ?1 ORDER BY seq",
+        )?;
+        let rows = statement.query_map(params![run_id], event_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(LedgerError::from)
+    }
+
     /// Number of recorded events.
     ///
     /// # Errors
@@ -957,6 +1002,38 @@ impl Ledger {
             .conn
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
         Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    /// Highest event row id, or `0` when the log is empty.
+    ///
+    /// A command layer snapshots this before a run and passes it to
+    /// [`Ledger::events_since`] afterwards, which is how it learns every event
+    /// the run appended (the incident flow uses its own run ids).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] when the query fails.
+    pub fn event_cursor(&self) -> Result<i64, LedgerError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+                row.get(0)
+            })?)
+    }
+
+    /// Every event appended after `cursor`, in append order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] when the query fails.
+    pub fn events_since(&self, cursor: i64) -> Result<Vec<Event>, LedgerError> {
+        let mut statement = self.conn.prepare(
+            "SELECT run_id, seq, ts, kind, artifact_key, target, detail_json
+             FROM events WHERE id > ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![cursor], event_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(LedgerError::from)
     }
 
     /// Whether any event was recorded under `run_id`.
@@ -1471,19 +1548,37 @@ fn reduce_run_finished(conn: &Connection, event: &Event) -> Result<(), LedgerErr
             })?;
         let last_version = cursor.get("last_version").and_then(Value::as_str);
         let last_artifact_key = cursor.get("last_artifact_key").and_then(Value::as_str);
-        conn.execute(
-            "INSERT INTO cursors
-                 (fingerprint, last_version, last_artifact_key, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (fingerprint) DO UPDATE SET
-                 last_version = COALESCE(excluded.last_version, cursors.last_version),
-                 last_artifact_key = COALESCE(
-                     excluded.last_artifact_key, cursors.last_artifact_key
-                 ),
-                 updated_at = excluded.updated_at",
-            params![fingerprint, last_version, last_artifact_key, timestamp],
+        // Absent or null fields clear the position: an uncapped backfill run
+        // has finished the queue and must not resume from an old key.
+        upsert_cursor(
+            conn,
+            fingerprint,
+            last_version,
+            last_artifact_key,
+            &timestamp,
         )?;
     }
+    Ok(())
+}
+
+/// Insert or replace one resume cursor.
+fn upsert_cursor(
+    conn: &Connection,
+    fingerprint: &str,
+    last_version: Option<&str>,
+    last_artifact_key: Option<&str>,
+    updated_at: &str,
+) -> Result<(), LedgerError> {
+    conn.execute(
+        "INSERT INTO cursors
+             (fingerprint, last_version, last_artifact_key, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (fingerprint) DO UPDATE SET
+             last_version = excluded.last_version,
+             last_artifact_key = excluded.last_artifact_key,
+             updated_at = excluded.updated_at",
+        params![fingerprint, last_version, last_artifact_key, updated_at],
+    )?;
     Ok(())
 }
 

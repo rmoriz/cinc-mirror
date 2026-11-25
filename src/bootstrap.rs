@@ -26,8 +26,9 @@
 //! # Scope and safety
 //!
 //! rsync targets are ignored: they carry sidecar metadata and no legacy data
-//! predates the ledger there. Bootstrap works without the lease and writes no
-//! run file; the caller owns ledger sync and commit. It appends events to the
+//! predates the ledger there. Bootstrap works without the lease (the command
+//! layer takes it) and appends a minimal `run_started`/`run_finished` pair with
+//! `mode: bootstrap`, so its run file explains itself. It appends events to the
 //! in-memory ledger only, never downloads package bytes and never publishes.
 
 use std::collections::HashSet;
@@ -146,9 +147,28 @@ pub async fn run(ctx: &Ctx) -> Result<BootstrapReport, BootstrapError> {
         });
     }
 
+    let seq = Seq::new();
+    ctx.ledger.lock().await.append(
+        &Event::new(
+            ctx.run_id.clone(),
+            seq.next(),
+            Utc::now(),
+            EventKind::RunStarted,
+        )
+        .with_detail(json!({
+            "mode": "bootstrap",
+            "host": hostname(),
+            "transport_order": ctx
+                .config
+                .transport
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        })),
+    )?;
+
     let artifacts = crawl_all(ctx).await?;
     let targets = oci_targets(ctx)?;
-    let seq = Seq::new();
     let mut report = BootstrapReport::default();
 
     for artifact in &artifacts {
@@ -173,7 +193,37 @@ pub async fn run(ctx: &Ctx) -> Result<BootstrapReport, BootstrapError> {
         }
     }
 
+    let outcome = if report.conflicts > 0 {
+        "incidents"
+    } else {
+        "success"
+    };
+    ctx.ledger.lock().await.append(
+        &Event::new(
+            ctx.run_id.clone(),
+            seq.next(),
+            Utc::now(),
+            EventKind::RunFinished,
+        )
+        .with_detail(json!({
+            "mode": "bootstrap",
+            "outcome": outcome,
+            "summary": {
+                "imported": report.imported,
+                "skipped": report.skipped,
+                "conflicts": report.conflicts,
+            },
+        })),
+    )?;
+
     Ok(report)
+}
+
+/// Host name for the run event; empty when the environment does not say.
+fn hostname() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("HOST"))
+        .unwrap_or_default()
 }
 
 /// Crawl every selected policy into one artifact list.

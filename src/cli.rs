@@ -14,6 +14,16 @@ use crate::runner::{Order, RunOpts};
 use crate::scope::ScopeArgs;
 use crate::verify::VerifyOpts;
 
+/// How tracing events are rendered on stderr.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum LogFormat {
+    /// Human-readable lines.
+    #[default]
+    Text,
+    /// One JSON object per event, for a log collector.
+    Json,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "cinc-mirror",
@@ -32,6 +42,10 @@ pub struct Cli {
     /// unreachable; a live lease held by another run still refuses the run
     #[arg(long, global = true)]
     pub allow_unleased: bool,
+
+    /// Format of tracing output on stderr
+    #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
+    pub log_format: LogFormat,
 }
 
 #[derive(Debug, Subcommand)]
@@ -41,7 +55,7 @@ pub enum Command {
     /// Estimate a run without downloading or publishing package bytes
     Plan(PlanArgs),
     /// Fill historical versions that are not mirrored yet
-    Backfill,
+    Backfill(BackfillArgs),
     /// Re-hash and compare known artifacts
     Verify(VerifyArgs),
     /// Re-publish or re-fetch artifacts that need repair
@@ -75,7 +89,7 @@ impl Command {
         match self {
             Self::Mirror(_) => "mirror",
             Self::Plan(_) => "plan",
-            Self::Backfill => "backfill",
+            Self::Backfill(_) => "backfill",
             Self::Verify(_) => "verify",
             Self::Repair(_) => "repair",
             Self::Incidents { .. } => "incidents",
@@ -189,11 +203,11 @@ impl OrderChoice {
     }
 }
 
-/// Queue and limit flags shared by `mirror` and, later, `backfill`.
+/// Queue and limit flags shared by `mirror` and `backfill`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// Stop after this many artifacts
-    #[arg(long = "limit", value_name = "N")]
+    #[arg(long = "limit", value_name = "N", value_parser = parse_positive)]
     pub limit: Option<usize>,
 
     /// Stop once this many download bytes were transferred (the crossing
@@ -212,6 +226,10 @@ pub struct RunArgs {
     /// Report what would happen without downloading or publishing
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Print the summary as JSON instead of one text line
+    #[arg(long)]
+    pub json: bool,
 }
 
 impl RunArgs {
@@ -224,8 +242,20 @@ impl RunArgs {
             order: self.order.to_order(),
             gc_after: self.gc_after,
             dry_run: self.dry_run,
+            ..RunOpts::default()
         }
     }
+}
+
+/// Accept a positive count for `--limit`.
+fn parse_positive(raw: &str) -> Result<usize, String> {
+    let value: usize = raw
+        .parse()
+        .map_err(|_| "expected a positive integer".to_string())?;
+    if value == 0 {
+        return Err("the limit must be greater than zero".to_string());
+    }
+    Ok(value)
 }
 
 /// Arguments to `verify`.
@@ -242,6 +272,10 @@ pub struct VerifyArgs {
     /// Check a deterministic sample of this many artifacts
     #[arg(long, value_name = "N", value_parser = parse_sample)]
     pub sample: Option<usize>,
+
+    /// Print the report as JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 impl VerifyArgs {
@@ -264,8 +298,12 @@ pub struct RepairArgs {
     pub targets: Vec<String>,
 
     /// Repair at most this many broken publications
-    #[arg(long = "limit", value_name = "N")]
+    #[arg(long = "limit", value_name = "N", value_parser = parse_positive)]
     pub limit: Option<usize>,
+
+    /// Print the report as JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 impl RepairArgs {
@@ -298,6 +336,16 @@ fn parse_sample(raw: &str) -> Result<usize, String> {
 /// Arguments to `mirror`.
 #[derive(Debug, Args)]
 pub struct MirrorArgs {
+    #[command(flatten)]
+    pub filters: ScopeFilterArgs,
+
+    #[command(flatten)]
+    pub run: RunArgs,
+}
+
+/// Arguments to `backfill`: the mirror flags plus the stored resume cursor.
+#[derive(Debug, Args)]
+pub struct BackfillArgs {
     #[command(flatten)]
     pub filters: ScopeFilterArgs,
 
@@ -378,7 +426,11 @@ pub struct PlanArgs {
 #[derive(Debug, Subcommand)]
 pub enum IncidentsCommand {
     /// List incidents, open first and newest first
-    List,
+    List {
+        /// Print the list as a JSON array
+        #[arg(long)]
+        json: bool,
+    },
     /// Show one incident
     Show { id: String },
     /// Acknowledge an incident
@@ -420,7 +472,11 @@ pub enum TargetsCommand {
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
     /// Validate the configuration without network access
-    Check,
+    Check {
+        /// Also probe every enabled target (auth, registry and rsync host)
+        #[arg(long)]
+        probe: bool,
+    },
 }
 
 #[cfg(test)]
@@ -439,7 +495,7 @@ mod tests {
         let after = Cli::try_parse_from(["cinc-mirror", "backfill", "--allow-unleased"])
             .expect("a global flag after the subcommand");
         assert!(after.allow_unleased);
-        assert!(matches!(after.cmd, Command::Backfill));
+        assert!(matches!(after.cmd, Command::Backfill(_)));
 
         let default = Cli::try_parse_from(["cinc-mirror", "mirror"]).expect("no flag");
         assert!(!default.allow_unleased);

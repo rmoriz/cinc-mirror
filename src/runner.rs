@@ -91,7 +91,7 @@ impl Order {
 }
 
 /// Per-run options, applied on top of the configuration.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunOpts {
     /// Stop after this many artifacts were started.
     pub max_artifacts: Option<usize>,
@@ -104,6 +104,13 @@ pub struct RunOpts {
     pub gc_after: bool,
     /// Plan and count without downloading, publishing or writing events.
     pub dry_run: bool,
+    /// Start the queue just after this artifact key and wrap around. A backfill
+    /// sets it from the cursor its previous capped run recorded.
+    pub start_after: Option<String>,
+    /// Record a resume cursor under this policy fingerprint in the run's
+    /// `run_finished` event: the last processed key when the run was capped,
+    /// nulls when it finished the queue.
+    pub cursor_fingerprint: Option<String>,
 }
 
 /// Why a run could not be performed.
@@ -233,6 +240,7 @@ struct Queued {
 #[derive(Debug, Clone)]
 struct ArtifactReport {
     key: String,
+    version: String,
     sha256: String,
     downloaded: bool,
     bytes: u64,
@@ -365,6 +373,7 @@ impl Job<'_> {
                     );
                     return Ok(ArtifactReport {
                         key: artifact.key(),
+                        version: artifact.version.clone(),
                         sha256: artifact.sha256.clone(),
                         downloaded: false,
                         bytes: 0,
@@ -414,6 +423,7 @@ impl Job<'_> {
 
         Ok(ArtifactReport {
             key: artifact.key(),
+            version: artifact.version.clone(),
             sha256: artifact.sha256.clone(),
             downloaded,
             bytes,
@@ -627,6 +637,11 @@ impl Job<'_> {
 /// incident error that aborted the run. Per-artifact download and target
 /// failures are counted in the summary instead of aborting.
 pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
+    if opts.max_artifacts == Some(0) {
+        return Err(RunError::Usage {
+            reason: "--limit must be greater than zero".to_string(),
+        });
+    }
     if opts.max_bytes == Some(0) {
         return Err(RunError::Usage {
             reason: "--limit-bytes must be greater than zero".to_string(),
@@ -718,12 +733,25 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
             discovered,
             satisfied,
             skipped,
+            queued: queue.len(),
             ..Summary::default()
         }
         .finish());
     }
 
     queue.sort_by(|left, right| compare(left, right, opts.order));
+    if let Some(after) = opts.start_after.as_deref() {
+        if let Some(index) = queue.iter().position(|item| item.artifact.key() == *after) {
+            if index + 1 < queue.len() {
+                queue.rotate_left(index + 1);
+            }
+        } else {
+            tracing::warn!(
+                artifact = after,
+                "the stored backfill cursor is not in this queue; starting at the beginning"
+            );
+        }
+    }
     tracing::debug!(
         discovered,
         satisfied,
@@ -787,6 +815,7 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
         discovered,
         satisfied,
         skipped,
+        queued: queue.len(),
         ..Summary::default()
     };
     for report in &reports {
@@ -795,6 +824,13 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
         summary.failed += report.failed;
         summary.incidents_opened += report.incidents;
         summary.bytes_downloaded = summary.bytes_downloaded.saturating_add(report.bytes);
+    }
+    // A capped run stops with work left, so its last artifact is a valid resume
+    // point. An uncapped run has nothing to resume.
+    summary.capped = reports.len() < queue.len();
+    if summary.capped {
+        summary.last_version = reports.last().map(|report| report.version.clone());
+        summary.last_artifact_key = reports.last().map(|report| report.key.clone());
     }
     let summary = summary.finish();
 
@@ -810,6 +846,23 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
         } else {
             "success"
         };
+        let mut detail = json!({"outcome": outcome, "summary": &summary});
+        if let Some(fingerprint) = opts.cursor_fingerprint.as_deref() {
+            detail["cursor"] = if summary.capped {
+                json!({
+                    "fingerprint": fingerprint,
+                    "last_version": summary.last_version.as_deref(),
+                    "last_artifact_key": summary.last_artifact_key.as_deref(),
+                })
+            } else {
+                // A finished queue clears the old resume point.
+                json!({
+                    "fingerprint": fingerprint,
+                    "last_version": null,
+                    "last_artifact_key": null,
+                })
+            };
+        }
         append(
             ctx,
             Event::new(
@@ -818,7 +871,7 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
                 Utc::now(),
                 EventKind::RunFinished,
             )
-            .with_detail(json!({"outcome": outcome, "summary": summary})),
+            .with_detail(detail),
         )
         .await?;
     }

@@ -1072,3 +1072,66 @@ fn has_events_for_run_reports_only_recorded_run_ids() {
         "a different run id has no events"
     );
 }
+
+#[test]
+fn run_queries_and_cursor_clearing_are_exact() {
+    let (_dir, mut ledger) = open();
+    let first = artifact("19.4.46", 'a');
+    let second = artifact("19.4.47", 'b');
+
+    ledger
+        .append(&seen("run-1", 1, &first, 10))
+        .expect("run-1 event one");
+    ledger
+        .append(&seen("run-1", 2, &first, 10))
+        .expect("run-1 event two");
+    ledger
+        .append(&seen("run-2", 1, &second, 20))
+        .expect("run-2 event");
+
+    let cursor = ledger.event_cursor().expect("event cursor");
+    assert_eq!(cursor, 3, "three events were appended");
+
+    let run_one = ledger.events_for_run("run-1").expect("run events");
+    assert_eq!(run_one.len(), 2);
+    assert_eq!(run_one[0].seq, 1);
+    assert_eq!(run_one[1].seq, 2);
+
+    assert!(ledger.events_since(cursor).expect("tail").is_empty());
+    ledger
+        .append(&seen("run-3", 1, &first, 10))
+        .expect("later event");
+    let tail = ledger.events_since(cursor).expect("tail");
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].run_id, "run-3");
+
+    // A capped run stores a position; an uncapped run clears it.
+    ledger
+        .set_cursor("fingerprint", Some("19.4.46"), Some(&first.key()))
+        .expect("set the cursor");
+    let stored = ledger
+        .cursor("fingerprint")
+        .expect("cursor query")
+        .expect("cursor row");
+    assert_eq!(stored.last_version.as_deref(), Some("19.4.46"));
+
+    ledger
+        .append(&event(
+            "run-4",
+            1,
+            EventKind::RunFinished,
+            None,
+            None,
+            json!({
+                "outcome": "success",
+                "cursor": {"fingerprint": "fingerprint"},
+            }),
+        ))
+        .expect("an uncapped run clears the cursor");
+    let cleared = ledger
+        .cursor("fingerprint")
+        .expect("cursor query")
+        .expect("cursor row");
+    assert_eq!(cleared.last_version, None);
+    assert_eq!(cleared.last_artifact_key, None);
+}

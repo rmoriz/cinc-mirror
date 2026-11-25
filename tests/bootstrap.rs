@@ -604,8 +604,14 @@ async fn rsync_targets_are_ignored() {
         .publications(RSYNC)
         .unwrap()
         .is_empty());
-    assert!(
-        event_list(&fixture.ctx).await.is_empty(),
-        "an ignored rsync target records nothing"
+    let events = event_list(&fixture.ctx).await;
+    assert_eq!(
+        events.len(),
+        2,
+        "an ignored rsync target records only the run pair"
     );
+    assert_eq!(count_kind(&events, EventKind::RunStarted), 1);
+    assert_eq!(count_kind(&events, EventKind::RunFinished), 1);
+    assert_eq!(count_kind(&events, EventKind::Imported), 0);
+    assert_eq!(count_kind(&events, EventKind::IncidentOpened), 0);
 }

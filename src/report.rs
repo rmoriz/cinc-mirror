@@ -18,8 +18,95 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_PARTIAL: i32 = 2;
 /// The run newly opened an integrity incident.
 pub const EXIT_INCIDENTS: i32 = 3;
+/// A live foreign run holds the ledger lease.
+pub const EXIT_LEASE_BUSY: i32 = 4;
+/// The configuration, credentials or the ledger remote are unusable.
+pub const EXIT_CONFIG: i32 = 5;
 /// The command line asked for something unusable.
 pub const EXIT_USAGE: i32 = 64;
+
+/// Environment variables whose values must never be printed.
+const TOKEN_ENV: [&str; 2] = ["GHCR_TOKEN", "GITHUB_TOKEN"];
+
+/// Hide credentials a diagnostic line may have picked up.
+///
+/// Errors are formatted from library types rather than raw headers, so the two
+/// realistic leaks are an `Authorization` header value pasted into a message
+/// and a token that a library echoed from its environment. Both are replaced
+/// with `***`; the rest of the message stays readable.
+#[must_use]
+pub fn redact_secrets(text: &str) -> String {
+    let mut redacted = redact_header(text);
+
+    for name in TOKEN_ENV {
+        let Ok(value) = std::env::var(name) else {
+            continue;
+        };
+        let value = value.trim();
+        // A short value is far more likely a substring of unrelated text than a
+        // credential; replacing it would only corrupt the diagnostic.
+        if value.len() >= 8 {
+            redacted = redacted.replace(value, "***");
+        }
+    }
+
+    redacted
+}
+
+/// Replace the value of every `Authorization` header occurrence.
+///
+/// Only a `:` or `=` separator marks a header; the word in prose ("authorization
+/// is required") is left alone.
+fn redact_header(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(offset) = lower[cursor..].find("authorization") {
+        let start = cursor + offset;
+        let after = start + "authorization".len();
+        result.push_str(&text[cursor..after]);
+
+        // Optional whitespace, then the separator.
+        let mut separator = after;
+        while let Some(character) = text[separator..].chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            separator += character.len_utf8();
+        }
+        let Some(character) = text[separator..].chars().next() else {
+            cursor = after;
+            continue;
+        };
+        if character != ':' && character != '=' {
+            cursor = after;
+            continue;
+        }
+        let value_begin = separator + character.len_utf8();
+        result.push_str(&text[after..value_begin]);
+
+        // Skip the horizontal whitespace that follows the separator.
+        let mut value_start = value_begin;
+        while let Some(character) = text[value_start..].chars().next() {
+            if !character.is_whitespace() || character == '\n' || character == '\r' {
+                break;
+            }
+            value_start += character.len_utf8();
+        }
+        // Keep one space so the line stays readable.
+        if value_start > value_begin {
+            result.push(' ');
+        }
+        result.push_str("***");
+        // The value runs to the end of the line.
+        let value_end = text[value_start..]
+            .find(['\n', '\r'])
+            .map_or(text.len(), |offset| value_start + offset);
+        cursor = value_end;
+    }
+    result.push_str(&text[cursor..]);
+    result
+}
 
 /// Counts from one run.
 ///
@@ -27,12 +114,14 @@ pub const EXIT_USAGE: i32 = 64;
 /// artifacts, because fan-out is per target. `failed` counts failed downloads
 /// and publication attempts that are not incidents; a tag conflict is tracked
 /// as an incident so a repeated detection does not keep failing the run.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Summary {
     /// Artifacts the crawl produced.
     pub discovered: usize,
     /// Artifacts already published on every enabled target.
     pub satisfied: usize,
+    /// Artifacts waiting in the queue after satisfied rows were removed.
+    pub queued: usize,
     /// Artifacts whose bytes were downloaded in this run.
     pub downloaded: usize,
     /// Successful publications, one per artifact and target.
@@ -45,6 +134,12 @@ pub struct Summary {
     pub incidents_opened: usize,
     /// Bytes actually transferred by the download ladder, resume offset excluded.
     pub bytes_downloaded: u64,
+    /// Whether a limit stopped the run with work left in the queue.
+    pub capped: bool,
+    /// Version of the last artifact processed, for a backfill cursor.
+    pub last_version: Option<String>,
+    /// Key of the last artifact processed, for a backfill cursor.
+    pub last_artifact_key: Option<String>,
     /// Process exit code implied by the counts.
     pub exit_code: i32,
 }
@@ -132,6 +227,7 @@ mod tests {
         let summary = Summary {
             discovered: 3,
             satisfied: 1,
+            queued: 2,
             downloaded: 2,
             published: 4,
             skipped: 0,
@@ -139,6 +235,7 @@ mod tests {
             incidents_opened: 0,
             bytes_downloaded: 2048,
             exit_code: 0,
+            ..Summary::default()
         };
         assert_eq!(
             summary.to_text(),
@@ -146,5 +243,22 @@ mod tests {
              incidents=0 bytes=2048 exit=0"
         );
         assert!(summary.to_json().contains("\"published\": 4"));
+        assert!(summary.to_json().contains("\"queued\": 2"));
+    }
+
+    #[test]
+    fn redaction_hides_header_values_and_tokens() {
+        assert_eq!(
+            super::redact_header("Authorization: Bearer abc123\nnext line"),
+            "Authorization: ***\nnext line"
+        );
+        assert_eq!(
+            super::redact_header("request with authorization=Basic Zm9v failed"),
+            "request with authorization=***"
+        );
+        assert_eq!(
+            super::redact_header("authorization is required"),
+            "authorization is required"
+        );
     }
 }
