@@ -6,13 +6,23 @@
 #   cp mirror.toml.example mirror.toml && chmod 600 mirror.toml
 #
 # Credentials are never stored in this file. The `ghcr` target uses
-# `auth = "docker"`, so log in once and let Docker keep the credential:
+# `auth = "basic"` and reads them from the environment:
 #
-#   echo "$GHCR_TOKEN" | docker login ghcr.io -u <github-user> --password-stdin
+#   export CINC_MIRROR_GHCR_USER="<github-user>"
+#   export CINC_MIRROR_GHCR_PASSWORD="<token with write:packages>"
 #
-# with a token that carries `write:packages` (plus `read:packages`, `repo`).
-# In GitHub Actions the workflow writes the same docker config from
-# `GITHUB_TOKEN`, so nothing here changes there.
+# With the GitHub CLI:
+#
+#   export CINC_MIRROR_GHCR_USER="$(gh api user --jq .login)"
+#   export CINC_MIRROR_GHCR_PASSWORD="$(gh auth token)"
+#
+# Or copy `.env.example` to `.env` next to this file and put the same names
+# there; the binary loads `.env` (or `config.env`) automatically.
+#
+# `auth = "docker"` remains available for plain `auths` entries in
+# `~/.docker/config.json`, but credential helpers such as Docker Desktop's
+# `desktop` helper are not run. In GitHub Actions the workflow supplies a
+# plain docker config from `GITHUB_TOKEN`, so the CI configuration is separate.
 #
 # Replace `<owner>` with your GitHub user or organization. New GHCR packages
 # are private; make them public once under
@@ -66,7 +76,7 @@ name = "ghcr"
 kind = "oci"
 registry = "ghcr.io"
 namespace = "<owner>/cinc-mirror"
-auth = "docker"
+auth = "basic"
 
 # A second, ordinary target. Enable it and fill in the host or path; the same
 # bytes are always fanned out to every enabled target.

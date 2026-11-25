@@ -54,7 +54,9 @@ cargo test
 The mirror reads `mirror.toml` from the working directory, or the file given
 with `--config`. The file is git-ignored and should be mode `0600`. It never
 contains credentials: a target names an auth mode and the secret is read from
-the environment, Docker config or a key file at use time.
+the environment or a key file at use time. `auth = "docker"` also reads plain
+`auths` entries from `~/.docker/config.json`, but it does not run credential
+helpers such as Docker Desktop's `desktop` helper.
 
 A commented, ready-to-edit example that publishes to GHCR is in
 `mirror.toml.example`; copy it to `mirror.toml`.
@@ -100,7 +102,7 @@ name = "ghcr"
 kind = "oci"
 registry = "ghcr.io"
 namespace = "<owner>/cinc-mirror"
-auth = "docker"
+auth = "basic"
 
 [[targets]]
 name = "rsync"
@@ -109,6 +111,29 @@ url = "ssh://mirror@backup.example.org/srv/cinc-mirror"
 auth = "ssh-key"
 identity_file = "~/.ssh/id_ed25519"
 ```
+
+The GHCR target reads `CINC_MIRROR_GHCR_USER` and
+`CINC_MIRROR_GHCR_PASSWORD` (or `password_file`). With the GitHub CLI:
+
+```bash
+export CINC_MIRROR_GHCR_USER="$(gh api user --jq .login)"
+export CINC_MIRROR_GHCR_PASSWORD="$(gh auth token)"
+```
+
+Use `gh auth refresh -s write:packages` if the token lacks the scope.
+The binary also loads `.env` (or the legacy `config.env`) from the working
+directory before reading credentials, so the same names can live in a
+git-ignored file:
+
+```bash
+cp .env.example .env && chmod 600 .env
+```
+
+Variables already present in the environment are not overridden.
+`CINC_MIRROR_ENV_FILE` can name a different file.
+
+`mirror.ci.toml` keeps `auth = "docker"` because the workflow writes a plain
+`auths` entry from `GITHUB_TOKEN`.
 
 `mirror.ci.toml` is the committed configuration the scheduled workflow uses; it
 mirrors all six upstream projects at every version.

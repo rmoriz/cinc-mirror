@@ -63,6 +63,8 @@ const LEASE_REFRESH: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    load_env_file();
+
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
@@ -82,6 +84,44 @@ async fn main() -> ExitCode {
             eprintln!("error: {}", redact_secrets(&format!("{error:#}")));
             ExitCode::from(exit_code(&error) as u8)
         }
+    }
+}
+
+/// Load credentials from `.env` (or the legacy `config.env`) before anything
+/// reads the environment.
+///
+/// `CINC_MIRROR_ENV_FILE` names one explicit file. Otherwise the first of
+/// `.env` and `config.env` in the working directory wins. `dotenvy` does not
+/// override variables already present in the environment.
+fn load_env_file() {
+    let explicit = std::env::var_os("CINC_MIRROR_ENV_FILE");
+    let candidates: Vec<std::ffi::OsString> = match explicit {
+        Some(path) => vec![path],
+        None => vec![".env".into(), "config.env".into()],
+    };
+
+    for candidate in candidates {
+        let path = std::path::Path::new(&candidate);
+        if !path.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if let Ok(metadata) = path.metadata() {
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    eprintln!(
+                        "warning: {} is readable by other users; run `chmod 600 {}`",
+                        path.display(),
+                        path.display()
+                    );
+                }
+            }
+        }
+        if let Err(error) = dotenvy::from_path(path) {
+            eprintln!("warning: cannot load {}: {error}", path.display());
+        }
+        return;
     }
 }
 

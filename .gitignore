@@ -10,6 +10,7 @@ logs/
 
 # Configuration with secrets
 config.env
+.env
 
 # Rust build output and runtime state
 /target
