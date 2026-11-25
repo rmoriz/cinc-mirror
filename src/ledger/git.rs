@@ -190,6 +190,12 @@ impl LedgerStore {
         }
 
         if self.remote_has_branch()? {
+            if self.workdir.join(".git").exists() {
+                // A bootstrap interrupted after its orphan commit (or a race
+                // picked up by a later call) already owns this worktree; adopt
+                // the remote tip instead of refusing to clone over it.
+                return self.adopt_remote_tip();
+            }
             let mut command = git(&[
                 "clone",
                 "--quiet",
@@ -262,12 +268,48 @@ impl LedgerStore {
             return Ok(());
         }
 
-        // Another run bootstrapped the branch between our probe and our push:
-        // adopt its tip instead of failing the first run.
-        match self.fetch_and_reset() {
+        // Another run bootstrapped the branch between our probe and our push.
+        // The only local commit is this call's readme — no run file can exist
+        // yet — so adopting the winning tip is safe. Run commits never take
+        // this path; `sync` refuses to reset those away.
+        match self.adopt_remote_tip() {
             Ok(()) => Ok(()),
             Err(_) => Err(failure(&push, "push")),
         }
+    }
+
+    /// Fetch the remote ledger branch into `FETCH_HEAD`.
+    fn fetch_remote_tip(&self) -> Result<(), LedgerGitError> {
+        let reference = format!("refs/heads/{}", self.branch);
+        ok(
+            git_in(
+                &self.workdir,
+                &["fetch", "--quiet", "--no-tags", &self.remote, &reference],
+            ),
+            "fetch",
+        )?;
+        Ok(())
+    }
+
+    /// Move `HEAD` and the working tree to the fetched tip.
+    fn reset_to_fetch_head(&self) -> Result<(), LedgerGitError> {
+        ok(
+            git_in(&self.workdir, &["reset", "--quiet", "--hard", "FETCH_HEAD"]),
+            "reset",
+        )?;
+        Ok(())
+    }
+
+    /// Adopt the remote tip after losing the bootstrap race.
+    ///
+    /// Unconditional on purpose, and only used by the bootstrap fallback: the
+    /// local commit there is the duplicate readme of a first run, never a run
+    /// segment. Everything after a first successful sync goes through
+    /// [`LedgerStore::fetch_and_reset`], which protects local commits.
+    fn adopt_remote_tip(&self) -> Result<(), LedgerGitError> {
+        self.ensure_repo()?;
+        self.fetch_remote_tip()?;
+        self.reset_to_fetch_head()
     }
 
     fn fetch_and_reset(&self) -> Result<(), LedgerGitError> {
@@ -279,14 +321,7 @@ impl LedgerStore {
             });
         }
 
-        let reference = format!("refs/heads/{}", self.branch);
-        ok(
-            git_in(
-                &self.workdir,
-                &["fetch", "--quiet", "--no-tags", &self.remote, &reference],
-            ),
-            "fetch",
-        )?;
+        self.fetch_remote_tip()?;
 
         // A run whose push was rejected leaves a commit that exists only here.
         // Resetting to the remote tip would delete it (and its run file), so
@@ -320,11 +355,7 @@ impl LedgerStore {
             return Ok(());
         }
 
-        ok(
-            git_in(&self.workdir, &["reset", "--quiet", "--hard", "FETCH_HEAD"]),
-            "reset",
-        )?;
-        Ok(())
+        self.reset_to_fetch_head()
     }
 
     fn relative_path(&self, path: &Path) -> Result<String, LedgerGitError> {
@@ -1023,4 +1054,160 @@ pub enum LeaseError {
     /// A git operation failed.
     #[error(transparent)]
     Git(#[from] LedgerGitError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use super::LedgerStore;
+
+    const BRANCH: &str = "ledger";
+    const WINNER_README: &str = "ledger for cinc-mirror from the winner\n";
+    const LOSER_README: &str = "ledger for cinc-mirror\n";
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A bare remote plus its `file://` URL.
+    fn bare_remote(root: &Path) -> (PathBuf, String) {
+        let remote = root.join("remote.git");
+        let output = Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(&remote)
+            .output()
+            .expect("run git init --bare");
+        assert!(
+            output.status.success(),
+            "git init --bare failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let url = format!("file://{}", remote.display());
+        (remote, url)
+    }
+
+    /// A worktree with an orphan `ledger` branch holding one readme commit.
+    fn orphan_repo(path: &Path, readme: &str) {
+        let output = Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(path)
+            .output()
+            .expect("run git init");
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        git(path, &["symbolic-ref", "HEAD", "refs/heads/ledger"]);
+        fs::write(path.join("README.md"), readme).expect("write readme");
+        git(path, &["add", "README.md"]);
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@localhost",
+                "commit",
+                "--quiet",
+                "-m",
+                "ledger: initialize",
+            ])
+            .output()
+            .expect("run git commit");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    fn push_winner(workdir: &Path, url: &str) {
+        let refspec = format!("HEAD:refs/heads/{BRANCH}");
+        git(workdir, &["push", "--quiet", url, &refspec]);
+    }
+
+    fn store(workdir: &Path, url: &str) -> LedgerStore {
+        LedgerStore::new(workdir.to_path_buf(), url.to_string(), BRANCH.to_string())
+    }
+
+    /// The fallback inside `init_orphan_branch`: the branch appeared between our
+    /// probe and our push, so the failed push is followed by adopting the tip.
+    #[test]
+    fn init_orphan_branch_adopts_a_winning_bootstrap() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let (remote, url) = bare_remote(root.path());
+
+        let winner = root.path().join("winner");
+        orphan_repo(&winner, WINNER_README);
+        push_winner(&winner, &url);
+        let winner_head = git(&remote, &["rev-parse", "refs/heads/ledger"]);
+
+        let workdir = root.path().join("state/ledger-repo");
+        fs::create_dir_all(workdir.parent().expect("state dir")).expect("state dir");
+        store(&workdir, &url)
+            .init_orphan_branch()
+            .expect("a lost bootstrap adopts the winner instead of failing");
+
+        assert_eq!(git(&workdir, &["rev-parse", "HEAD"]), winner_head);
+        assert_eq!(
+            fs::read_to_string(workdir.join("README.md")).expect("readme"),
+            WINNER_README
+        );
+        assert_eq!(git(&workdir, &["status", "--porcelain"]), "");
+        assert_eq!(
+            git(&remote, &["rev-list", "--count", "refs/heads/ledger"]),
+            "1",
+            "the duplicate readme commit was not pushed"
+        );
+    }
+
+    /// The deterministic pre-created shape of the race: both sides already have
+    /// an orphan bootstrap commit, and the losing worktree is handed back to the
+    /// store.
+    #[test]
+    fn clone_or_init_adopts_an_existing_bootstrap_commit() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let (remote, url) = bare_remote(root.path());
+
+        let winner = root.path().join("winner");
+        orphan_repo(&winner, WINNER_README);
+        push_winner(&winner, &url);
+        let winner_head = git(&remote, &["rev-parse", "refs/heads/ledger"]);
+
+        let workdir = root.path().join("state/ledger-repo");
+        fs::create_dir_all(&workdir).expect("state dir");
+        orphan_repo(&workdir, LOSER_README);
+        assert_ne!(
+            git(&workdir, &["rev-parse", "HEAD"]),
+            winner_head,
+            "the losing bootstrap has its own commit"
+        );
+
+        store(&workdir, &url)
+            .clone_or_init()
+            .expect("the pre-created bootstrap is adopted");
+
+        assert_eq!(git(&workdir, &["rev-parse", "HEAD"]), winner_head);
+        assert_eq!(
+            fs::read_to_string(workdir.join("README.md")).expect("readme"),
+            WINNER_README
+        );
+        assert_eq!(git(&workdir, &["status", "--porcelain"]), "");
+    }
 }
