@@ -484,26 +484,54 @@ async fn ftp_reports_a_missing_path_as_not_found() {
 #[tokio::test]
 async fn restart_when_partial_hash_differs_after_completion() {
     let wrong = b"HELLO";
-    let rung = serving(TransportKind::Ftp, wrong);
+    let right = b"hello";
+    // The first server holds a complete but wrong object; the second rung must
+    // be tried and its verified bytes must win.
+    let first = serving(TransportKind::Ftp, wrong);
+    let second = serving(TransportKind::Ftps, right);
     let (_dir, dest) = empty_dest();
 
-    let error = source_with(vec![rung], no_retry())
-        .download(REMOTE, &dest, &expected_for(b"hello"))
+    let outcome = source_with(vec![first.clone(), second.clone()], no_retry())
+        .download(REMOTE, &dest, &expected_for(right))
         .await
-        .expect_err("a digest mismatch is an incident, not a success");
+        .expect("a later rung with the right bytes must win");
+
+    assert_eq!(first.calls(), 1, "a corrupt completion is not retried");
+    assert_eq!(second.calls(), 1, "the next rung must be tried");
+    assert_eq!(outcome.transport, TransportKind::Ftps);
+    assert_eq!(outcome.hashes.sha256, sha256_of(right));
+    assert_eq!(std::fs::read(&dest).expect("payload"), right);
+}
+
+#[tokio::test]
+async fn a_corrupt_rung_outranks_a_later_transport_failure() {
+    let wrong = b"complete but wrong";
+    let promised = b"what the metadata promised";
+    let corrupt = serving(TransportKind::Ftp, wrong);
+    let failing = FakeTransport::new(TransportKind::Ftps, |_call, _dest, _from| {
+        Err(retryable("the later rung is down"))
+    });
+    let (_dir, dest) = empty_dest();
+
+    let error = source_with(vec![corrupt.clone(), failing.clone()], no_retry())
+        .download(REMOTE, &dest, &expected_for(promised))
+        .await
+        .expect_err("no rung verified the bytes");
 
     match error {
         DownloadError::Corrupt { expected, observed } => {
-            assert_eq!(expected, sha256_of(b"hello"));
-            assert_eq!(observed.sha256, sha256_of(wrong));
-            assert_eq!(observed.size, wrong.len() as u64);
+            assert_eq!(expected, sha256_of(promised));
+            assert_eq!(
+                observed.sha256,
+                sha256_of(wrong),
+                "the last corrupt completion must be reported"
+            );
         }
-        other => panic!("unexpected error: {other:?}"),
+        other => panic!("a corrupt rung must outrank a transport failure: {other:?}"),
     }
-    assert!(
-        !dest.exists(),
-        "a corrupt partial must be deleted, not resumed"
-    );
+    assert_eq!(corrupt.calls(), 1);
+    assert_eq!(failing.calls(), 3, "the later rung still retries");
+    assert!(!dest.exists(), "the corrupt partial must be deleted");
 }
 
 #[tokio::test]

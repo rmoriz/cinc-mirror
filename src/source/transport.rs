@@ -275,9 +275,11 @@ pub enum DownloadError {
         observed: Option<Box<Hashes>>,
     },
 
-    /// A complete file was produced but its digests or size did not match.
+    /// Every rung that produced a complete file produced the wrong bytes.
     ///
-    /// The partial is deleted: a file with the wrong bytes is never resumed.
+    /// The file is deleted: a corrupt file is never resumed. `observed` is the
+    /// last corrupt completion, even when later rungs failed with transport
+    /// errors; a later rung that verifies wins and is not reported here.
     Corrupt {
         /// Expected lowercase hex SHA-256.
         expected: String,
@@ -945,6 +947,11 @@ fn ftp_error(remote_path: &str, error: FtpError) -> TransportError {
 /// `dest` is the `.part` path the caller (the store) owns; its current length is
 /// read here and used as the resume offset. The file is only left in place when
 /// its size and every expected digest agree.
+///
+/// A completed file with the wrong bytes is deleted and the ladder continues:
+/// the rungs are different servers (an FTP mirror and the HTTPS origin), so one
+/// of them may still have the right object. When no rung verifies, a corrupt
+/// completion outranks the transport errors of later rungs.
 pub(crate) async fn download(
     transports: &[Arc<dyn PayloadTransport>],
     retry: &RetryPolicy,
@@ -964,6 +971,7 @@ pub(crate) async fn download(
     }
 
     let mut last: Option<(TransportKind, TransportError)> = None;
+    let mut corrupt: Option<(String, Box<Hashes>)> = None;
 
     for transport in transports {
         let kind = transport.kind();
@@ -978,6 +986,12 @@ pub(crate) async fn download(
                         source,
                     })
                 }
+                Err(AttemptError::Corrupt { expected, observed }) => {
+                    // Wrong bytes are never retried on the same rung, but a
+                    // different server may hold the right object.
+                    corrupt = Some((expected, observed));
+                    break;
+                }
                 Err(AttemptError::Failed(source)) => {
                     last = Some((kind, source));
                 }
@@ -988,6 +1002,10 @@ pub(crate) async fn download(
                 tokio::time::sleep(retry.delay(attempt - 1)).await;
             }
         }
+    }
+
+    if let Some((expected, observed)) = corrupt {
+        return Err(DownloadError::Corrupt { expected, observed });
     }
 
     let Some((last_transport, source)) = last else {
@@ -1015,7 +1033,15 @@ enum AttemptError {
     Permanent(TransportError),
     /// The rung may be retried, then the ladder moves on.
     Failed(TransportError),
-    /// The ladder must stop with this error (corruption, local I/O).
+    /// A complete file had the wrong bytes: it was deleted, this rung must not
+    /// be retried, and the ladder moves on.
+    Corrupt {
+        /// Expected lowercase hex SHA-256.
+        expected: String,
+        /// Hashes of the deleted bytes.
+        observed: Box<Hashes>,
+    },
+    /// The ladder must stop with this error (local I/O).
     Aborted(DownloadError),
 }
 
@@ -1070,12 +1096,13 @@ async fn attempt_download(
         });
     }
 
-    // Wrong bytes are never resumed: delete the file and report both digests.
+    // Wrong bytes are never resumed: delete the file and let the ladder try the
+    // next rung. Both digests are kept for the final report.
     let _ = tokio::fs::remove_file(dest).await;
-    Err(AttemptError::Aborted(DownloadError::Corrupt {
+    Err(AttemptError::Corrupt {
         expected: expected.sha256.clone(),
         observed: Box::new(hashes),
-    }))
+    })
 }
 
 /// Current length of `dest`; a missing file is an empty partial.
