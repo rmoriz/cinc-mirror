@@ -44,10 +44,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn artifact_for(bytes: &[u8]) -> Artifact {
+    artifact_with_basename(bytes, BASENAME)
+}
+
+fn artifact_with_basename(bytes: &[u8], basename: &str) -> Artifact {
     let sha256 = sha256_hex(bytes);
     let metadata = format!(
         r#"{{
-  "basename": "{BASENAME}",
+  "basename": "{basename}",
   "sha256": "{sha256}",
   "platform": "debian",
   "platform_version": "13",
@@ -65,7 +69,7 @@ fn artifact_for(bytes: &[u8]) -> Artifact {
             platform_version: "13".to_string(),
         },
         ArtifactInput {
-            basename: BASENAME.to_string(),
+            basename: basename.to_string(),
             sha256,
             metadata_json: metadata,
             platform: "debian".to_string(),
@@ -208,7 +212,7 @@ fn ssh_address_uses_strict_host_key_and_batch_mode() {
         "-p 2222",
         "-o BatchMode=yes",
         "-o StrictHostKeyChecking=yes",
-        "-i /keys/id_ed25519",
+        "-i '/keys/id_ed25519'",
     ] {
         assert!(
             rsh.contains(expected),
@@ -216,6 +220,10 @@ fn ssh_address_uses_strict_host_key_and_batch_mode() {
         );
     }
 
+    assert!(
+        args.iter().any(|arg| arg == "-s"),
+        "the remote path must be protected from the remote shell: {args:?}"
+    );
     assert!(args.iter().any(|arg| arg == "--partial-dir=.rsync-partial"));
     assert_eq!(
         args.last().expect("destination"),
@@ -248,6 +256,10 @@ fn daemon_address_does_not_use_ssh() {
     assert!(
         !args.iter().any(|arg| arg == "-e"),
         "a daemon transfer must not invoke ssh: {args:?}"
+    );
+    assert!(
+        args.iter().any(|arg| arg == "-s"),
+        "the remote path must be protected from the remote shell: {args:?}"
     );
     assert!(args.iter().any(|arg| arg == "--mkpath"));
     assert!(args.iter().any(|arg| arg == "--partial-dir=.rsync-partial"));
@@ -318,6 +330,35 @@ async fn fresh_upload_writes_package_metadata_and_sidecar() {
         !dir.join(".rsync-partial").exists(),
         "a complete upload leaves no partial directory"
     );
+}
+
+#[tokio::test]
+async fn local_upload_handles_a_metacharacter_basename() {
+    require_rsync();
+
+    let source = tempfile::tempdir().expect("source dir");
+    let root = tempfile::tempdir().expect("target dir");
+    let bytes = b"the verified package bytes";
+    let basename = "pkg ;$(id)'q.deb";
+    let artifact = artifact_with_basename(bytes, basename);
+    let package = source.path().join(basename);
+    std::fs::write(&package, bytes).expect("write package");
+    let target = local_target(root.path());
+
+    let outcome = target.put(&artifact, &package).await.expect("put");
+
+    let dir = published_dir(root.path(), &artifact);
+    assert_eq!(
+        std::fs::read(dir.join(basename)).expect("package"),
+        bytes,
+        "local paths are argv, so metacharacters stay literal"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join(format!("{basename}.sha256"))).expect("sidecar"),
+        format!("{}  {}\n", artifact.sha256, bytes.len())
+    );
+    assert_eq!(outcome.remote_digest, artifact.sha256);
+    target.verify(&artifact).await.expect("verify");
 }
 
 #[tokio::test]

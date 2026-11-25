@@ -252,10 +252,14 @@ impl RsyncTarget {
         match &self.address {
             RsyncAddress::Local { .. } => {}
             RsyncAddress::Ssh { .. } => {
+                // `-s` makes rsync pass the remote path as one protected
+                // argument instead of letting the remote shell split it.
+                args.push("-s".to_string());
                 args.push("-e".to_string());
                 args.push(self.ssh_rsh());
             }
             RsyncAddress::Daemon { .. } => {
+                args.push("-s".to_string());
                 // The daemon receiver cannot be told to create parents any
                 // other way; rsync 3.2.3+ grows the destination path.
                 args.push("--mkpath".to_string());
@@ -337,7 +341,7 @@ impl RsyncTarget {
         parts.push("StrictHostKeyChecking=yes".to_string());
         if let Some(identity) = identity {
             parts.push("-i".to_string());
-            parts.push(quote_if_needed(identity));
+            parts.push(shell_quote(identity));
         }
         parts.join(" ")
     }
@@ -375,6 +379,35 @@ impl RsyncTarget {
             None => host.clone(),
         });
         Some(args)
+    }
+
+    /// Remote `mkdir -p <path>` command for an SSH host.
+    ///
+    /// The path is one protected argument: the remote shell must not split it
+    /// on whitespace, expand a `$`, or read a `;` as a command separator.
+    fn ssh_mkdir_args(&self, relative: &str) -> Vec<String> {
+        vec![
+            "mkdir".to_string(),
+            "-p".to_string(),
+            shell_quote(&self.ssh_remote_path(relative)),
+        ]
+    }
+
+    /// Remote `cat <path>` command for an SSH host.
+    fn ssh_cat_args(&self, relative: &str) -> Vec<String> {
+        vec![
+            "cat".to_string(),
+            shell_quote(&self.ssh_remote_path(relative)),
+        ]
+    }
+
+    /// Remote `test -f <path>` command for an SSH host.
+    fn ssh_test_args(&self, relative: &str) -> Vec<String> {
+        vec![
+            "test".to_string(),
+            "-f".to_string(),
+            shell_quote(&self.ssh_remote_path(relative)),
+        ]
     }
 
     async fn ssh(&self, remote: &[String]) -> Result<Output, TargetError> {
@@ -424,10 +457,8 @@ impl RsyncTarget {
                     .map_err(|source| io_error(path, source))
             }
             RsyncAddress::Ssh { .. } => {
-                let path = self.ssh_remote_path(relative);
-                let output = self
-                    .ssh(&["mkdir".to_string(), "-p".to_string(), path])
-                    .await?;
+                let remote = self.ssh_mkdir_args(relative);
+                let output = self.ssh(&remote).await?;
                 ensure_success("ssh mkdir -p", output).map(|_| ())
             }
             RsyncAddress::Daemon { .. } => Ok(()),
@@ -454,8 +485,7 @@ impl RsyncTarget {
                 }
             }
             RsyncAddress::Ssh { .. } => {
-                let path = self.ssh_remote_path(&relative);
-                let remote = vec!["cat".to_string(), path];
+                let remote = self.ssh_cat_args(&relative);
                 let output = self.ssh(&remote).await?;
                 if output.status.success() {
                     Some(output.stdout)
@@ -468,7 +498,12 @@ impl RsyncTarget {
             RsyncAddress::Daemon { .. } => {
                 let temp = TempDir::create()?;
                 let url = self.daemon_url(&relative);
-                let args = vec!["-a".to_string(), url, format!("{}/", temp.path().display())];
+                let args = vec![
+                    "-a".to_string(),
+                    "-s".to_string(),
+                    url,
+                    format!("{}/", temp.path().display()),
+                ];
                 let output = self.rsync(&args).await?;
                 if !output.status.success() {
                     if is_missing(&output) {
@@ -504,8 +539,7 @@ impl RsyncTarget {
                 }
             }
             RsyncAddress::Ssh { .. } => {
-                let path = self.ssh_remote_path(relative);
-                let remote = vec!["test".to_string(), "-f".to_string(), path];
+                let remote = self.ssh_test_args(relative);
                 let output = self.ssh(&remote).await?;
                 if output.status.success() {
                     Ok(true)
@@ -516,7 +550,11 @@ impl RsyncTarget {
                 }
             }
             RsyncAddress::Daemon { .. } => {
-                let args = vec!["--list-only".to_string(), self.daemon_url(relative)];
+                let args = vec![
+                    "-s".to_string(),
+                    "--list-only".to_string(),
+                    self.daemon_url(relative),
+                ];
                 let output = self.rsync(&args).await?;
                 if output.status.success() {
                     Ok(true)
@@ -557,6 +595,7 @@ impl Target for RsyncTarget {
             } => {
                 let port = port.map(|port| format!(":{port}")).unwrap_or_default();
                 let args = vec![
+                    "-s".to_string(),
                     "--list-only".to_string(),
                     format!("rsync://{host}{port}/{module}/"),
                 ];
@@ -764,15 +803,14 @@ fn directory_of(relative: &str) -> String {
         .map_or_else(String::new, |(directory, _)| directory.to_string())
 }
 
-fn quote_if_needed(value: &str) -> String {
-    if value
-        .chars()
-        .any(|character| character.is_whitespace() || matches!(character, '\'' | '"'))
-    {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    } else {
-        value.to_string()
-    }
+/// Wrap `value` in POSIX single quotes and escape embedded single quotes.
+///
+/// Inside single quotes a POSIX shell treats every character literally, so a
+/// remote path with spaces, `;`, `$`, backticks or globs stays one argument.
+/// The only character that needs escaping is the quote itself, closed and
+/// reopened as `'\''`.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn invalid_address(url: &str, reason: impl Into<String>) -> TargetError {
@@ -845,4 +883,79 @@ fn command_error(command: &str, output: Output) -> TargetError {
 fn is_missing(output: &Output) -> bool {
     let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
     stderr.contains("no such file or directory") || stderr.contains("no such file")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::artifact::{Artifact, ArtifactContext, ArtifactInput};
+
+    fn ssh_target() -> RsyncTarget {
+        RsyncTarget::new(RsyncConfig {
+            name: "ssh".to_string(),
+            url: "ssh://mirror@backup.example.org:2222/srv/cinc-mirror".to_string(),
+            auth: TargetAuth::SshKey,
+            identity_file: None,
+            password_file: None,
+        })
+        .expect("ssh target")
+    }
+
+    fn artifact_with_basename(basename: &str) -> Artifact {
+        Artifact::new(
+            &ArtifactContext {
+                channel: "stable".to_string(),
+                project: "cinc".to_string(),
+                version: "19.4.46".to_string(),
+                platform: "debian".to_string(),
+                platform_version: "13".to_string(),
+            },
+            ArtifactInput {
+                basename: basename.to_string(),
+                sha256: "00".repeat(32),
+                metadata_json: "{}".to_string(),
+                platform: "debian".to_string(),
+                platform_version: "13".to_string(),
+                version: "19.4.46".to_string(),
+                iteration: Some("1".to_string()),
+                raw_arch: "x86_64".to_string(),
+            },
+        )
+        .expect("artifact")
+    }
+
+    #[test]
+    fn shell_quote_single_quotes_everything() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("a b;c"), "'a b;c'");
+        assert_eq!(shell_quote("$HOME `id` *"), "'$HOME `id` *'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn ssh_commands_keep_a_metacharacter_basename_in_one_token() {
+        let target = ssh_target();
+        let artifact = artifact_with_basename("pkg ;$(id)'q.deb");
+        let relative = format!("{}{SIDECAR_SUFFIX}", artifact.rsync_relpath());
+        let expected =
+            "'/srv/cinc-mirror/stable/cinc/19.4.46/debian/13/pkg ;$(id)'\\''q.deb.sha256'";
+
+        for (remote, expected_len) in [
+            (target.ssh_cat_args(&relative), 2),
+            (target.ssh_mkdir_args(&relative), 3),
+            (target.ssh_test_args(&relative), 3),
+        ] {
+            assert_eq!(
+                remote.len(),
+                expected_len,
+                "the path must stay a single argument: {remote:?}"
+            );
+            assert_eq!(
+                remote.last().map(String::as_str),
+                Some(expected),
+                "the whole remote path must be one single-quoted token"
+            );
+        }
+    }
 }
