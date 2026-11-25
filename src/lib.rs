@@ -5,6 +5,7 @@
 //! a thin CLI wrapper around it.
 
 pub mod artifact;
+pub mod bootstrap;
 pub mod cli;
 pub mod config;
 pub mod crawl;
@@ -30,6 +31,7 @@ pub use artifact::{
     mapped_arch, sanitize_component, Artifact, ArtifactContext, ArtifactError, ArtifactInput,
     ARTIFACT_TYPE, MAX_TAG_LEN,
 };
+pub use bootstrap::{BootstrapError, BootstrapReport};
 pub use cli::{Cli, Command};
 pub use config::{
     Config, ConfigError, IncidentConfig, LedgerConfig, ProjectPolicy, Selection, TargetAuth,
