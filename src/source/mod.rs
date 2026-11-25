@@ -43,6 +43,7 @@ use url::Url;
 
 use crate::config::{Config, TransportKind};
 use crate::hash::ExpectedHashes;
+use crate::net::RateLimiter;
 use crate::source::metadata::Metadata;
 use crate::source::transport::{
     DownloadError, DownloadOutcome, FtpTransport, FtpsTransport, HttpsTransport, PayloadTransport,
@@ -309,6 +310,31 @@ impl Source {
         }
     }
 
+    /// Build a source for `config` whose payload ladder is `transports`.
+    ///
+    /// Listings and metadata use the real HTTPS fetcher; the injected ladder
+    /// is what a local mirror or a test uses instead of the built-in
+    /// FTP/FTPS/HTTPS rungs. Production keeps [`Source::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceError::Config`] when the base URL has no host, and
+    /// [`SourceError::Http`] when the HTTP client cannot be built.
+    pub fn with_transports(
+        config: SourceConfig,
+        transports: Vec<Arc<dyn PayloadTransport>>,
+    ) -> Result<Self, SourceError> {
+        let fetcher = HttpFetcher::new(&config)?;
+        let mut source = Self::with_fetcher(Arc::new(fetcher), config.https_base.clone()).with_ftp(
+            config.ftp_host.clone(),
+            config.ftp_port,
+            config.ftp_base_path.clone(),
+        );
+        source.transports = config.transports.clone();
+        source.payload = Some(transports);
+        Ok(source)
+    }
+
     /// Replace the payload ladder.
     ///
     /// This is the seam that lets resume, retry and verification run without a
@@ -417,8 +443,28 @@ impl Source {
         dest: &Path,
         expected: &ExpectedHashes,
     ) -> Result<DownloadOutcome, DownloadError> {
+        self.download_with_rate(remote_path, dest, expected, None)
+            .await
+    }
+
+    /// [`Source::download`] with a shared bandwidth cap.
+    ///
+    /// The limiter is charged after every written chunk in the copy loop, so a
+    /// cap slows a transfer instead of failing it. `None` is unlimited and is
+    /// what [`Source::download`] uses.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`Source::download`].
+    pub async fn download_with_rate(
+        &self,
+        remote_path: &str,
+        dest: &Path,
+        expected: &ExpectedHashes,
+        rate: Option<&RateLimiter>,
+    ) -> Result<DownloadOutcome, DownloadError> {
         let ladder = self.payload_ladder();
-        transport::download(&ladder, &self.retry, remote_path, dest, expected).await
+        transport::download(&ladder, &self.retry, remote_path, dest, expected, rate).await
     }
 
     /// The configured ladder, or the injected one.
@@ -638,6 +684,22 @@ mod tests {
             .collect();
 
         assert_eq!(kinds, vec![TransportKind::Https, TransportKind::Ftp]);
+    }
+
+    #[test]
+    fn with_transports_uses_the_injected_ladder() {
+        let transport: Arc<dyn PayloadTransport> = Arc::new(HttpsTransport::new(
+            Url::parse(DEFAULT_HTTPS_BASE).expect("base url"),
+        ));
+        let source = Source::with_transports(config(), vec![transport]).expect("source");
+
+        let ladder = source.payload_ladder();
+        assert_eq!(
+            ladder.len(),
+            1,
+            "the injected ladder replaces the built-in one"
+        );
+        assert_eq!(ladder[0].kind(), TransportKind::Https);
     }
 
     #[test]

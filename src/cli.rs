@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::config::{Config, ConfigError};
+use crate::runner::{Order, RunOpts};
 use crate::scope::ScopeArgs;
 
 #[derive(Debug, Parser)]
@@ -34,7 +35,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Crawl upstream and publish every new artifact
-    Mirror,
+    Mirror(MirrorArgs),
     /// Estimate a run without downloading or publishing package bytes
     Plan(PlanArgs),
     /// Fill historical versions that are not mirrored yet
@@ -70,7 +71,7 @@ impl Command {
     #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Mirror => "mirror",
+            Self::Mirror(_) => "mirror",
             Self::Plan(_) => "plan",
             Self::Backfill => "backfill",
             Self::Verify => "verify",
@@ -162,6 +163,126 @@ pub enum PlanGrouping {
     Target,
 }
 
+/// The `--order` spelling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum OrderChoice {
+    /// Version descending, then the policy and path components.
+    #[default]
+    VersionDesc,
+    /// Smallest known size first.
+    SmallestFirst,
+    /// Largest known size first.
+    LargestFirst,
+}
+
+impl OrderChoice {
+    /// Map the parsed flag onto the runner's order.
+    #[must_use]
+    pub fn to_order(self) -> Order {
+        match self {
+            Self::VersionDesc => Order::VersionDesc,
+            Self::SmallestFirst => Order::SmallestFirst,
+            Self::LargestFirst => Order::LargestFirst,
+        }
+    }
+}
+
+/// Queue and limit flags shared by `mirror` and, later, `backfill`.
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// Stop after this many artifacts
+    #[arg(long = "limit", value_name = "N")]
+    pub limit: Option<usize>,
+
+    /// Stop once this many download bytes were transferred (the crossing
+    /// artifact is finished); accepts units such as 2GiB or 500MB
+    #[arg(long = "limit-bytes", value_name = "SIZE", value_parser = parse_byte_size)]
+    pub limit_bytes: Option<u64>,
+
+    /// Queue order
+    #[arg(long = "order", value_enum, default_value_t = OrderChoice::VersionDesc)]
+    pub order: OrderChoice,
+
+    /// Delete each store blob once every enabled target has published it
+    #[arg(long)]
+    pub gc_after: bool,
+
+    /// Report what would happen without downloading or publishing
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+impl RunArgs {
+    /// Project the parsed flags onto [`RunOpts`].
+    #[must_use]
+    pub fn to_run_opts(&self) -> RunOpts {
+        RunOpts {
+            max_artifacts: self.limit,
+            max_bytes: self.limit_bytes,
+            order: self.order.to_order(),
+            gc_after: self.gc_after,
+            dry_run: self.dry_run,
+        }
+    }
+}
+
+/// Arguments to `mirror`.
+#[derive(Debug, Args)]
+pub struct MirrorArgs {
+    #[command(flatten)]
+    pub filters: ScopeFilterArgs,
+
+    #[command(flatten)]
+    pub run: RunArgs,
+}
+
+/// Parse a byte size such as `500`, `2GiB` or `1.5GB`.
+///
+/// Decimal units are powers of ten and `*iB` units are powers of two, matching
+/// the bandwidth parser. A value of zero is accepted by the parser and rejected
+/// by the runner as a usage error, so the flag parses and the failure has one
+/// home.
+fn parse_byte_size(raw: &str) -> Result<u64, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("expected a byte size such as `2GiB` or `500MB`".to_string());
+    }
+
+    let split = value
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let amount: f64 = number
+        .parse()
+        .map_err(|_| "the size is not a number".to_string())?;
+    if !amount.is_finite() || amount < 0.0 {
+        return Err("the size must be a finite, non-negative number".to_string());
+    }
+
+    let multiplier: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1_000,
+        "kib" => 1_024,
+        "m" | "mb" => 1_000_000,
+        "mib" => 1_048_576,
+        "g" | "gb" => 1_000_000_000,
+        "gib" => 1_073_741_824,
+        "t" | "tb" => 1_000_000_000_000,
+        "tib" => 1_099_511_627_776,
+        _ => {
+            return Err(
+                "expected B, KiB, MiB, GiB or TiB (decimal KB/MB/GB/TB also accepted)".to_string(),
+            )
+        }
+    };
+
+    let bytes = amount * multiplier as f64;
+    if !bytes.is_finite() || bytes > u64::MAX as f64 {
+        return Err("the size is too large".to_string());
+    }
+    Ok(bytes.round() as u64)
+}
+
 /// Arguments to `plan`.
 #[derive(Debug, Args)]
 pub struct PlanArgs {
@@ -244,7 +365,7 @@ mod tests {
         let before = Cli::try_parse_from(["cinc-mirror", "--allow-unleased", "mirror"])
             .expect("a global flag before the subcommand");
         assert!(before.allow_unleased);
-        assert!(matches!(before.cmd, Command::Mirror));
+        assert!(matches!(before.cmd, Command::Mirror(_)));
 
         let after = Cli::try_parse_from(["cinc-mirror", "backfill", "--allow-unleased"])
             .expect("a global flag after the subcommand");
@@ -282,5 +403,46 @@ mod tests {
         assert_eq!(id, "hash_changed-0123456789abcdef");
         assert!(republish);
         assert_eq!(note.as_deref(), Some("checked upstream"));
+    }
+
+    #[test]
+    fn mirror_parses_limits_order_and_gc() {
+        let cli = Cli::try_parse_from([
+            "cinc-mirror",
+            "mirror",
+            "--limit",
+            "3",
+            "--limit-bytes",
+            "2GiB",
+            "--order",
+            "smallest-first",
+            "--gc-after",
+            "--dry-run",
+        ])
+        .expect("mirror arguments");
+
+        let Command::Mirror(args) = cli.cmd else {
+            panic!("expected mirror");
+        };
+        let opts = args.run.to_run_opts();
+        assert_eq!(opts.max_artifacts, Some(3));
+        assert_eq!(opts.max_bytes, Some(2_147_483_648));
+        assert_eq!(opts.order, crate::runner::Order::SmallestFirst);
+        assert!(opts.gc_after);
+        assert!(opts.dry_run);
+    }
+
+    #[test]
+    fn byte_sizes_accept_units_and_zero() {
+        assert_eq!(super::parse_byte_size("512"), Ok(512));
+        assert_eq!(super::parse_byte_size("2GiB"), Ok(2_147_483_648));
+        assert_eq!(super::parse_byte_size("500MB"), Ok(500_000_000));
+        assert_eq!(super::parse_byte_size("0"), Ok(0));
+        for value in ["", "fast", "-1MiB", "1XiB"] {
+            assert!(
+                super::parse_byte_size(value).is_err(),
+                "`{value}` must be rejected"
+            );
+        }
     }
 }

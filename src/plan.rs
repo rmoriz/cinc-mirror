@@ -255,7 +255,11 @@ fn add(groups: &mut BTreeMap<String, GroupTotals>, key: &str, size: u64, satisfi
 }
 
 /// The resolved policies as JSON, preserving every field that affects selection.
-fn policies_json(scope: &ResolvedScope) -> Value {
+///
+/// The runner records this in its `run_started` event, so the plan and the run
+/// row describe the same policy the same way.
+#[must_use]
+pub fn policies_json(scope: &ResolvedScope) -> Value {
     Value::Array(scope.policies.iter().map(policy_json).collect())
 }
 

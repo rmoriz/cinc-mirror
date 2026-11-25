@@ -8,12 +8,16 @@ pub mod artifact;
 pub mod cli;
 pub mod config;
 pub mod crawl;
+pub mod ctx;
 pub mod fsutil;
 pub mod hash;
 pub mod incident;
 pub mod ledger;
+pub mod net;
 pub mod oci;
 pub mod plan;
+pub mod report;
+pub mod runner;
 pub mod scope;
 pub mod source;
 pub mod store;
@@ -30,14 +34,18 @@ pub use config::{
     TargetConfig, TargetKind, TransportKind,
 };
 pub use crawl::{crawl, CrawlError};
+pub use ctx::Ctx;
 pub use hash::{hash_file, hash_reader, ExpectedHashes, Hasher, Hashes, VerifyOutcome};
 pub use ledger::{
     ArtifactRow, Cursor, Event, EventKind, Incident, IncidentFilter, IncidentKind, IncidentState,
     Lease, LeaseError, LeaseHolder, Ledger, LedgerError, LedgerFilesError, LedgerGitError,
     LedgerStore, Publication, PublicationStatus, Run,
 };
+pub use net::RateLimiter;
 pub use oci::{AuthError, HttpFailure, OciAuth, OciConfig, OciError, Registry};
 pub use plan::{build, GroupTotals, Plan, PlanError, SpaceCheck};
+pub use report::Summary;
+pub use runner::{run, Order, RunError, RunOpts};
 pub use scope::{PlatformVersion, ResolvedPolicy, ResolvedScope, ScopeArgs, ScopeError};
 pub use source::index::{parse_index, IndexEntry};
 pub use source::metadata::{Metadata, MetadataError};

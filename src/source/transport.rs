@@ -44,6 +44,7 @@ use url::Url;
 
 use crate::config::TransportKind;
 use crate::hash::{hash_file, ExpectedHashes, Hasher, Hashes};
+use crate::net::RateLimiter;
 use crate::source::{redirect_policy, USER_AGENT};
 
 /// Default ladder order when the caller does not configure one.
@@ -95,6 +96,27 @@ pub trait PayloadTransport: Send + Sync {
         dest: &Path,
         resume_from: u64,
     ) -> Result<u64, TransportError>;
+
+    /// [`PayloadTransport::fetch`] with a bandwidth charge per written chunk.
+    ///
+    /// The default ignores the limiter, so a fake rung and a future transport
+    /// do not have to know about pacing. The built-in rungs override this and
+    /// charge the shared limiter after every chunk, which paces the copy loop
+    /// rather than only the scheduler.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`PayloadTransport::fetch`].
+    async fn fetch_limited(
+        &self,
+        remote_path: &str,
+        dest: &Path,
+        resume_from: u64,
+        rate: Option<&RateLimiter>,
+    ) -> Result<u64, TransportError> {
+        let _ = rate;
+        self.fetch(remote_path, dest, resume_from).await
+    }
 }
 
 /// A failed transport operation.
@@ -430,9 +452,20 @@ impl PayloadTransport for FtpTransport {
         dest: &Path,
         resume_from: u64,
     ) -> Result<u64, TransportError> {
+        self.fetch_limited(remote_path, dest, resume_from, None)
+            .await
+    }
+
+    async fn fetch_limited(
+        &self,
+        remote_path: &str,
+        dest: &Path,
+        resume_from: u64,
+        rate: Option<&RateLimiter>,
+    ) -> Result<u64, TransportError> {
         let path = self.endpoint.remote_path(remote_path)?;
         let mut stream = connect_plain(&self.endpoint, remote_path).await?;
-        let result = transfer_plain(&mut stream, &path, remote_path, dest, resume_from).await;
+        let result = transfer_plain(&mut stream, &path, remote_path, dest, resume_from, rate).await;
         let _ = tokio::time::timeout(FTP_TIMEOUT, stream.quit()).await;
         result
     }
@@ -466,9 +499,21 @@ impl PayloadTransport for FtpsTransport {
         dest: &Path,
         resume_from: u64,
     ) -> Result<u64, TransportError> {
+        self.fetch_limited(remote_path, dest, resume_from, None)
+            .await
+    }
+
+    async fn fetch_limited(
+        &self,
+        remote_path: &str,
+        dest: &Path,
+        resume_from: u64,
+        rate: Option<&RateLimiter>,
+    ) -> Result<u64, TransportError> {
         let path = self.endpoint.remote_path(remote_path)?;
         let mut stream = connect_secure(&self.endpoint, remote_path).await?;
-        let result = transfer_secure(&mut stream, &path, remote_path, dest, resume_from).await;
+        let result =
+            transfer_secure(&mut stream, &path, remote_path, dest, resume_from, rate).await;
         let _ = tokio::time::timeout(FTP_TIMEOUT, stream.quit()).await;
         result
     }
@@ -568,6 +613,17 @@ impl PayloadTransport for HttpsTransport {
         dest: &Path,
         resume_from: u64,
     ) -> Result<u64, TransportError> {
+        self.fetch_limited(remote_path, dest, resume_from, None)
+            .await
+    }
+
+    async fn fetch_limited(
+        &self,
+        remote_path: &str,
+        dest: &Path,
+        resume_from: u64,
+        rate: Option<&RateLimiter>,
+    ) -> Result<u64, TransportError> {
         let url = self.url(remote_path)?;
         let client = self.client(remote_path)?;
 
@@ -588,13 +644,13 @@ impl PayloadTransport for HttpsTransport {
                     // treated as an unknown offset and restarted from zero.
                     if let Some((start, total)) = content_range(&response) {
                         if start == resume_from && total > resume_from {
-                            return append_body(response, dest, remote_path, false).await;
+                            return append_body(response, dest, remote_path, false, rate).await;
                         }
                     }
                 }
                 200 => {
                     // The server ignored the range and sent the whole object.
-                    return append_body(response, dest, remote_path, true).await;
+                    return append_body(response, dest, remote_path, true, rate).await;
                 }
                 416 => {}
                 status => return Err(status_error(remote_path, status)),
@@ -609,7 +665,7 @@ impl PayloadTransport for HttpsTransport {
             return Err(status_error(remote_path, status));
         }
 
-        append_body(response, dest, remote_path, true).await
+        append_body(response, dest, remote_path, true, rate).await
     }
 }
 
@@ -623,12 +679,13 @@ fn content_range(response: &reqwest::Response) -> Option<(u64, u64)> {
 }
 
 /// Copy a response body to `dest`, truncating first when the range was refused
-/// or ignored.
+/// or ignored, and charge `rate` after each chunk.
 async fn append_body(
     mut response: reqwest::Response,
     dest: &Path,
     remote_path: &str,
     truncate: bool,
+    rate: Option<&RateLimiter>,
 ) -> Result<u64, TransportError> {
     let mut file = open_dest(dest, truncate).await?;
     let mut written = 0_u64;
@@ -640,6 +697,9 @@ async fn append_body(
             .await
             .map_err(|source| TransportError::local(dest, source))?;
         written += chunk.len() as u64;
+        if let Some(rate) = rate {
+            rate.consume(chunk.len() as u64).await;
+        }
     }
 
     file.flush()
@@ -747,6 +807,7 @@ async fn transfer_plain(
     remote_path: &str,
     dest: &Path,
     resume_from: u64,
+    rate: Option<&RateLimiter>,
 ) -> Result<u64, TransportError> {
     let size = ftp_size(remote_path, stream.size(path)).await?;
     let offset = prepare_offset(dest, size, resume_from).await?;
@@ -758,7 +819,7 @@ async fn transfer_plain(
 
     let mut data = ftp_timeout(remote_path, stream.retr_as_stream(path)).await?;
     let mut file = open_dest(dest, false).await?;
-    let written = copy_data(&mut data, &mut file, remote_path, dest).await?;
+    let written = copy_data(&mut data, &mut file, remote_path, dest, rate).await?;
     ftp_timeout(remote_path, stream.finalize_retr_stream(data)).await?;
     file.flush()
         .await
@@ -783,6 +844,7 @@ async fn transfer_secure(
     remote_path: &str,
     dest: &Path,
     resume_from: u64,
+    rate: Option<&RateLimiter>,
 ) -> Result<u64, TransportError> {
     let size = ftp_size(remote_path, stream.size(path)).await?;
     let offset = prepare_offset(dest, size, resume_from).await?;
@@ -792,7 +854,7 @@ async fn transfer_secure(
 
     let mut data = ftp_timeout(remote_path, stream.retr_as_stream(path)).await?;
     let mut file = open_dest(dest, false).await?;
-    let written = copy_data(&mut data, &mut file, remote_path, dest).await?;
+    let written = copy_data(&mut data, &mut file, remote_path, dest, rate).await?;
     ftp_timeout(remote_path, stream.finalize_retr_stream(data)).await?;
     file.flush()
         .await
@@ -851,12 +913,13 @@ async fn prepare_offset(
     Ok(0)
 }
 
-/// Copy the data stream to `file`, with a per-read timeout.
+/// Copy the data stream to `file`, with a per-read timeout and optional pacing.
 async fn copy_data<R>(
     reader: &mut R,
     file: &mut tokio::fs::File,
     remote_path: &str,
     dest: &Path,
+    rate: Option<&RateLimiter>,
 ) -> Result<u64, TransportError>
 where
     R: futures::io::AsyncRead + Unpin,
@@ -889,6 +952,9 @@ where
             .await
             .map_err(|source| TransportError::local(dest, source))?;
         written += read as u64;
+        if let Some(rate) = rate {
+            rate.consume(read as u64).await;
+        }
     }
 }
 
@@ -958,6 +1024,7 @@ pub(crate) async fn download(
     remote_path: &str,
     dest: &Path,
     expected: &ExpectedHashes,
+    rate: Option<&RateLimiter>,
 ) -> Result<DownloadOutcome, DownloadError> {
     if transports.is_empty() {
         return Err(DownloadError::Config {
@@ -977,7 +1044,7 @@ pub(crate) async fn download(
         let kind = transport.kind();
 
         for attempt in 1..=retry.attempts() {
-            match attempt_download(transport.as_ref(), remote_path, dest, expected).await {
+            match attempt_download(transport.as_ref(), remote_path, dest, expected, rate).await {
                 Ok(outcome) => return Ok(outcome),
                 Err(AttemptError::Permanent(source)) => {
                     return Err(DownloadError::Rejected {
@@ -1051,6 +1118,7 @@ async fn attempt_download(
     remote_path: &str,
     dest: &Path,
     expected: &ExpectedHashes,
+    rate: Option<&RateLimiter>,
 ) -> Result<DownloadOutcome, AttemptError> {
     let resume_from = dest_len(dest).await.map_err(AttemptError::Aborted)?;
 
@@ -1063,7 +1131,7 @@ async fn attempt_download(
     };
 
     let written = transport
-        .fetch(remote_path, dest, resume_from)
+        .fetch_limited(remote_path, dest, resume_from, rate)
         .await
         .map_err(|error| {
             if error.is_fatal() {
