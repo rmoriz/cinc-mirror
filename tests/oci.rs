@@ -9,12 +9,12 @@ mod common;
 
 use std::ffi::OsString;
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use cinc_mirror::config::{TargetAuth, TargetConfig, TargetKind};
-use cinc_mirror::oci::{AuthError, OciAuth, OciConfig, OciError, Registry};
+use cinc_mirror::oci::{AuthError, HttpFailure, OciAuth, OciConfig, OciError, Registry};
 use common::registry::{MockAuth, MockRegistry};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -57,6 +57,7 @@ fn registry_for(mock: &MockRegistry, auth: OciAuth) -> Registry {
         namespace: "cinc-mirror".to_string(),
         auth,
         insecure_http: true,
+        ..OciConfig::default()
     })
     .expect("mock registry")
     // The production backoff is 0.5/1/2 s; the tests assert counts, not waits.
@@ -258,6 +259,104 @@ async fn upload_of_an_empty_layer_finalises_without_a_patch() {
     assert_eq!(mock.patch_count(), 0);
     assert_eq!(mock.upload_completes(), 1);
     assert_eq!(mock.blob(REPO, &digest), Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn a_stalled_patch_times_out_instead_of_hanging() {
+    let mock = MockRegistry::start(MockAuth::Anonymous).await;
+    mock.stall_patches_for(Duration::from_secs(30));
+
+    let registry = Registry::new(OciConfig {
+        registry: mock.registry_name(),
+        namespace: "cinc-mirror".to_string(),
+        auth: OciAuth::Anonymous,
+        insecure_http: true,
+        request_timeout: Duration::from_millis(100),
+        idle_read_timeout: Duration::from_millis(50),
+    })
+    .expect("mock registry")
+    .with_retry_base(Duration::ZERO);
+
+    let bytes: Vec<u8> = (0..8 * 1024 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let digest = sha256_digest(&bytes);
+    let (_dir, path) = write_layer(&bytes);
+
+    let started = Instant::now();
+    let error = registry
+        .upload_blob(REPO, &path, &digest)
+        .await
+        .expect_err("the stall must surface as an error, not hang");
+    let elapsed = started.elapsed();
+
+    assert!(error.is_retryable(), "a timeout must retry, got {error:?}");
+    match &error {
+        OciError::Http {
+            source: HttpFailure::Timeout { .. },
+            ..
+        } => {}
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the client hung for {elapsed:?}"
+    );
+    assert_eq!(
+        mock.upload_starts(),
+        4,
+        "the whole upload session retries four times"
+    );
+    assert_eq!(mock.patch_count(), 4, "one timed-out PATCH per attempt");
+    assert_eq!(mock.upload_completes(), 0);
+}
+
+#[tokio::test]
+async fn a_stalled_patch_response_body_hits_the_idle_read_timeout() {
+    let mock = MockRegistry::start(MockAuth::Anonymous).await;
+    mock.stall_patch_bodies_for(Duration::from_secs(30));
+
+    let registry = Registry::new(OciConfig {
+        registry: mock.registry_name(),
+        namespace: "cinc-mirror".to_string(),
+        auth: OciAuth::Anonymous,
+        insecure_http: true,
+        // Generous request budget so the per-read budget is what fires.
+        request_timeout: Duration::from_secs(5),
+        idle_read_timeout: Duration::from_millis(50),
+    })
+    .expect("mock registry")
+    .with_retry_base(Duration::ZERO);
+
+    let bytes: Vec<u8> = (0..4 * 1024 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let digest = sha256_digest(&bytes);
+    let (_dir, path) = write_layer(&bytes);
+
+    let started = Instant::now();
+    let error = registry
+        .upload_blob(REPO, &path, &digest)
+        .await
+        .expect_err("the stalled body must surface as an error, not hang");
+    let elapsed = started.elapsed();
+
+    match &error {
+        OciError::Http {
+            source: HttpFailure::Timeout { waited, phase, .. },
+            ..
+        } => {
+            assert_eq!(*waited, Duration::from_millis(50));
+            assert_eq!(*phase, "reading the response body");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert!(error.is_retryable(), "{error:?}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the client hung for {elapsed:?}"
+    );
+    assert_eq!(mock.upload_starts(), 4);
 }
 
 #[tokio::test]

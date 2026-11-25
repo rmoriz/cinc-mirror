@@ -15,10 +15,11 @@
 //! writes. The server binds `127.0.0.1:0`, so tests never leave the machine.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -79,6 +80,8 @@ pub struct MockState {
     manifest_puts: AtomicUsize,
     manifest_put_failures: AtomicUsize,
     blob_heads: AtomicUsize,
+    stall_patch: AtomicU64,
+    stall_patch_body: AtomicU64,
     requests: Mutex<Vec<(String, String)>>,
     authorizations: Mutex<Vec<Option<String>>>,
 }
@@ -105,6 +108,8 @@ impl MockState {
             manifest_puts: AtomicUsize::new(0),
             manifest_put_failures: AtomicUsize::new(0),
             blob_heads: AtomicUsize::new(0),
+            stall_patch: AtomicU64::new(0),
+            stall_patch_body: AtomicU64::new(0),
             requests: Mutex::new(Vec::new()),
             authorizations: Mutex::new(Vec::new()),
         }
@@ -252,7 +257,7 @@ async fn v2(
                 return response;
             }
             return match method {
-                Method::PATCH => patch_upload(&state, repo, id, &body),
+                Method::PATCH => patch_upload(&state, repo, id, &body).await,
                 _ => finish_upload(&state, repo, id, &body, uri.query()),
             };
         }
@@ -301,9 +306,16 @@ fn start_upload(state: &Arc<MockState>, repo: &str) -> Response {
         .into_response()
 }
 
-fn patch_upload(state: &Arc<MockState>, repo: &str, id: &str, body: &[u8]) -> Response {
+async fn patch_upload(state: &Arc<MockState>, repo: &str, id: &str, body: &[u8]) -> Response {
     state.patches.fetch_add(1, Ordering::SeqCst);
     lock(&state.patch_sizes).push(body.len());
+
+    let stall = state.stall_patch.load(Ordering::SeqCst);
+    if stall > 0 {
+        // A registry that accepts the connection and then does not answer:
+        // only a client-side request timeout can end this.
+        tokio::time::sleep(Duration::from_millis(stall)).await;
+    }
 
     let mut uploads = lock(&state.uploads);
     let Some(upload) = uploads.get_mut(id) else {
@@ -311,17 +323,36 @@ fn patch_upload(state: &Arc<MockState>, repo: &str, id: &str, body: &[u8]) -> Re
     };
     upload.extend_from_slice(body);
     let total = upload.len();
+    drop(uploads);
 
     let location = format!(
         "{}/v2/{}/blobs/uploads/{}?_state=session",
         state.base_url, repo, id
     );
+    let range = format!("0-{}", total.saturating_sub(1));
+
+    let stall_body = state.stall_patch_body.load(Ordering::SeqCst);
+    if stall_body > 0 {
+        // Headers arrive immediately, the body never does: only the client's
+        // per-read timeout can end this.
+        let stream = futures::stream::once(async move {
+            tokio::time::sleep(Duration::from_millis(stall_body)).await;
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{}"))
+        });
+        let mut response = Response::new(Body::from_stream(stream));
+        *response.status_mut() = StatusCode::ACCEPTED;
+        response
+            .headers_mut()
+            .insert("location", location.parse().expect("location header"));
+        response
+            .headers_mut()
+            .insert("range", range.parse().expect("range header"));
+        return response;
+    }
+
     (
         StatusCode::ACCEPTED,
-        [
-            ("location", location),
-            ("range", format!("0-{}", total.saturating_sub(1))),
-        ],
+        [("location", location), ("range", range)],
     )
         .into_response()
 }
@@ -601,6 +632,20 @@ impl MockRegistry {
     /// Number of `HEAD` blob requests seen.
     pub fn blob_head_count(&self) -> usize {
         self.state.blob_heads.load(Ordering::SeqCst)
+    }
+
+    /// Make every `PATCH` handler wait before answering.
+    pub fn stall_patches_for(&self, duration: Duration) {
+        self.state
+            .stall_patch
+            .store(duration.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// Make every `PATCH` send its headers and then stall the response body.
+    pub fn stall_patch_bodies_for(&self, duration: Duration) {
+        self.state
+            .stall_patch_body
+            .store(duration.as_millis() as u64, Ordering::SeqCst);
     }
 
     /// Fail the next `count` manifest writes with HTTP 500.

@@ -47,6 +47,13 @@
 //! `400`, `403` and `404` are terminal. A `401` re-authenticates exactly once
 //! before the retry decision is made, and a second `401` is an
 //! [`AuthError::Unauthorized`].
+//!
+//! Every network wait is bounded. [`OciConfig::request_timeout`] (300 s by
+//! default) covers one whole request, including sending a `PATCH` body that a
+//! registry accepts and then stops reading; [`OciConfig::idle_read_timeout`]
+//! (120 s by default) covers each response body read. An expired budget is a
+//! retryable [`OciError::Http`] failure, so a stalled registry retries like a
+//! refused connection instead of wedging a worker.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -94,6 +101,12 @@ const TOKEN_DEFAULT_LIFETIME: u64 = 60;
 
 /// A cached token is refreshed when this close to expiry.
 const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(5);
+
+/// Default budget for one response body read.
+pub const DEFAULT_IDLE_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Default budget for one complete request.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Layer title annotation used to find the package layer.
 const TITLE_ANNOTATION: &str = "org.opencontainers.image.title";
@@ -163,6 +176,32 @@ pub struct OciConfig {
     pub auth: OciAuth,
     /// Use cleartext HTTP. Only for tests and registries on the local machine.
     pub insecure_http: bool,
+    /// Budget for one response body read (one `chunk()` await).
+    ///
+    /// A stalled connection that has already sent its headers fails here
+    /// instead of hanging a worker forever. Defaults to
+    /// [`DEFAULT_IDLE_READ_TIMEOUT`].
+    pub idle_read_timeout: Duration,
+    /// Budget for one complete request: connection, request body, response
+    /// headers and the body reads between [`Registry::send_once`] callers.
+    ///
+    /// A registry that accepts a connection and then stops reading our PATCH
+    /// body never returns from `send()`; this bounds that wedge. Defaults to
+    /// [`DEFAULT_REQUEST_TIMEOUT`].
+    pub request_timeout: Duration,
+}
+
+impl Default for OciConfig {
+    fn default() -> Self {
+        Self {
+            registry: String::new(),
+            namespace: String::new(),
+            auth: OciAuth::Anonymous,
+            insecure_http: false,
+            idle_read_timeout: DEFAULT_IDLE_READ_TIMEOUT,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+        }
+    }
 }
 
 impl OciConfig {
@@ -172,8 +211,7 @@ impl OciConfig {
         Self {
             registry: registry.into(),
             namespace: namespace.into(),
-            auth: OciAuth::Anonymous,
-            insecure_http: false,
+            ..Self::default()
         }
     }
 }
@@ -189,6 +227,8 @@ pub struct Registry {
     auth: OciAuth,
     client: Client,
     tokens: Mutex<HashMap<(String, String), CachedToken>>,
+    request_timeout: Duration,
+    idle_read_timeout: Duration,
     attempts: usize,
     backoff: Duration,
 }
@@ -253,12 +293,19 @@ impl Registry {
     ///
     /// Returns [`OciError::Config`] when the registry name is empty, uses an
     /// unsupported scheme, or asks for cleartext HTTP without
-    /// [`OciConfig::insecure_http`], and when the HTTP client cannot be built.
+    /// [`OciConfig::insecure_http`], when a timeout is zero, and when the HTTP
+    /// client cannot be built.
     pub fn new(config: OciConfig) -> Result<Self, OciError> {
         let registry = config.registry.trim().to_string();
         if registry.is_empty() {
             return Err(OciError::Config {
                 reason: "registry must not be empty".to_string(),
+            });
+        }
+        if config.request_timeout.is_zero() || config.idle_read_timeout.is_zero() {
+            return Err(OciError::Config {
+                reason: "request_timeout and idle_read_timeout must be greater than zero"
+                    .to_string(),
             });
         }
 
@@ -286,6 +333,8 @@ impl Registry {
             auth: config.auth,
             client,
             tokens: Mutex::new(HashMap::new()),
+            request_timeout: config.request_timeout,
+            idle_read_timeout: config.idle_read_timeout,
             attempts: RETRY_ATTEMPTS,
             backoff: RETRY_BASE,
         })
@@ -373,6 +422,7 @@ impl Registry {
             namespace: namespace.to_string(),
             auth,
             insecure_http: registry.starts_with("http://"),
+            ..OciConfig::default()
         })
     }
 
@@ -424,7 +474,7 @@ impl Registry {
             response
         };
 
-        check_success(response, &Method::GET, &url)
+        self.check_success(response, &Method::GET, &url)
             .await
             .map(|_| ())
     }
@@ -538,7 +588,9 @@ impl Registry {
         match response.status() {
             status if status.is_success() => Ok(true),
             StatusCode::NOT_FOUND => Ok(false),
-            status => Err(status_error(&Method::HEAD, url, status, response).await),
+            status => Err(self
+                .status_error(&Method::HEAD, url, status, response)
+                .await),
         }
     }
 
@@ -558,13 +610,15 @@ impl Registry {
         let status = response.status();
         if status == StatusCode::CREATED {
             // Some registries deduplicate and finish the upload immediately.
+            self.drain_body(response, &Method::POST, &start).await?;
             return check_upload_digest(reported.as_deref(), digest);
         }
-        let response = check_success(response, &Method::POST, &start).await?;
+        let response = self.check_success(response, &Method::POST, &start).await?;
         let location = location_header(&response).ok_or_else(|| OciError::Protocol {
             registry: self.registry.clone(),
             reason: format!("upload start at {start} returned no Location header"),
         })?;
+        self.drain_body(response, &Method::POST, &start).await?;
         let mut location = self.location_url(&location)?;
 
         let mut file = tokio::fs::File::open(path)
@@ -602,7 +656,10 @@ impl Registry {
                 )
                 .await?;
             let next = location_header(&response);
-            check_success(response, &Method::PATCH, &location).await?;
+            let response = self
+                .check_success(response, &Method::PATCH, &location)
+                .await?;
+            self.drain_body(response, &Method::PATCH, &location).await?;
             if let Some(next) = next {
                 location = self.location_url(&next)?;
             }
@@ -631,7 +688,8 @@ impl Registry {
             )
             .await?;
         let reported = digest_header(&response);
-        check_success(response, &Method::PUT, &finish).await?;
+        let response = self.check_success(response, &Method::PUT, &finish).await?;
+        self.drain_body(response, &Method::PUT, &finish).await?;
 
         check_upload_digest(reported.as_deref(), digest)
     }
@@ -655,7 +713,8 @@ impl Registry {
             )
             .await?;
         let reported = digest_header(&response);
-        check_success(response, &Method::PUT, url).await?;
+        let response = self.check_success(response, &Method::PUT, url).await?;
+        self.drain_body(response, &Method::PUT, url).await?;
         Ok(reported.unwrap_or_else(|| computed.to_string()))
     }
 
@@ -665,12 +724,8 @@ impl Registry {
             .request(Method::GET, url, repo, &pull_scope(repo), &headers, None)
             .await?;
         let reported = digest_header(&response);
-        let response = check_success(response, &Method::GET, url).await?;
-        let bytes = response.bytes().await.map_err(|source| OciError::Http {
-            method: "GET".to_string(),
-            url: url.to_string(),
-            source,
-        })?;
+        let response = self.check_success(response, &Method::GET, url).await?;
+        let bytes = self.read_body(response, &Method::GET, url).await?;
         let digest = reported.unwrap_or_else(|| format!("sha256:{}", sha256_hex(&bytes)));
         let manifest = serde_json::from_slice(&bytes).map_err(|error| OciError::Protocol {
             registry: self.registry.clone(),
@@ -733,11 +788,110 @@ impl Registry {
                 .body(bytes.to_vec());
         }
 
-        builder.send().await.map_err(|source| OciError::Http {
+        let method = method.as_str().to_string();
+        let url = url.to_string();
+        match tokio::time::timeout(self.request_timeout, builder.send()).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(source)) => Err(OciError::Http {
+                method,
+                url,
+                source: HttpFailure::Request(source),
+            }),
+            Err(_) => Err(OciError::Http {
+                method,
+                url,
+                source: HttpFailure::Timeout {
+                    waited: self.request_timeout,
+                    phase: "waiting for the response",
+                },
+            }),
+        }
+    }
+
+    /// Reject a non-success status, keeping the body for the error message.
+    async fn check_success(
+        &self,
+        response: Response,
+        method: &Method,
+        url: &Url,
+    ) -> Result<Response, OciError> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Err(OciError::NotFound {
+                method: method.as_str().to_string(),
+                url: url.to_string(),
+            });
+        }
+        Err(self.status_error(method, url, status, response).await)
+    }
+
+    async fn status_error(
+        &self,
+        method: &Method,
+        url: &Url,
+        status: StatusCode,
+        response: Response,
+    ) -> OciError {
+        let body = self
+            .read_body(response, method, url)
+            .await
+            .unwrap_or_default();
+        OciError::Status {
             method: method.as_str().to_string(),
             url: url.to_string(),
-            source,
-        })
+            status: status.as_u16(),
+            body: truncate(&String::from_utf8_lossy(&body)),
+        }
+    }
+
+    /// Read a response body with a per-read budget.
+    ///
+    /// Every `chunk()` await is wrapped in [`Registry`]'s idle read timeout, so
+    /// a registry that sends headers and then stalls the body fails with a
+    /// retryable [`OciError::Http`] instead of hanging the worker.
+    async fn read_body(
+        &self,
+        mut response: Response,
+        method: &Method,
+        url: &Url,
+    ) -> Result<Vec<u8>, OciError> {
+        let mut body = Vec::new();
+        loop {
+            match tokio::time::timeout(self.idle_read_timeout, response.chunk()).await {
+                Ok(Ok(Some(chunk))) => body.extend_from_slice(&chunk),
+                Ok(Ok(None)) => return Ok(body),
+                Ok(Err(source)) => {
+                    return Err(OciError::Http {
+                        method: method.as_str().to_string(),
+                        url: url.to_string(),
+                        source: HttpFailure::Request(source),
+                    })
+                }
+                Err(_) => {
+                    return Err(OciError::Http {
+                        method: method.as_str().to_string(),
+                        url: url.to_string(),
+                        source: HttpFailure::Timeout {
+                            waited: self.idle_read_timeout,
+                            phase: "reading the response body",
+                        },
+                    })
+                }
+            }
+        }
+    }
+
+    /// Read and discard a response body so the connection can be reused.
+    async fn drain_body(
+        &self,
+        response: Response,
+        method: &Method,
+        url: &Url,
+    ) -> Result<(), OciError> {
+        self.read_body(response, method, url).await.map(|_| ())
     }
 
     /// Run `operation` up to the retry limit on transient failures.
@@ -829,7 +983,7 @@ impl Registry {
         repo: &str,
         desired_scope: &str,
         challenge: &Challenge,
-    ) -> Result<Option<String>, AuthError> {
+    ) -> Result<Option<String>, OciError> {
         self.authorize_inner(repo, desired_scope, challenge, true)
             .await
     }
@@ -841,7 +995,7 @@ impl Registry {
         repo: &str,
         desired_scope: &str,
         challenge: &Challenge,
-    ) -> Result<Option<String>, AuthError> {
+    ) -> Result<Option<String>, OciError> {
         self.authorize_inner(repo, desired_scope, challenge, false)
             .await
     }
@@ -852,7 +1006,7 @@ impl Registry {
         desired_scope: &str,
         challenge: &Challenge,
         prefer_challenge_scope: bool,
-    ) -> Result<Option<String>, AuthError> {
+    ) -> Result<Option<String>, OciError> {
         let credential = self.resolve_credential()?;
 
         match challenge.scheme.as_str() {
@@ -885,14 +1039,15 @@ impl Registry {
                 Ok(Some(format!("Bearer {token}")))
             }
             "basic" => credential.basic_authorization().map(Some).ok_or_else(|| {
-                AuthError::MissingCredentials {
+                OciError::from(AuthError::MissingCredentials {
                     registry: self.registry.clone(),
-                }
+                })
             }),
             other => Err(AuthError::Challenge {
                 registry: self.registry.clone(),
                 reason: format!("unsupported challenge scheme `{other}`"),
-            }),
+            }
+            .into()),
         }
     }
 
@@ -904,7 +1059,7 @@ impl Registry {
         credential: &Credential,
         repo: &str,
         desired_scope: &str,
-    ) -> Result<String, AuthError> {
+    ) -> Result<String, OciError> {
         let mut url = Url::parse(realm).map_err(|error| AuthError::Challenge {
             registry: self.registry.clone(),
             reason: format!("token realm `{realm}` is not a URL: {error}"),
@@ -924,21 +1079,36 @@ impl Registry {
             request = request.basic_auth(username, Some(password));
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|source| AuthError::TokenRequest {
-                url: url.to_string(),
-                source,
-            })?;
+        let response = match tokio::time::timeout(self.request_timeout, request.send()).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(source)) => {
+                return Err(OciError::Http {
+                    method: "GET".to_string(),
+                    url: url.to_string(),
+                    source: HttpFailure::Request(source),
+                })
+            }
+            Err(_) => {
+                return Err(OciError::Http {
+                    method: "GET".to_string(),
+                    url: url.to_string(),
+                    source: HttpFailure::Timeout {
+                        waited: self.request_timeout,
+                        phase: "waiting for the token response",
+                    },
+                })
+            }
+        };
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = self.read_body(response, &Method::GET, &url).await?;
+        let body = String::from_utf8_lossy(&body).to_string();
         if !status.is_success() {
             return Err(AuthError::Token {
                 url: url.to_string(),
                 status: status.as_u16(),
                 body: truncate(&body),
-            });
+            }
+            .into());
         }
 
         let value: Value = serde_json::from_str(&body).map_err(|error| AuthError::TokenBody {
@@ -1043,6 +1213,27 @@ impl Registry {
     }
 }
 
+/// Why a request failed at the transport level.
+///
+/// Timeouts are part of this class on purpose: a stalled connection is a
+/// transient fault, so it goes through the same four-attempt ladder as a
+/// refused connection.
+#[derive(Debug, Error)]
+pub enum HttpFailure {
+    /// The request failed before a usable response arrived.
+    #[error(transparent)]
+    Request(#[from] reqwest::Error),
+
+    /// The request or one body read exceeded its budget.
+    #[error("timed out after {waited:?} while {phase}")]
+    Timeout {
+        /// The budget that expired.
+        waited: Duration,
+        /// What the client was waiting for.
+        phase: &'static str,
+    },
+}
+
 /// Errors raised by the OCI client.
 #[derive(Debug, Error)]
 pub enum OciError {
@@ -1064,9 +1255,9 @@ pub enum OciError {
         method: String,
         /// Request URL.
         url: String,
-        /// Underlying transport error.
+        /// Underlying transport failure, including a timeout.
         #[source]
-        source: reqwest::Error,
+        source: HttpFailure,
     },
 
     /// The registry answered with an unexpected status.
@@ -1240,16 +1431,6 @@ pub enum AuthError {
         body: String,
     },
 
-    /// The token endpoint could not be reached.
-    #[error("token request to {url} failed: {source}")]
-    TokenRequest {
-        /// Token endpoint URL.
-        url: String,
-        /// Underlying transport error.
-        #[source]
-        source: reqwest::Error,
-    },
-
     /// The token endpoint answered with something that is not a token.
     #[error("token response from {url} is unusable: {reason}")]
     TokenBody {
@@ -1332,39 +1513,6 @@ fn location_header(response: &Response) -> Option<String> {
         .get(LOCATION)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
-}
-
-async fn check_success(
-    response: Response,
-    method: &Method,
-    url: &Url,
-) -> Result<Response, OciError> {
-    let status = response.status();
-    if status.is_success() {
-        return Ok(response);
-    }
-    if status == StatusCode::NOT_FOUND {
-        return Err(OciError::NotFound {
-            method: method.as_str().to_string(),
-            url: url.to_string(),
-        });
-    }
-    Err(status_error(method, url, status, response).await)
-}
-
-async fn status_error(
-    method: &Method,
-    url: &Url,
-    status: StatusCode,
-    response: Response,
-) -> OciError {
-    let body = response.text().await.unwrap_or_default();
-    OciError::Status {
-        method: method.as_str().to_string(),
-        url: url.to_string(),
-        status: status.as_u16(),
-        body: truncate(&body),
-    }
 }
 
 fn check_upload_digest(reported: Option<&str>, expected: &str) -> Result<(), OciError> {
@@ -2179,6 +2327,42 @@ mod tests {
     fn empty_registries_are_refused() {
         let error = Registry::new(OciConfig::new("   ", "ns")).expect_err("empty registry");
         assert!(matches!(error, OciError::Config { .. }));
+    }
+
+    #[test]
+    fn timeouts_default_and_must_be_positive() {
+        let config = OciConfig::new("ghcr.io", "ns");
+        assert_eq!(config.idle_read_timeout, DEFAULT_IDLE_READ_TIMEOUT);
+        assert_eq!(config.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+
+        for config in [
+            OciConfig {
+                request_timeout: Duration::ZERO,
+                ..OciConfig::new("ghcr.io", "ns")
+            },
+            OciConfig {
+                idle_read_timeout: Duration::ZERO,
+                ..OciConfig::new("ghcr.io", "ns")
+            },
+        ] {
+            let error = Registry::new(config).expect_err("a zero timeout would fail everything");
+            assert!(matches!(error, OciError::Config { .. }), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn timeouts_are_retryable_transport_failures() {
+        let error = OciError::Http {
+            method: "PATCH".to_string(),
+            url: "https://ghcr.io/v2/ns/blobs/uploads/1".to_string(),
+            source: HttpFailure::Timeout {
+                waited: Duration::from_millis(50),
+                phase: "reading the response body",
+            },
+        };
+
+        assert!(error.is_retryable());
+        assert!(error.to_string().contains("timed out after 50ms"));
     }
 
     #[test]

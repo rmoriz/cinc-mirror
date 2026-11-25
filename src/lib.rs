@@ -34,7 +34,7 @@ pub use ledger::{
     Lease, LeaseError, LeaseHolder, Ledger, LedgerError, LedgerFilesError, LedgerGitError,
     LedgerStore, Publication, PublicationStatus, Run,
 };
-pub use oci::{AuthError, OciAuth, OciConfig, OciError, Registry};
+pub use oci::{AuthError, HttpFailure, OciAuth, OciConfig, OciError, Registry};
 pub use plan::{build, GroupTotals, Plan, PlanError, SpaceCheck};
 pub use scope::{PlatformVersion, ResolvedPolicy, ResolvedScope, ScopeArgs, ScopeError};
 pub use source::index::{parse_index, IndexEntry};
