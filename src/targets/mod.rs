@@ -83,15 +83,6 @@ pub enum TargetError {
         kind: TargetKind,
     },
 
-    /// The manifest could not be built.
-    #[error("cannot build the manifest for tag `{tag}`: {reason}")]
-    Manifest {
-        /// The tag being published.
-        tag: String,
-        /// What went wrong while building it.
-        reason: String,
-    },
-
     /// The registry client failed.
     #[error(transparent)]
     Oci(#[from] OciError),

@@ -130,6 +130,10 @@ fn artifact(version: &str, sha_byte: char) -> Artifact {
         raw_arch: "x86_64".to_string(),
         basename: format!("cinc-{version}-debian-13-x86_64.pkg.tar.zst"),
         sha256: sha_byte.to_string().repeat(64),
+        metadata_json: format!(
+            r#"{{"basename":"cinc-{version}-debian-13-x86_64.pkg.tar.zst","sha256":"{}","iteration":1}}"#,
+            sha_byte.to_string().repeat(64)
+        ),
         iteration: None,
         superseded: false,
     }
@@ -146,6 +150,7 @@ fn artifact_detail(artifact: &Artifact) -> Value {
         "raw_arch": artifact.raw_arch,
         "basename": artifact.basename,
         "sha256": artifact.sha256,
+        "metadata_json": artifact.metadata_json,
         "iteration": artifact.iteration,
     })
 }

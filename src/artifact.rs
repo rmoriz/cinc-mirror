@@ -56,6 +56,9 @@ pub struct ArtifactInput {
     pub basename: String,
     /// Hex-encoded SHA-256 of the file, lowercase or uppercase.
     pub sha256: String,
+    /// Exact upstream `*.metadata.json` document, published verbatim as the
+    /// OCI metadata layer.
+    pub metadata_json: String,
     /// Platform claimed by the metadata; empty means "use the crawl value".
     pub platform: String,
     /// Platform release claimed by the metadata; empty means "use the crawl
@@ -91,6 +94,12 @@ pub struct Artifact {
     pub basename: String,
     /// Lowercase hex SHA-256 of the file.
     pub sha256: String,
+    /// Exact upstream `*.metadata.json` document as received.
+    ///
+    /// The OCI target publishes these bytes verbatim as the `metadata.json`
+    /// layer; nothing re-serialises them, so unknown upstream fields and
+    /// digest cross-checks survive the mirror.
+    pub metadata_json: String,
     /// Upstream iteration when it is neither absent nor `1`.
     pub iteration: Option<u64>,
     /// Publish under [`Artifact::superseded_tag`] instead of the descriptive
@@ -142,6 +151,7 @@ impl Artifact {
             raw_arch: input.raw_arch,
             basename: input.basename,
             sha256,
+            metadata_json: input.metadata_json,
             iteration: normalize_iteration(input.iteration.as_deref()),
             superseded: false,
         })

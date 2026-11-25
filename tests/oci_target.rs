@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use cinc_mirror::artifact::{Artifact, ArtifactContext, ArtifactInput};
 use cinc_mirror::config::{Config, TargetAuth, TargetConfig, TargetKind};
+use cinc_mirror::ledger::{Event, EventKind, Ledger};
 use cinc_mirror::oci::{OciAuth, OciConfig, Registry};
 use cinc_mirror::targets::{OciTarget, Target, TargetError, TargetSet};
 use common::registry::{MockAuth, MockRegistry};
@@ -40,6 +41,30 @@ fn artifact_for(bytes: &[u8]) -> Artifact {
     artifact_for_version(bytes, "19.4.46")
 }
 
+/// The upstream document, mirroring the real `*.metadata.json`: numeric
+/// `iteration`, the optional cross-check digests and fields the mirror ignores.
+fn raw_metadata(bytes: &[u8], version: &str) -> String {
+    format!(
+        r#"{{
+  "basename": "{BASENAME}",
+  "md5": "33db1d1be1d5cd535d8b7dcfd2ec7ee0",
+  "sha1": "c6d023b4f8fc5097e5a44625e639d1adfa4d1c04",
+  "sha256": "{}",
+  "sha512": "cdbbdd1d4be7454adc4c819dd5a0cb9d499b46913b7f4eb00910199d880632114006230221acfeea17b8f59da9bf62c00987d444bab3004b3e62914df292992a",
+  "platform": "debian",
+  "platform_version": "13",
+  "arch": "x86_64",
+  "name": "cinc",
+  "friendly_name": "Cinc Client",
+  "homepage": "https://www.cinc.sh",
+  "version": "{version}",
+  "iteration": 1,
+  "license": "Apache-2.0"
+}}"#,
+        sha256_hex(bytes)
+    )
+}
+
 fn artifact_for_version(bytes: &[u8], version: &str) -> Artifact {
     Artifact::new(
         &ArtifactContext {
@@ -52,6 +77,7 @@ fn artifact_for_version(bytes: &[u8], version: &str) -> Artifact {
         ArtifactInput {
             basename: BASENAME.to_string(),
             sha256: sha256_hex(bytes),
+            metadata_json: raw_metadata(bytes, version),
             platform: "debian".to_string(),
             platform_version: "13".to_string(),
             version: version.to_string(),
@@ -171,17 +197,30 @@ async fn put_writes_expected_manifest_and_annotations() {
         json!("metadata.json")
     );
     let metadata_digest = layers[1]["digest"].as_str().expect("metadata digest");
+    let expected_metadata = raw_metadata(bytes, "19.4.46");
     let metadata_bytes = mock
         .blob(REPO, metadata_digest)
         .expect("the metadata layer blob is uploaded");
-    assert_eq!(layers[1]["size"], json!(metadata_bytes.len()));
+    assert_eq!(
+        metadata_bytes,
+        expected_metadata.as_bytes(),
+        "the layer must carry the upstream document byte for byte"
+    );
+    assert_eq!(
+        layers[1]["digest"],
+        json!(sha256_digest(expected_metadata.as_bytes()))
+    );
+    assert_eq!(layers[1]["size"], json!(expected_metadata.len()));
     let metadata: Value = serde_json::from_slice(&metadata_bytes).expect("metadata is JSON");
     assert_eq!(metadata["basename"], json!(BASENAME));
     assert_eq!(metadata["sha256"], json!(sha256_hex(bytes)));
+    assert_eq!(metadata["sha512"], json!("cdbbdd1d4be7454adc4c819dd5a0cb9d499b46913b7f4eb00910199d880632114006230221acfeea17b8f59da9bf62c00987d444bab3004b3e62914df292992a"));
     assert_eq!(metadata["arch"], json!("x86_64"));
     assert_eq!(metadata["platform"], json!("debian"));
     assert_eq!(metadata["platform_version"], json!("13"));
     assert_eq!(metadata["version"], json!("19.4.46"));
+    assert_eq!(metadata["iteration"], json!(1), "numeric, not null");
+    assert_eq!(metadata["license"], json!("Apache-2.0"));
 
     let annotations = &manifest["annotations"];
     assert_eq!(
@@ -406,6 +445,71 @@ async fn superseded_artifact_uses_suffixed_tag() {
     assert_eq!(
         target.exists(&artifact).await.expect("exists"),
         Some(sha256_digest(bytes))
+    );
+}
+
+#[tokio::test]
+async fn ledger_round_trip_keeps_the_metadata_layer_digest() {
+    let mock = MockRegistry::start(MockAuth::Anonymous).await;
+    let target = target_for(&mock);
+    let bytes = b"the verified package bytes".as_slice();
+    let fresh = artifact_for(bytes);
+    let (_dir, path) = write_package(bytes);
+
+    target.put(&fresh, &path).await.expect("fresh put");
+    let fresh_digest = stored_manifest(&mock, &fresh.tag())["layers"][1]["digest"].clone();
+
+    // Reconstruct the artifact the way a later run does: through the ledger,
+    // which persists both the exact metadata text and the raw architecture.
+    let state = tempfile::tempdir().expect("state dir");
+    let mut ledger = Ledger::open(state.path()).expect("ledger");
+    ledger
+        .append(&Event {
+            run_id: "run-1".to_string(),
+            seq: 1,
+            ts: chrono::Utc::now(),
+            kind: EventKind::ArtifactSeen,
+            artifact_key: Some(fresh.key()),
+            target: None,
+            detail: json!({
+                "artifact": {
+                    "channel": fresh.channel,
+                    "project": fresh.project,
+                    "version": fresh.version,
+                    "platform": fresh.platform,
+                    "platform_version": fresh.platform_version,
+                    "arch": fresh.arch,
+                    "raw_arch": fresh.raw_arch,
+                    "basename": fresh.basename,
+                    "sha256": fresh.sha256,
+                    "metadata_json": fresh.metadata_json,
+                    "iteration": fresh.iteration,
+                },
+                "size": bytes.len(),
+            }),
+        })
+        .expect("artifact_seen");
+    let reconstructed = ledger
+        .artifact(&fresh.key())
+        .expect("artifact query")
+        .expect("artifact row")
+        .artifact;
+
+    assert_eq!(
+        reconstructed, fresh,
+        "the round trip must be field-identical"
+    );
+
+    let superseded = reconstructed.with_superseded(true);
+    target
+        .put(&superseded, &path)
+        .await
+        .expect("reconstructed put");
+    let rebuilt_digest =
+        stored_manifest(&mock, &superseded.superseded_tag())["layers"][1]["digest"].clone();
+    assert_eq!(
+        rebuilt_digest, fresh_digest,
+        "a ledger-reconstructed artifact publishes the same metadata layer"
     );
 }
 

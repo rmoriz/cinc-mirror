@@ -16,6 +16,12 @@ use crate::artifact::ArtifactInput;
 /// The subset of an upstream `*.metadata.json` the mirror uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Metadata {
+    /// The exact document text as received.
+    ///
+    /// The OCI target publishes this verbatim, so the mirror must not
+    /// re-serialise the parsed subset: unknown fields and the numeric
+    /// `iteration` keep their upstream spelling.
+    pub raw_json: String,
     /// Upstream file name, a single path component.
     pub basename: String,
     /// Lowercase or uppercase hex SHA-256; the gate for verification.
@@ -54,6 +60,7 @@ impl Metadata {
             .map_err(|error| MetadataError::InvalidJson(error.to_string()))?;
 
         Ok(Self {
+            raw_json: json.to_string(),
             basename: required("basename", raw.basename)?,
             sha256: required("sha256", raw.sha256)?,
             platform: required("platform", raw.platform)?,
@@ -76,6 +83,7 @@ impl Metadata {
         ArtifactInput {
             basename: self.basename.clone(),
             sha256: self.sha256.clone(),
+            metadata_json: self.raw_json.clone(),
             platform: self.platform.clone(),
             platform_version: self.platform_version.clone(),
             version: self.version.clone(),

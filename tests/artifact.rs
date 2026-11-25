@@ -28,6 +28,7 @@ fn input(basename: &str, sha256: &str, raw_arch: &str, iteration: Option<&str>) 
     ArtifactInput {
         basename: basename.to_string(),
         sha256: sha256.to_string(),
+        metadata_json: format!(r#"{{"basename":"{basename}","sha256":"{sha256}","iteration":1}}"#),
         platform: "debian".to_string(),
         platform_version: "13".to_string(),
         version: "19.4.46".to_string(),
@@ -42,6 +43,29 @@ fn debian_artifact(sha256: &str, iteration: Option<&str>) -> Artifact {
         input("cinc_19.4.46-1_amd64.deb", sha256, "x86_64", iteration),
     )
     .expect("valid artifact")
+}
+
+// Metadata document ---------------------------------------------------------
+
+#[test]
+fn keeps_the_exact_upstream_metadata_document() {
+    let raw = r#"{
+  "basename": "cinc_19.4.46-1_amd64.deb",
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "sha512": "cross-check",
+  "unknown": {"nested": [1, 2]},
+  "iteration": 1
+}"#;
+    let artifact = Artifact::new(
+        &context("19.4.46", "debian", "13"),
+        ArtifactInput {
+            metadata_json: raw.to_string(),
+            ..input("cinc_19.4.46-1_amd64.deb", SHA, "x86_64", Some("1"))
+        },
+    )
+    .expect("valid artifact");
+
+    assert_eq!(artifact.metadata_json, raw);
 }
 
 // Arch mapping --------------------------------------------------------------
@@ -99,6 +123,7 @@ fn iteration_two_gets_suffix() {
         ArtifactInput {
             basename: "cinc-19.4.46-2-x64.msi".to_string(),
             sha256: SHA.to_string(),
+            metadata_json: "{}".to_string(),
             platform: "windows".to_string(),
             platform_version: "2022".to_string(),
             version: "19.4.46".to_string(),
@@ -127,6 +152,7 @@ fn sanitizes_and_caps_tag_length() {
         ArtifactInput {
             basename: "cinc_19.4.46-1_amd64.deb".to_string(),
             sha256: SHA.to_string(),
+            metadata_json: "{}".to_string(),
             platform: "Debian GNU Linux".to_string(),
             platform_version: "13".to_string(),
             version: "19.4.46+build:7".to_string(),
@@ -143,6 +169,7 @@ fn sanitizes_and_caps_tag_length() {
         ArtifactInput {
             basename: "cinc_19.4.46-1_amd64.deb".to_string(),
             sha256: SHA.to_string(),
+            metadata_json: "{}".to_string(),
             platform: "platform".repeat(40),
             platform_version: "13".to_string(),
             version: "19.4.46".to_string(),
@@ -300,6 +327,7 @@ fn rsync_relpath_is_upstream_shaped() {
         ArtifactInput {
             basename: "cinc-19.4.46-2-x64.msi".to_string(),
             sha256: SHA.to_string(),
+            metadata_json: "{}".to_string(),
             platform: "windows".to_string(),
             platform_version: "2022".to_string(),
             version: "19.4.46".to_string(),

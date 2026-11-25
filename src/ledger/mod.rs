@@ -24,7 +24,8 @@
 //! The typed columns are the identity; `detail` is JSON whose shape depends on
 //! the kind:
 //!
-//! - `artifact_seen`, `imported`: `artifact` (the artifact fields), and
+//! - `artifact_seen`, `imported`: `artifact` (the artifact fields, including
+//!   the exact upstream `metadata_json` text and the raw architecture), and
 //!   optionally `size`, `upstream_path`, `metadata`.
 //! - `verified`: `size` when the download learned it.
 //! - `published`: `remote_ref` and `remote_digest` when the target reports them.
@@ -32,7 +33,8 @@
 //!   `next_attempt_at` as RFC3339.
 //! - `hash_changed`: `old_sha256` (required), `new_sha256` (defaults to the new
 //!   artifact's digest), optional `old_key` (otherwise derived from the new key)
-//!   and the complete replacement under `artifact`.
+//!   and the complete replacement under `artifact`, including its
+//!   `metadata_json`.
 //! - `incident_opened`: `id`, `kind`, optional `artifact_key`,
 //!   `old_sha256`, `new_sha256`, `issue_url`, and a nested `detail`.
 //! - `incident_acked`: `id`, optional `note` and `issue_url`.
@@ -93,12 +95,12 @@ const DB_FILE: &str = "ledger.db";
 /// Append new files here instead of editing a released migration. The schema
 /// itself uses `IF NOT EXISTS`, so a migration that is interrupted between
 /// `execute_batch` and the version insert is safe to run again.
-const MIGRATIONS: &[&str] = &[include_str!("schema.sql")];
+const MIGRATIONS: &[&str] = &[include_str!("schema.sql"), include_str!("schema_v2.sql")];
 
 const ARTIFACT_COLUMNS: &str = "a.key, a.upstream_path, a.sha256, a.size, a.basename, \
      a.project, a.channel, a.version, a.iteration, a.platform, a.platform_version, \
      a.arch, a.metadata_json, a.first_seen, a.last_seen, a.superseded_by, \
-     a.supersedes, a.local";
+     a.supersedes, a.local, a.raw_arch";
 
 const PUBLICATION_COLUMNS: &str = "artifact_key, target, status, remote_ref, remote_digest, \
      attempts, next_attempt_at, last_error, updated_at";
@@ -443,9 +445,9 @@ impl Event {
 pub struct ArtifactRow {
     /// The canonical artifact.
     ///
-    /// The raw upstream architecture is not a column of its own, so
-    /// `raw_arch` repeats the public `arch`; nothing downstream uses the raw
-    /// spelling.
+    /// A ledger round trip restores every identity field, including the exact
+    /// upstream metadata text and the raw architecture spelling, so a
+    /// reconstructed artifact publishes byte-identical layers.
     pub artifact: Artifact,
     /// Upstream-shaped path the artifact occupies, independent of its digest.
     pub upstream_path: String,
@@ -1450,7 +1452,7 @@ fn upsert_artifact(
         .upstream_path
         .clone()
         .unwrap_or_else(|| artifact.rsync_relpath());
-    let metadata = serde_json::to_string(&detail.metadata)?;
+    let metadata_json = artifact.metadata_json.clone();
     let iteration = artifact.iteration.map(|value| value.to_string());
     let timestamp = ts_text(event.ts);
 
@@ -1458,9 +1460,9 @@ fn upsert_artifact(
         "INSERT INTO artifacts
              (key, upstream_path, sha256, size, basename, project, channel,
               version, iteration, platform, platform_version, arch, metadata_json,
-              first_seen, last_seen, supersedes, local)
+              first_seen, last_seen, supersedes, local, raw_arch)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?14, ?15, 0)
+                 ?14, ?14, ?15, 0, ?16)
          ON CONFLICT (key) DO UPDATE SET
              upstream_path = excluded.upstream_path,
              sha256 = excluded.sha256,
@@ -1473,6 +1475,7 @@ fn upsert_artifact(
              platform = excluded.platform,
              platform_version = excluded.platform_version,
              arch = excluded.arch,
+             raw_arch = excluded.raw_arch,
              metadata_json = CASE
                  WHEN excluded.metadata_json <> 'null' THEN excluded.metadata_json
                  ELSE artifacts.metadata_json
@@ -1492,9 +1495,10 @@ fn upsert_artifact(
             artifact.platform,
             artifact.platform_version,
             artifact.arch,
-            metadata,
+            metadata_json,
             timestamp,
             supersedes,
+            artifact.raw_arch,
         ],
     )?;
     Ok(artifact)
@@ -1598,6 +1602,9 @@ fn detail_artifact(event: &Event) -> Result<ArtifactDetail, LedgerError> {
     if detail.metadata.is_null() {
         detail.metadata = event.detail.get("metadata").cloned().unwrap_or(Value::Null);
     }
+    if detail.metadata_json.is_none() {
+        detail.metadata_json = detail_str(event, "metadata_json").map(ToString::to_string);
+    }
     Ok(detail)
 }
 
@@ -1652,6 +1659,9 @@ struct ArtifactDetail {
     size: Option<u64>,
     #[serde(default)]
     upstream_path: Option<String>,
+    /// The exact upstream metadata text, published verbatim by targets.
+    #[serde(default)]
+    metadata_json: Option<String>,
     #[serde(default)]
     metadata: Value,
 }
@@ -1668,6 +1678,13 @@ impl ArtifactDetail {
             raw_arch: self.raw_arch.clone().unwrap_or_else(|| self.arch.clone()),
             basename: self.basename.clone(),
             sha256: self.sha256.clone(),
+            // A new event carries the exact upstream text. Events written
+            // before that field existed only have the parsed detail, which is
+            // the closest reconstruction available.
+            metadata_json: self
+                .metadata_json
+                .clone()
+                .unwrap_or_else(|| self.metadata.to_string()),
             iteration: self.iteration,
             superseded: false,
         }
@@ -1688,6 +1705,14 @@ fn artifact_row_from_row(row: &Row<'_>) -> rusqlite::Result<ArtifactRow> {
     let size: Option<i64> = row.get(3)?;
     let local: i64 = row.get(17)?;
     let arch: String = row.get(11)?;
+    // Version 1 rows have no raw architecture; the public spelling is the only
+    // value they can supply.
+    let stored_raw_arch: String = row.get(18)?;
+    let raw_arch = if stored_raw_arch.is_empty() {
+        arch.clone()
+    } else {
+        stored_raw_arch
+    };
 
     Ok(ArtifactRow {
         artifact: Artifact {
@@ -1696,12 +1721,11 @@ fn artifact_row_from_row(row: &Row<'_>) -> rusqlite::Result<ArtifactRow> {
             version: row.get(7)?,
             platform: row.get(9)?,
             platform_version: row.get(10)?,
-            arch: arch.clone(),
-            // The raw upstream architecture is not a column of its own; the
-            // public architecture is the value later layers use.
-            raw_arch: arch,
+            arch,
+            raw_arch,
             basename: row.get(4)?,
             sha256: row.get(2)?,
+            metadata_json,
             iteration,
             superseded: false,
         },

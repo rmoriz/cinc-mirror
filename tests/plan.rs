@@ -449,6 +449,18 @@ async fn crawl_orders_versions_platforms_arches_and_basenames() {
         ],
         "order is version descending, then platform, platform_version, arch, basename"
     );
+    assert_eq!(
+        artifacts[0].metadata_json,
+        metadata(
+            "cinc_19.4.46-1_amd64.deb",
+            SHA_A,
+            "debian",
+            "13",
+            "19.4.46",
+            "x86_64",
+        ),
+        "crawl must carry the upstream document through unchanged"
+    );
 }
 
 #[tokio::test]

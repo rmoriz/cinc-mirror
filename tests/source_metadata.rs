@@ -58,6 +58,10 @@ fn metadata_parses_required_fields() {
     assert_eq!(metadata.arch, "x86_64");
     assert_eq!(metadata.version, "19.4.46");
     assert_eq!(metadata.iteration.as_deref(), Some("2"));
+    assert_eq!(
+        metadata.raw_json, METADATA,
+        "the upstream document must be kept byte for byte"
+    );
 }
 
 #[test]
@@ -76,6 +80,10 @@ fn metadata_maps_to_artifact_input() {
     assert_eq!(input.version, "19.4.46");
     assert_eq!(input.iteration.as_deref(), Some("2"));
     assert_eq!(input.raw_arch, "x86_64");
+    assert_eq!(
+        input.metadata_json, METADATA,
+        "to_input must pass the exact document through"
+    );
 }
 
 #[test]

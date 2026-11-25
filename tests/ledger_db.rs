@@ -33,6 +33,10 @@ fn artifact(version: &str, sha_byte: char) -> Artifact {
         raw_arch: "x86_64".to_string(),
         basename: format!("cinc-{version}-debian-13-x86_64.pkg.tar.zst"),
         sha256: sha_byte.to_string().repeat(64),
+        metadata_json: format!(
+            r#"{{"basename":"cinc-{version}-debian-13-x86_64.pkg.tar.zst","sha256":"{}","iteration":1}}"#,
+            sha_byte.to_string().repeat(64)
+        ),
         iteration: None,
         superseded: false,
     }
@@ -49,6 +53,7 @@ fn detail_json(artifact: &Artifact) -> Value {
         "raw_arch": artifact.raw_arch,
         "basename": artifact.basename,
         "sha256": artifact.sha256,
+        "metadata_json": artifact.metadata_json,
         "iteration": artifact.iteration,
     })
 }
@@ -352,6 +357,11 @@ fn hash_change_opens_single_incident_per_hash_pair() {
     assert_eq!(new_row.size, Some(101));
     assert_eq!(new_row.artifact.key(), new.key());
     assert_eq!(new_row.artifact.sha256, new.sha256);
+    assert_eq!(
+        new_row.artifact.metadata_json, new.metadata_json,
+        "hash_changed must keep the exact upstream metadata text"
+    );
+    assert_eq!(new_row.artifact.raw_arch, "x86_64");
 
     let open = ledger
         .incidents(IncidentFilter::open())
@@ -767,7 +777,7 @@ fn schema_migrates_from_empty_and_is_rerunnable() {
 
     {
         let ledger = Ledger::open(dir.path()).expect("first open");
-        assert_eq!(ledger.schema_version().expect("schema version"), 1);
+        assert_eq!(ledger.schema_version().expect("schema version"), 2);
     }
 
     let artifact = artifact("19.4.46", 'a');
@@ -779,7 +789,7 @@ fn schema_migrates_from_empty_and_is_rerunnable() {
     }
 
     let ledger = Ledger::open(dir.path()).expect("third open");
-    assert_eq!(ledger.schema_version().expect("schema version"), 1);
+    assert_eq!(ledger.schema_version().expect("schema version"), 2);
     assert_eq!(ledger.event_count().expect("event count"), 1);
     assert!(ledger
         .artifact(&artifact.key())

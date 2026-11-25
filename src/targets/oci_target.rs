@@ -2,9 +2,10 @@
 //!
 //! One repository per upstream project (`<namespace>/<project>`), one tag per
 //! artifact ([`Artifact::tag`]), and one image manifest per tag. The manifest
-//! carries the package as its first layer and the upstream-shaped
-//! `metadata.json` as its second, so `oras pull` of a tag yields the same two
-//! files the legacy shell script pushed.
+//! carries the package as its first layer and the exact upstream
+//! `metadata.json` document as its second, so `oras pull` of a tag yields the
+//! same two files the legacy shell script pushed. The document is carried
+//! verbatim on the artifact; nothing re-serialises it.
 //!
 //! The manifest is the publication: its digest is what the ledger stores and
 //! what `verify` compares. A tag that already holds a different package digest
@@ -175,23 +176,17 @@ impl Target for OciTarget {
             })?
             .len();
 
-        let metadata_bytes =
-            serde_json::to_vec(&metadata_document(artifact)).map_err(|source| {
-                TargetError::Manifest {
-                    tag: reference.clone(),
-                    reason: format!("the metadata document is not serialisable: {source}"),
-                }
-            })?;
-        let metadata_digest = sha256_digest(&metadata_bytes);
+        let metadata_bytes = artifact.metadata_json.as_bytes();
+        let metadata_digest = sha256_digest(metadata_bytes);
 
         self.ensure_bytes(&repo, EMPTY_CONFIG, &sha256_digest(EMPTY_CONFIG))
             .await?;
         self.ensure_file(&repo, package, &incoming).await?;
-        self.ensure_bytes(&repo, &metadata_bytes, &metadata_digest)
+        self.ensure_bytes(&repo, metadata_bytes, &metadata_digest)
             .await?;
 
         let manifest =
-            manifest_document(artifact, &incoming, size, &metadata_bytes, &metadata_digest);
+            manifest_document(artifact, &incoming, size, metadata_bytes, &metadata_digest);
         let manifest_digest = self
             .registry
             .put_manifest(&repo, &reference, &manifest)
@@ -239,24 +234,6 @@ impl Target for OciTarget {
 /// `sha256:<hex>` of the artifact's verified package digest.
 fn package_digest(artifact: &Artifact) -> String {
     format!("sha256:{}", artifact.sha256)
-}
-
-/// The metadata layer's content.
-///
-/// It mirrors the fields upstream publishes in `*.metadata.json`; the entire
-/// upstream document is not kept in the store, so the target writes the subset
-/// that identifies the package. `arch` keeps the upstream spelling so a
-/// consumer sees the same value the package name carries.
-fn metadata_document(artifact: &Artifact) -> Value {
-    json!({
-        "arch": artifact.raw_arch,
-        "basename": artifact.basename,
-        "iteration": artifact.iteration,
-        "platform": artifact.platform,
-        "platform_version": artifact.platform_version,
-        "sha256": artifact.sha256,
-        "version": artifact.version,
-    })
 }
 
 /// The OCI image manifest for one artifact.
