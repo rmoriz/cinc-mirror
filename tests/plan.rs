@@ -473,6 +473,64 @@ async fn crawl_orders_versions_platforms_arches_and_basenames() {
 }
 
 #[tokio::test]
+async fn crawl_uses_the_metadata_platform_version_for_alias_directories() {
+    let mut pages = HashMap::new();
+    pages.insert("files/stable/cinc/".to_string(), listing(&["19.4.46/"]));
+    pages.insert(
+        "files/stable/cinc/19.4.46/".to_string(),
+        listing(&["windows/"]),
+    );
+    pages.insert(
+        "files/stable/cinc/19.4.46/windows/".to_string(),
+        listing(&["10/", "11/", "2022/"]),
+    );
+    for alias in ["10", "11", "2022"] {
+        let base = format!("files/stable/cinc/19.4.46/windows/{alias}");
+        pages.insert(
+            format!("{base}/"),
+            listing(&[
+                "cinc-19.4.46-1-x64.msi",
+                "cinc-19.4.46-1-x64.msi.metadata.json",
+            ]),
+        );
+        pages.insert(
+            format!("{base}/cinc-19.4.46-1-x64.msi.metadata.json"),
+            metadata(
+                "cinc-19.4.46-1-x64.msi",
+                SHA_A,
+                "windows",
+                "2022",
+                "19.4.46",
+                "x86_64",
+            ),
+        );
+    }
+
+    let source = source_over(FakeUpstream::new(pages, HashMap::new()));
+    let config = config(std::path::Path::new("/tmp"), "0");
+
+    let outcome = crawl(&source, &scope(&config).policies[0])
+        .await
+        .expect("alias directories must not fail the crawl");
+
+    let keys: Vec<String> = outcome
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.key())
+        .collect();
+    assert_eq!(
+        keys,
+        vec![format!("stable/cinc/19.4.46/windows/2022/amd64/{SHA_A}")],
+        "metadata names the canonical platform version and aliases collapse to one artifact"
+    );
+    assert!(
+        outcome.collisions.is_empty(),
+        "identical bytes in alias directories are not a collision: {:?}",
+        outcome.collisions
+    );
+}
+
+#[tokio::test]
 async fn crawl_reports_two_digests_under_one_tag_as_a_collision() {
     let mut pages = HashMap::new();
     let js = |name: &str| format!("files/stable/cinc/19.4.46/debian/13/{name}.metadata.json");

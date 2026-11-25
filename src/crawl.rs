@@ -7,6 +7,12 @@
 //! run. Every `*.metadata.json` sibling is fetched and validated; the artifact
 //! is built from the metadata and the resolved policy values.
 //!
+//! Upstream publishes the same Windows package under several compatibility
+//! directories (`windows/10`, `/11`, `/2016`, `/2022`, ...) while the metadata
+//! names one canonical platform version. The metadata is authoritative for the
+//! artifact identity, so those aliases collapse into one artifact instead of
+//! aborting the crawl.
+//!
 //! The result is deterministic: versions descending, then platform,
 //! platform_version, architecture and basename ascending. Two different digests
 //! under one descriptive tag are an upstream anomaly, not a failed run: the
@@ -233,8 +239,20 @@ async fn artifacts_in_dir(
                 path: path.clone(),
                 source,
             })?;
-        let artifact = Artifact::new(&context, metadata.to_input())
-            .map_err(|source| CrawlError::Artifact { path, source })?;
+        let artifact = {
+            // The directory only locates this copy; the metadata names the
+            // canonical platform version. Building the artifact under the
+            // directory name would publish one package once per compatibility
+            // alias, so take the metadata value when it provides one.
+            let mut artifact_context = context.clone();
+            if !metadata.platform_version.is_empty() {
+                artifact_context
+                    .platform_version
+                    .clone_from(&metadata.platform_version);
+            }
+            Artifact::new(&artifact_context, metadata.to_input())
+                .map_err(|source| CrawlError::Artifact { path, source })?
+        };
         artifacts.push(artifact);
     }
 
