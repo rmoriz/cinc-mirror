@@ -528,6 +528,7 @@ async fn crawl_uses_the_metadata_platform_version_for_alias_directories() {
         "identical bytes in alias directories are not a collision: {:?}",
         outcome.collisions
     );
+    assert_eq!(outcome.skipped, 0);
 }
 
 #[tokio::test]
@@ -619,6 +620,7 @@ async fn crawl_skips_metadata_whose_platform_contradicts_the_directory() {
         outcome.artifacts.is_empty(),
         "a document under a platform directory that contradicts its platform is skipped"
     );
+    assert_eq!(outcome.skipped, 1, "the skip is counted for the plan");
 }
 
 #[tokio::test]
@@ -754,6 +756,7 @@ async fn plan_excludes_colliding_artifacts_and_reports_them() {
     .expect("a collision does not fail the plan");
 
     assert_eq!(plan.collisions, 1);
+    assert_eq!(plan.skipped, 0);
     assert_eq!(plan.collision_details.len(), 1, "details back the count");
     let collision = &plan.collision_details[0];
     assert_eq!(collision.tag, "19.4.46-debian-13-arm64");
@@ -946,6 +949,7 @@ async fn json_embeds_effective_policy_and_is_stable() {
         "\"satisfied_bytes\"",
         "\"collisions\"",
         "\"collision_details\"",
+        "\"skipped\"",
         "\"by_project\"",
         "\"by_platform\"",
         "\"by_arch\"",

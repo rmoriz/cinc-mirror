@@ -988,6 +988,7 @@ async fn plan_command(base: &Config, args: PlanArgs, allow_unleased: bool) -> an
                     "artifacts": estimate.artifacts,
                     "total_bytes": estimate.total_bytes,
                     "satisfied_bytes": estimate.satisfied_bytes,
+                    "skipped": estimate.skipped,
                 },
             }));
         if let Err(error) = env.ledger_mut()?.append(&event) {
@@ -1047,6 +1048,13 @@ fn print_plan(estimate: &Plan, by: PlanGrouping) {
                 collision.conflicting, collision.upstream_path
             );
         }
+    }
+
+    if estimate.skipped > 0 {
+        println!(
+            "skipped: {} (metadata does not fit its upstream directory; RUST_LOG=debug shows paths)",
+            estimate.skipped
+        );
     }
 
     let (label, groups) = match by {

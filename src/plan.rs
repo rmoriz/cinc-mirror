@@ -90,6 +90,9 @@ pub struct Plan {
     pub collisions: usize,
     /// The collisions behind [`Plan::collisions`], for inspection.
     pub collision_details: Vec<CollisionDetail>,
+    /// Metadata documents the crawl could not represent because their
+    /// platform or version contradicts the upstream directory.
+    pub skipped: usize,
     /// Totals per project.
     pub by_project: BTreeMap<String, GroupTotals>,
     /// Totals per platform.
@@ -157,8 +160,10 @@ pub async fn build(
 ) -> Result<Plan, PlanError> {
     let mut candidates: BTreeMap<String, Artifact> = BTreeMap::new();
     let mut collisions: Vec<TagCollision> = Vec::new();
+    let mut skipped = 0;
     for policy in &scope.policies {
         let outcome = crawl(source, policy).await?;
+        skipped += outcome.skipped;
         for artifact in outcome.artifacts {
             candidates.entry(artifact.key()).or_insert(artifact);
         }
@@ -204,6 +209,7 @@ pub async fn build(
         satisfied_bytes: 0,
         collisions: collisions.len(),
         collision_details: collisions.iter().map(CollisionDetail::new).collect(),
+        skipped,
         by_project: BTreeMap::new(),
         by_platform: BTreeMap::new(),
         by_arch: BTreeMap::new(),

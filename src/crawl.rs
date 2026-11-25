@@ -14,8 +14,9 @@
 //! aborting the crawl. Some historical documents name a value that is not a
 //! usable path component (`debian/13` claiming `trixie/sid`); there the
 //! directory value stands. A document that lands under a directory whose
-//! platform or version contradicts it is skipped with a warning, because the
-//! tree cannot be represented faithfully.
+//! platform or version contradicts it is skipped and counted, because the
+//! tree cannot be represented faithfully; the plan reports the count and
+//! `RUST_LOG=debug` names the paths.
 //!
 //! The result is deterministic: versions descending, then platform,
 //! platform_version, architecture and basename ascending. Two different digests
@@ -44,6 +45,10 @@ pub struct CrawlOutcome {
     /// Tag collisions found on the way; the conflicting artifact of each is
     /// not in `artifacts`.
     pub collisions: Vec<TagCollision>,
+    /// Metadata documents skipped because their platform or version
+    /// contradicts the upstream directory. They cannot be represented
+    /// faithfully; the plan surfaces the count.
+    pub skipped: usize,
 }
 
 /// Two artifacts map to one descriptive tag but do not carry the same bytes.
@@ -107,7 +112,7 @@ pub async fn crawl(source: &Source, policy: &ResolvedPolicy) -> Result<CrawlOutc
                     })
             {
                 let directory = format!("{platform_dir}/{platform_version}");
-                let mut found = artifacts_in_dir(
+                let (mut found, skipped) = artifacts_in_dir(
                     source,
                     policy,
                     &version_name,
@@ -116,6 +121,7 @@ pub async fn crawl(source: &Source, policy: &ResolvedPolicy) -> Result<CrawlOutc
                     &directory,
                 )
                 .await?;
+                outcome.skipped += skipped;
                 found.sort_by(|left, right| {
                     left.arch
                         .cmp(&right.arch)
@@ -213,7 +219,7 @@ async fn artifacts_in_dir(
     platform: &str,
     platform_version: &str,
     dir: &str,
-) -> Result<Vec<Artifact>, CrawlError> {
+) -> Result<(Vec<Artifact>, usize), CrawlError> {
     let entries = source.list(dir).await.map_err(|source| CrawlError::List {
         dir: dir.to_string(),
         source,
@@ -234,6 +240,7 @@ async fn artifacts_in_dir(
     };
 
     let mut artifacts = Vec::new();
+    let mut skipped = 0;
     for document in documents {
         let path = format!("{dir}/{document}");
         let metadata = source
@@ -254,7 +261,8 @@ async fn artifacts_in_dir(
             let version_contradicts = !metadata.version.is_empty()
                 && (metadata.version != context.version || !is_safe_component(&metadata.version));
             if platform_contradicts || version_contradicts {
-                tracing::warn!(
+                skipped += 1;
+                tracing::debug!(
                     path = %path,
                     metadata_platform = %metadata.platform,
                     metadata_version = %metadata.version,
@@ -288,7 +296,7 @@ async fn artifacts_in_dir(
         artifacts.push(artifact);
     }
 
-    Ok(artifacts)
+    Ok((artifacts, skipped))
 }
 
 /// Errors raised while crawling a policy.
