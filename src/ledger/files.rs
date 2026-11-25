@@ -160,6 +160,11 @@ impl LedgerStore {
         for segment in &segments {
             let stamp = stamp(&segment.path)?;
             if known.files.get(&segment.key) == Some(&stamp) {
+                // Carry the stamp into the rewritten cache: a file this call
+                // skipped is still up to date, and `write_high_water` replaces
+                // the whole cache. Files that disappeared are dropped because
+                // only current segments are collected.
+                seen.files.insert(segment.key.clone(), stamp);
                 continue;
             }
             let events = read_segment(&segment.path)?;

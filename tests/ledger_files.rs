@@ -90,6 +90,28 @@ impl Fixture {
     }
 }
 
+fn commit(dir: &Path, message: &str) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@localhost",
+            "commit",
+            "-m",
+            message,
+        ])
+        .output()
+        .expect("run git commit");
+    assert!(
+        output.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+}
+
 fn ts_at(seq: u64) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 11, 25, 12, 0, 0)
         .single()
@@ -290,8 +312,11 @@ fn load_all_is_idempotent() {
     assert_eq!(counts(&ledger), (3, 2, 1));
     assert_eq!(ledger.satisfied_keys("ghcr").expect("satisfied").len(), 1);
 
-    // Unchanged files are skipped through the high-water mark.
+    // Unchanged files are skipped through the high-water mark, and the cache
+    // keeps them: every later load is a no-op too instead of alternating
+    // between replaying everything and writing an empty cache.
     assert_eq!(store.load_all(&mut ledger).expect("second load"), 0);
+    assert_eq!(store.load_all(&mut ledger).expect("third load"), 0);
     assert_eq!(counts(&ledger), (3, 2, 1));
 
     // Correctness does not depend on that cache: drop it and replay everything.
@@ -404,6 +429,100 @@ fn sync_fetches_a_branch_advanced_by_another_writer() {
     assert!(scratch.is_file(), "sync must not discard local work");
     fs::remove_file(&scratch).expect("remove scratch file");
     second.sync().expect("a clean worktree syncs again");
+}
+
+#[test]
+fn sync_pushes_unpushed_commits() {
+    let fixture = Fixture::new();
+    let first = fixture.store("first");
+    first.sync().expect("bootstrap the ledger branch");
+    let second = fixture.store("second");
+    second.sync().expect("clone the ledger branch");
+
+    let local = artifact("19.9.0", 'e');
+    let path = second
+        .write_run(&[seen("run-local", 1, &local, 99)])
+        .expect("write the run");
+    let workdir = fixture.state("second").join("ledger-repo");
+    git(&workdir, &["add", "-A"]);
+    commit(&workdir, "run local");
+
+    second
+        .sync()
+        .expect("a local commit is published instead of dropped");
+    assert!(
+        path.is_file(),
+        "the run file survives the sync: {}",
+        path.display()
+    );
+    assert_eq!(git(&workdir, &["status", "--porcelain"]), "");
+    assert_eq!(git(&workdir, &["rev-parse", "HEAD"]), fixture.head());
+    assert_eq!(
+        git(
+            &fixture.remote,
+            &["ls-tree", "--name-only", "refs/heads/ledger", "runs/"]
+        ),
+        "runs/run-local.ndjson",
+        "the unpushed run reached the remote"
+    );
+}
+
+#[test]
+fn sync_refuses_to_discard_unpushed_commits() {
+    let fixture = Fixture::new();
+    let first = fixture.store("first");
+    first.sync().expect("bootstrap the ledger branch");
+    let second = fixture.store("second");
+    second.sync().expect("clone the ledger branch");
+
+    let local = artifact("19.8.0", 'f');
+    let path = second
+        .write_run(&[seen("run-local", 1, &local, 98)])
+        .expect("write the run");
+    let workdir = fixture.state("second").join("ledger-repo");
+    git(&workdir, &["add", "-A"]);
+    commit(&workdir, "run local");
+    let local_head = git(&workdir, &["rev-parse", "HEAD"]);
+
+    // Another writer advances the remote, so the local commit cannot be pushed
+    // without a rebase. `sync` must refuse instead of resetting it away.
+    let competing = artifact("19.9.0", 'a');
+    let competing_path = first
+        .write_run(&[seen("run-remote", 1, &competing, 97)])
+        .expect("write the competing run");
+    first
+        .commit_and_push(&competing_path, "run remote")
+        .expect("push the competing run");
+
+    match second.sync() {
+        Err(LedgerGitError::UnpushedCommits { count, .. }) => assert_eq!(count, 1),
+        other => panic!("expected UnpushedCommits, got {other:?}"),
+    }
+    assert_eq!(
+        git(&workdir, &["rev-parse", "HEAD"]),
+        local_head,
+        "the local commit survives"
+    );
+    assert!(
+        path.is_file(),
+        "the local run file survives: {}",
+        path.display()
+    );
+    assert!(
+        !git(
+            &fixture.remote,
+            &["ls-tree", "--name-only", "refs/heads/ledger", "runs/"]
+        )
+        .contains("run-local"),
+        "the refused run was not pushed"
+    );
+
+    // Once the local work is committed no further sync may sneak it away.
+    match second.sync() {
+        Err(LedgerGitError::UnpushedCommits { count, .. }) => assert_eq!(count, 1),
+        other => panic!("expected UnpushedCommits again, got {other:?}"),
+    }
+    assert!(path.is_file());
 }
 
 #[test]

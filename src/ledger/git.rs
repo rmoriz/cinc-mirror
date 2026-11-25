@@ -60,6 +60,12 @@ impl LedgerStore {
     /// when it is clean: a dirty worktree is refused with
     /// [`LedgerGitError::Dirty`] rather than silently discarding local work.
     ///
+    /// Committed work that was never pushed (a run whose
+    /// [`LedgerStore::commit_and_push`] was rejected) is never reset away: sync
+    /// pushes those commits first, and when the remote has advanced in the
+    /// meantime it returns [`LedgerGitError::UnpushedCommits`] leaving `HEAD`
+    /// and the working tree untouched for an explicit rebase.
+    ///
     /// # Errors
     ///
     /// Returns [`LedgerGitError`] when git is unavailable, the remote cannot be
@@ -281,6 +287,39 @@ impl LedgerStore {
             ),
             "fetch",
         )?;
+
+        // A run whose push was rejected leaves a commit that exists only here.
+        // Resetting to the remote tip would delete it (and its run file), so
+        // publish it first and refuse the sync when the remote has moved.
+        let ahead = ok(
+            git_in(&self.workdir, &["rev-list", "--count", "FETCH_HEAD..HEAD"]),
+            "rev-list",
+        )?;
+        let ahead = text(&ahead)
+            .parse::<u64>()
+            .map_err(|error| LedgerGitError::Command {
+                action: "rev-list".to_string(),
+                status: "0".to_string(),
+                stderr: format!("unexpected `git rev-list --count` output: {error}"),
+            })?;
+        if ahead > 0 {
+            let refspec = format!("HEAD:refs/heads/{}", self.branch);
+            let push = run(
+                git_in(&self.workdir, &["push", "--quiet", &self.remote, &refspec]),
+                "push",
+            )?;
+            if !push.status.success() {
+                return Err(LedgerGitError::UnpushedCommits {
+                    branch: self.branch.clone(),
+                    count: ahead,
+                    reason: String::from_utf8_lossy(&push.stderr).trim().to_string(),
+                });
+            }
+            // The push made `HEAD` the remote tip; there is nothing to reset to
+            // and `FETCH_HEAD` is stale now.
+            return Ok(());
+        }
+
         ok(
             git_in(&self.workdir, &["reset", "--quiet", "--hard", "FETCH_HEAD"]),
             "reset",
@@ -922,6 +961,21 @@ pub enum LedgerGitError {
         /// How many attempts were made.
         attempts: u32,
         /// Last stderr from git.
+        reason: String,
+    },
+
+    /// The worktree has commits the remote does not have, and they do not
+    /// fast-forward onto the remote tip.
+    #[error(
+        "the ledger worktree has {count} unpushed commit(s) on `{branch}` \
+         that the remote cannot fast-forward: {reason}"
+    )]
+    UnpushedCommits {
+        /// The branch that has local commits.
+        branch: String,
+        /// How many commits exist only locally.
+        count: u64,
+        /// Last stderr from the failed push.
         reason: String,
     },
 
