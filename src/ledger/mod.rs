@@ -959,6 +959,28 @@ impl Ledger {
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
+    /// Whether any event was recorded under `run_id`.
+    ///
+    /// A run id is a one-shot event namespace: `(run_id, seq)` is the
+    /// idempotency key, so reusing a run id would make later appends collide
+    /// with recorded events and be discarded silently. Commands that mint their
+    /// own events check this before allocating a sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] when the query fails.
+    pub fn has_events_for_run(&self, run_id: &str) -> Result<bool, LedgerError> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM events WHERE run_id = ?1 LIMIT 1",
+                params![run_id],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// The highest applied schema version.
     ///
     /// # Errors

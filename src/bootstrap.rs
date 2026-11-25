@@ -99,6 +99,17 @@ pub enum BootstrapError {
         /// The configured target name.
         name: String,
     },
+
+    /// The run id already has ledger events.
+    ///
+    /// The ledger keys events on `(run_id, seq)` and silently ignores a
+    /// duplicate, so a reused run id would drop imports and incidents without a
+    /// trace. The caller must mint a fresh id per invocation.
+    #[error("run id `{run_id}` already has ledger events; a bootstrap run needs a fresh run id")]
+    RunIdReused {
+        /// The reused run id.
+        run_id: String,
+    },
 }
 
 /// Monotonic event sequence for one bootstrap run.
@@ -116,12 +127,25 @@ impl Seq {
 
 /// Import existing OCI publications into the ledger.
 ///
+/// `ctx.run_id` must be fresh: it is the ledger's event namespace, and a run id
+/// that already has events makes every later append a duplicate-key no-op, so
+/// imports and incidents would disappear silently. The caller (the CLI) mints a
+/// new run id per invocation; this function enforces that instead of trusting
+/// it.
+///
 /// # Errors
 ///
-/// Returns [`BootstrapError`] when the crawl, the ledger, a target probe or the
-/// incident flow fails, and [`BootstrapError::MissingTarget`] when an enabled
-/// OCI target has no constructed target in the context.
+/// Returns [`BootstrapError::RunIdReused`] when `ctx.run_id` already has ledger
+/// events, and [`BootstrapError`] when the crawl, the ledger, a target probe or
+/// the incident flow fails, or when an enabled OCI target has no constructed
+/// target in the context.
 pub async fn run(ctx: &Ctx) -> Result<BootstrapReport, BootstrapError> {
+    if ctx.ledger.lock().await.has_events_for_run(&ctx.run_id)? {
+        return Err(BootstrapError::RunIdReused {
+            run_id: ctx.run_id.clone(),
+        });
+    }
+
     let artifacts = crawl_all(ctx).await?;
     let targets = oci_targets(ctx)?;
     let seq = Seq::new();

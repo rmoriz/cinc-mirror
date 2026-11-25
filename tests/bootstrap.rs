@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cinc_mirror::artifact::Artifact;
-use cinc_mirror::bootstrap::{self, BootstrapReport};
+use cinc_mirror::bootstrap::{self, BootstrapError, BootstrapReport};
 use cinc_mirror::config::{TargetAuth, TargetConfig, TargetKind};
 use cinc_mirror::ctx::Ctx;
 use cinc_mirror::ledger::{
@@ -41,10 +41,41 @@ const RSYNC: &str = "rsync";
 /// developer's `GITHUB_TOKEN` cannot make the incident flow reach the network.
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn clear_github_env() {
-    std::env::remove_var("GITHUB_TOKEN");
-    std::env::remove_var("GITHUB_REPOSITORY");
-    std::env::remove_var("GITHUB_ENV");
+/// Clears the GitHub variables for the duration of one test and restores them
+/// afterwards, so a developer's real values survive the suite.
+struct GithubEnvGuard {
+    token: Option<String>,
+    repository: Option<String>,
+    env_file: Option<String>,
+}
+
+impl GithubEnvGuard {
+    fn clear() -> Self {
+        let saved = Self {
+            token: std::env::var("GITHUB_TOKEN").ok(),
+            repository: std::env::var("GITHUB_REPOSITORY").ok(),
+            env_file: std::env::var("GITHUB_ENV").ok(),
+        };
+        std::env::remove_var("GITHUB_TOKEN");
+        std::env::remove_var("GITHUB_REPOSITORY");
+        std::env::remove_var("GITHUB_ENV");
+        saved
+    }
+}
+
+impl Drop for GithubEnvGuard {
+    fn drop(&mut self) {
+        restore_env("GITHUB_TOKEN", self.token.as_deref());
+        restore_env("GITHUB_REPOSITORY", self.repository.as_deref());
+        restore_env("GITHUB_ENV", self.env_file.as_deref());
+    }
+}
+
+fn restore_env(name: &str, value: Option<&str>) {
+    match value {
+        Some(value) => std::env::set_var(name, value),
+        None => std::env::remove_var(name),
+    }
 }
 
 /// `sha256:<hex>` of `bytes`.
@@ -351,7 +382,7 @@ async fn imports_tag_when_layer_digest_matches_upstream_sha() {
 
 #[tokio::test]
 async fn skips_already_imported_rows() {
-    let fixture = fixture().await;
+    let mut fixture = fixture().await;
     let manifest = matching_manifest(&fixture.artifact, &fixture.bytes);
     fixture
         .mock
@@ -360,6 +391,8 @@ async fn skips_already_imported_rows() {
     let first = bootstrap::run(&fixture.ctx).await.expect("first bootstrap");
     assert_eq!(first.imported, 1);
 
+    // Idempotence is across runs: each run must use its own event namespace.
+    fixture.ctx.run_id = "bootstrap-second-run".to_string();
     let second = bootstrap::run(&fixture.ctx)
         .await
         .expect("second bootstrap");
@@ -378,11 +411,46 @@ async fn skips_already_imported_rows() {
 }
 
 #[tokio::test]
+async fn a_reused_run_id_is_refused_before_writing_anything() {
+    let fixture = fixture().await;
+    let manifest = matching_manifest(&fixture.artifact, &fixture.bytes);
+    fixture
+        .mock
+        .store_manifest(REPO, &fixture.artifact.tag(), &manifest);
+
+    let first = bootstrap::run(&fixture.ctx).await.expect("first bootstrap");
+    assert_eq!(first.imported, 1);
+    let events_before = event_list(&fixture.ctx).await.len();
+
+    let error = bootstrap::run(&fixture.ctx)
+        .await
+        .expect_err("a reused run id must not be accepted");
+    match error {
+        BootstrapError::RunIdReused { run_id } => {
+            assert_eq!(run_id, fixture.ctx.run_id);
+        }
+        other => panic!("expected RunIdReused, got {other:?}"),
+    }
+
+    assert_eq!(
+        event_list(&fixture.ctx).await.len(),
+        events_before,
+        "the refused run appended nothing"
+    );
+    assert_eq!(
+        count_kind(&event_list(&fixture.ctx).await, EventKind::Imported),
+        1,
+        "no duplicate import was recorded"
+    );
+    assert_eq!(fixture.mock.manifest_put_count(), 0);
+}
+
+#[tokio::test]
 async fn reports_conflict_when_layer_differs() {
     let _env = ENV_LOCK.lock().await;
-    clear_github_env();
+    let _github = GithubEnvGuard::clear();
 
-    let fixture = fixture().await;
+    let mut fixture = fixture().await;
     let other = digest(b"some other package published under the tag");
     let manifest = legacy_manifest(&fixture.artifact, &other, 42);
     fixture
@@ -430,6 +498,8 @@ async fn reports_conflict_when_layer_differs() {
         0
     );
 
+    // A rerun of the conflict uses a fresh event namespace.
+    fixture.ctx.run_id = "bootstrap-conflict-rerun".to_string();
     let again = bootstrap::run(&fixture.ctx)
         .await
         .expect("second bootstrap");

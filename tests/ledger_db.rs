@@ -1048,3 +1048,27 @@ fn events_round_trip_with_snake_case_kind_and_millisecond_timestamps() {
         );
     }
 }
+
+#[test]
+fn has_events_for_run_reports_only_recorded_run_ids() {
+    let (_dir, mut ledger) = open();
+    let artifact = artifact("19.4.46", 'a');
+
+    assert!(!ledger
+        .has_events_for_run("run-1")
+        .expect("empty ledger query"));
+
+    ledger
+        .append(&seen("run-1", 1, &artifact, 1234))
+        .expect("artifact_seen");
+
+    assert!(ledger
+        .has_events_for_run("run-1")
+        .expect("recorded run query"));
+    assert!(
+        !ledger
+            .has_events_for_run("run-2")
+            .expect("unknown run query"),
+        "a different run id has no events"
+    );
+}
