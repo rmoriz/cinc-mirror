@@ -225,6 +225,19 @@ impl Artifact {
         )
     }
 
+    /// The path a superseded artifact occupies below an rsync target root.
+    ///
+    /// The replacement keeps the upstream directory and appends
+    /// `.superseded-<sha12>` to the basename, so the canonical name can keep
+    /// serving the old bytes until the incident is acknowledged.
+    #[must_use]
+    pub fn rsync_superseded_relpath(&self) -> String {
+        let mut path = self.rsync_relpath();
+        path.push_str(".superseded-");
+        path.push_str(self.short_sha());
+        path
+    }
+
     /// Check that `other` may share this artifact's descriptive tag.
     ///
     /// Two artifacts with the same tag must have identical bytes. A different

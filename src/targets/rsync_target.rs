@@ -244,7 +244,36 @@ impl RsyncTarget {
     /// path.
     #[must_use]
     pub fn rsync_args(&self, artifact: &Artifact) -> Vec<String> {
-        self.upload_args(Path::new(&artifact.basename), &artifact.rsync_relpath())
+        self.upload_args(
+            Path::new(&artifact.basename),
+            &self.reference_relpath(artifact),
+        )
+    }
+
+    /// The path this artifact occupies on the target.
+    ///
+    /// A superseded artifact uses the suffixed name so the canonical path can
+    /// keep serving the bytes it already has.
+    fn reference_relpath(&self, artifact: &Artifact) -> String {
+        if artifact.superseded {
+            artifact.rsync_superseded_relpath()
+        } else {
+            artifact.rsync_relpath()
+        }
+    }
+
+    /// The path of the metadata document that belongs to `artifact`.
+    ///
+    /// The canonical artifact keeps the historical `metadata.json`. A
+    /// superseded artifact gets a companion file next to its suffixed package,
+    /// so publishing the replacement cannot overwrite the canonical metadata.
+    fn metadata_relpath(&self, artifact: &Artifact) -> String {
+        if artifact.superseded {
+            format!("{}.metadata.json", artifact.rsync_superseded_relpath())
+        } else {
+            let directory = directory_of(&artifact.rsync_relpath());
+            format!("{directory}/{METADATA_NAME}")
+        }
     }
 
     fn upload_args(&self, source: &Path, relative: &str) -> Vec<String> {
@@ -488,7 +517,7 @@ impl RsyncTarget {
     }
 
     async fn read_sidecar(&self, artifact: &Artifact) -> Result<Option<Sidecar>, TargetError> {
-        let relative = format!("{}{SIDECAR_SUFFIX}", artifact.rsync_relpath());
+        let relative = format!("{}{SIDECAR_SUFFIX}", self.reference_relpath(artifact));
         let bytes = match &self.address {
             RsyncAddress::Local { .. } => {
                 let path = self
@@ -602,7 +631,7 @@ impl RsyncTarget {
             }
             if !allow_replace {
                 return Err(TargetError::TagConflict {
-                    tag: artifact.rsync_relpath(),
+                    tag: self.reference_relpath(artifact),
                     existing,
                     incoming: artifact.sha256.clone(),
                 });
@@ -614,7 +643,7 @@ impl RsyncTarget {
             .map_err(|source| io_error(package.to_path_buf(), source))?
             .len();
 
-        let relpath = artifact.rsync_relpath();
+        let relpath = self.reference_relpath(artifact);
         let directory = directory_of(&relpath);
         self.prepare_directory(&directory).await?;
 
@@ -626,12 +655,8 @@ impl RsyncTarget {
         fs::write(&metadata, artifact.metadata_json.as_bytes())
             .await
             .map_err(|source| io_error(metadata.clone(), source))?;
-        self.upload_file_with(
-            &metadata,
-            &format!("{directory}/{METADATA_NAME}"),
-            allow_replace,
-        )
-        .await?;
+        self.upload_file_with(&metadata, &self.metadata_relpath(artifact), allow_replace)
+            .await?;
 
         // Sidecar last: its presence is the commit marker for the pair above.
         let sidecar_dir = TempDir::create()?;
@@ -642,7 +667,7 @@ impl RsyncTarget {
             .map_err(|source| io_error(sidecar.clone(), source))?;
         self.upload_file_with(
             &sidecar,
-            &format!("{directory}/{sidecar_name}"),
+            &format!("{relpath}{SIDECAR_SUFFIX}"),
             allow_replace,
         )
         .await?;
@@ -652,7 +677,7 @@ impl RsyncTarget {
 
     fn outcome(&self, artifact: &Artifact) -> PutOutcome {
         PutOutcome {
-            remote_ref: self.destination_spec(&artifact.rsync_relpath()),
+            remote_ref: self.destination_spec(&self.reference_relpath(artifact)),
             remote_digest: artifact.sha256.clone(),
         }
     }
@@ -709,7 +734,7 @@ impl Target for RsyncTarget {
     }
 
     async fn verify(&self, artifact: &Artifact) -> Result<(), TargetError> {
-        let relpath = artifact.rsync_relpath();
+        let relpath = self.reference_relpath(artifact);
         let Some(sidecar) = self.read_sidecar(artifact).await? else {
             return Err(TargetError::NotPublished { tag: relpath });
         };

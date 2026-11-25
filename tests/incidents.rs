@@ -238,7 +238,11 @@ fn package_digest_from_manifest(bytes: &[u8]) -> String {
 }
 
 fn sidecar(state_dir: &Path, artifact: &Artifact) -> String {
-    let path = state_dir.join(format!("{}.sha256", artifact.rsync_relpath()));
+    sidecar_at(state_dir, &artifact.rsync_relpath())
+}
+
+fn sidecar_at(state_dir: &Path, relative: &str) -> String {
+    let path = state_dir.join(format!("{relative}.sha256"));
     std::fs::read_to_string(path).expect("rsync sidecar")
 }
 
@@ -470,6 +474,93 @@ async fn new_bytes_are_published_only_under_the_superseded_tag() {
     assert_eq!(
         package_digest_from_manifest(&replacement.bytes),
         format!("sha256:{}", new.sha256)
+    );
+}
+
+#[tokio::test]
+async fn new_bytes_are_published_only_under_the_superseded_rsync_name() {
+    let _env = env_lock().await;
+    clear_github_env();
+
+    let state = tempfile::tempdir().expect("state dir");
+    let mut ledger = Ledger::open(state.path()).expect("ledger");
+    let rsync_root = tempfile::tempdir().expect("rsync root");
+    let targets = TargetSet::from_targets(vec![Arc::new(rsync_target("rsync", rsync_root.path()))]);
+    let config = config_with(state.path(), "https://api.github.com");
+
+    let old_bytes = b"the old published package".as_slice();
+    let new_bytes = b"the replacement package".as_slice();
+    let old = artifact_for(old_bytes);
+    let new = artifact_for(new_bytes);
+    let (_old_dir, old_path) = write_package(old_bytes);
+    let (_new_dir, new_path) = write_package(new_bytes);
+
+    publish_and_record(
+        &mut ledger,
+        targets.all()[0].as_ref(),
+        &old,
+        &old_path,
+        "run-1",
+        1,
+        true,
+    )
+    .await;
+    open_hash_change(&mut ledger, &config, &old, &new).await;
+
+    let superseded = new.clone().with_superseded(true);
+    let outcome = targets.all()[0]
+        .put(&superseded, &new_path)
+        .await
+        .expect("superseded put");
+
+    assert_eq!(
+        std::fs::read(rsync_root.path().join(old.rsync_relpath())).expect("canonical package"),
+        old_bytes,
+        "the canonical rsync file keeps the old bytes"
+    );
+    assert!(sidecar(rsync_root.path(), &old).starts_with(&old.sha256));
+
+    let canonical_metadata = rsync_root
+        .path()
+        .join(old.rsync_relpath())
+        .parent()
+        .expect("canonical directory")
+        .join("metadata.json");
+    assert_eq!(
+        std::fs::read_to_string(canonical_metadata).expect("canonical metadata"),
+        old.metadata_json,
+        "publishing the replacement must not overwrite the canonical metadata"
+    );
+
+    let superseded_relpath = superseded.rsync_superseded_relpath();
+    assert_eq!(
+        outcome.remote_ref,
+        rsync_root
+            .path()
+            .join(&superseded_relpath)
+            .to_string_lossy(),
+        "the target reports the suffixed path"
+    );
+    assert_eq!(
+        std::fs::read(rsync_root.path().join(&superseded_relpath)).expect("superseded package"),
+        new_bytes
+    );
+    assert!(sidecar_at(rsync_root.path(), &superseded_relpath).starts_with(&new.sha256));
+    assert_eq!(
+        std::fs::read_to_string(
+            rsync_root
+                .path()
+                .join(format!("{superseded_relpath}.metadata.json"))
+        )
+        .expect("superseded metadata"),
+        new.metadata_json
+    );
+    assert_eq!(
+        targets.all()[0]
+            .exists(&superseded)
+            .await
+            .expect("superseded exists"),
+        Some(new.sha256.clone())
     );
 }
 
