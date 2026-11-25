@@ -1,0 +1,93 @@
+name: backfill
+
+# The only workflow that talks to the live CINC upstream and GHCR. It runs a
+# bounded slice of the mirror every six hours; the ledger cursor records how far
+# the last run got, so the next scheduled run simply continues from there. No
+# run redispatches itself.
+on:
+  schedule:
+    # Every six hours, off the hour so the job does not compete with the
+    # top-of-hour cron rush.
+    - cron: "17 */6 * * *"
+  repository_dispatch:
+    types: [backfill]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+
+concurrency:
+  group: cinc-mirror
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    name: mirror a bounded slice
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install rsync
+        run: command -v rsync >/dev/null || (sudo apt-get update && sudo apt-get install -y rsync)
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The ledger worktree lives outside the checkout (state_dir/ledger-repo),
+      # so the credentials checkout writes into this repository's local config
+      # do not reach it. GIT_CONFIG_* is inherited by every git subprocess,
+      # including the clone and push the ledger performs. The token stays in the
+      # environment; it is never embedded in a remote URL.
+      - name: Configure git authentication for the ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$auth"
+          {
+            echo "GIT_CONFIG_COUNT=1"
+            echo "GIT_CONFIG_KEY_0=http.https://github.com/.extraheader"
+            echo "GIT_CONFIG_VALUE_0=AUTHORIZATION: basic $auth"
+          } >> "$GITHUB_ENV"
+
+      - name: Mirror the next slice
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo run --release --locked -- \
+            mirror --everything \
+            --config mirror.ci.toml \
+            --limit 50 \
+            --limit-bytes 8GiB \
+            --gc-after \
+            --allow-unleased
+
+      - name: Collect plan and run events
+        if: always()
+        run: |
+          mkdir -p artifacts
+          cp -v "$HOME"/.local/state/cinc-mirror/plan-*.json artifacts/ 2>/dev/null || true
+          cp -v "$HOME"/.local/state/cinc-mirror/ledger-repo/runs/*.ndjson artifacts/ 2>/dev/null || true
+
+      - name: Upload plan and run events
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backfill-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 14

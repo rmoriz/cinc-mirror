@@ -15,6 +15,8 @@ config.env
 /target
 mirror.toml
 state/
+plan-*.json
+runs/
 
 # OS files
 .DS_Store

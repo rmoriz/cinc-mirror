@@ -3,6 +3,7 @@
 Status: design for review
 Branch: `rust`
 Date: 2026-11-24
+Plan: [2026-11-24-rust-mirror-implementation.md](../plans/2026-11-24-rust-mirror-implementation.md)
 
 ## Intent
 
