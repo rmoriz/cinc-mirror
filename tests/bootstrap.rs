@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use cinc_mirror::artifact::Artifact;
+use cinc_mirror::artifact::{Artifact, ArtifactContext, ArtifactInput};
 use cinc_mirror::bootstrap::{self, BootstrapError, BootstrapReport};
 use cinc_mirror::config::{TargetAuth, TargetConfig, TargetKind};
 use cinc_mirror::ctx::Ctx;
@@ -76,6 +76,42 @@ fn restore_env(name: &str, value: Option<&str>) {
         Some(value) => std::env::set_var(name, value),
         None => std::env::remove_var(name),
     }
+}
+
+/// An artifact with an explicit basename and raw architecture, for fixtures
+/// with several packages in one release directory.
+fn artifact_with(bytes: &[u8], basename: &str, raw_arch: &str) -> Artifact {
+    let metadata = json!({
+        "basename": basename,
+        "sha256": sha256_hex(bytes),
+        "platform": "debian",
+        "platform_version": "13",
+        "arch": raw_arch,
+        "name": "cinc",
+        "version": "19.4.46",
+        "iteration": 1,
+    })
+    .to_string();
+    Artifact::new(
+        &ArtifactContext {
+            channel: "stable".to_string(),
+            project: "cinc".to_string(),
+            version: "19.4.46".to_string(),
+            platform: "debian".to_string(),
+            platform_version: "13".to_string(),
+        },
+        ArtifactInput {
+            basename: basename.to_string(),
+            sha256: sha256_hex(bytes),
+            metadata_json: metadata,
+            platform: "debian".to_string(),
+            platform_version: "13".to_string(),
+            version: "19.4.46".to_string(),
+            iteration: Some("1".to_string()),
+            raw_arch: raw_arch.to_string(),
+        },
+    )
+    .expect("artifact")
 }
 
 /// `sha256:<hex>` of `bytes`.
@@ -547,6 +583,104 @@ async fn missing_tag_is_not_an_error() {
         .unwrap()
         .is_empty());
     assert_eq!(fixture.mock.manifest_put_count(), 0);
+}
+
+#[tokio::test]
+async fn a_crawl_collision_skips_the_conflicting_artifact() {
+    let _env = ENV_LOCK.lock().await;
+    let _github = GithubEnvGuard::clear();
+
+    let state = tempfile::tempdir().expect("state dir");
+    let mock = mock_registry().await;
+
+    // Two raw arches mapping to one public arm64 with different bytes; the
+    // registry holds the first build's manifest under the shared tag.
+    let first = artifact_with(
+        b"the aarch64 build bytes",
+        "cinc_19.4.46-1_aarch64.deb",
+        "aarch64",
+    );
+    let conflicting = artifact_with(
+        b"the arm64 build with different bytes",
+        "cinc_19.4.46-1_arm64.deb",
+        "arm64",
+    );
+    assert_eq!(first.tag(), conflicting.tag());
+    assert_ne!(first.sha256, conflicting.sha256);
+
+    let release_dir = "files/stable/cinc/19.4.46/debian/13";
+    let mut pages = HashMap::new();
+    pages.insert(
+        "files/stable/cinc/".to_string(),
+        listing(&["19.4.46/".to_string()]),
+    );
+    pages.insert(
+        "files/stable/cinc/19.4.46/".to_string(),
+        listing(&["debian/".to_string()]),
+    );
+    pages.insert(
+        "files/stable/cinc/19.4.46/debian/".to_string(),
+        listing(&["13/".to_string()]),
+    );
+    pages.insert(
+        format!("{release_dir}/"),
+        listing(&[
+            "cinc_19.4.46-1_aarch64.deb.metadata.json".to_string(),
+            "cinc_19.4.46-1_arm64.deb.metadata.json".to_string(),
+        ]),
+    );
+    pages.insert(
+        format!("{release_dir}/cinc_19.4.46-1_aarch64.deb.metadata.json"),
+        first.metadata_json.clone(),
+    );
+    pages.insert(
+        format!("{release_dir}/cinc_19.4.46-1_arm64.deb.metadata.json"),
+        conflicting.metadata_json.clone(),
+    );
+    let source = Source::with_fetcher(
+        Arc::new(FakeUpstream { pages }),
+        Url::parse(BASE).expect("base url"),
+    );
+
+    // The registry holds the kept artifact's bytes under the shared tag: if
+    // bootstrap considered the excluded artifact it would report a conflict.
+    let manifest = matching_manifest(&first, b"the aarch64 build bytes");
+    mock.store_manifest(REPO, &first.tag(), &manifest);
+
+    let rsync_root = state.path().join("rsync-target");
+    std::fs::create_dir_all(&rsync_root).expect("rsync root");
+    let mut config = config_with(state.path(), "http://127.0.0.1:9");
+    config.targets = vec![
+        target_config(OCI, TargetKind::Oci),
+        target_config(RSYNC, TargetKind::Rsync),
+    ];
+    let targets = TargetSet::from_targets(vec![
+        Arc::new(oci_target(&mock, OCI)),
+        Arc::new(rsync_target(RSYNC, &rsync_root)),
+    ]);
+    let ledger = Ledger::open(state.path()).expect("ledger");
+    let ctx = context_with(config, scope(), ledger, targets, source);
+
+    let report = bootstrap::run(&ctx).await.expect("bootstrap");
+
+    assert_eq!(
+        report,
+        BootstrapReport {
+            imported: 1,
+            skipped: 0,
+            conflicts: 0,
+        },
+        "the kept artifact is imported and the conflicting one is never resolved"
+    );
+
+    let ledger = ctx.ledger.lock().await;
+    let rows = ledger.artifacts().expect("artifacts");
+    assert_eq!(rows.len(), 1, "only the kept artifact is recorded");
+    assert_eq!(rows[0].artifact.key(), first.key());
+    assert!(ledger
+        .publications_for(&conflicting.key())
+        .expect("publications")
+        .is_empty());
 }
 
 #[tokio::test]

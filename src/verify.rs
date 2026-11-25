@@ -12,6 +12,12 @@
 //! `superseded` is skipped for that target — the canonical reference was
 //! deliberately retired by an acknowledged hash change.
 //!
+//! A row with no publication at all (a pending artifact, or one a tag
+//! collision excluded) has no remote state to compare against: it is not a
+//! remote finding, because reporting it would fail every run until the mirror
+//! publishes it. `--deep` still re-hashes whatever the ledger records as a
+//! local blob.
+//!
 //! # Local blobs
 //!
 //! Without `--deep` only the remote publications are probed. With `--deep` the
@@ -200,18 +206,22 @@ pub async fn run(ctx: &Ctx, opts: VerifyOpts) -> Result<VerifyReport, VerifyErro
         let ledger = ctx.ledger.lock().await;
         ledger.artifacts()?
     };
-    let superseded = {
+    // One pass over every selected target's publications learns two things:
+    // which (artifact, target) pairs were deliberately retired by an
+    // acknowledged hash change, and which artifacts were fanned out at all.
+    let mut retired = HashSet::new();
+    let mut fanned_out = HashSet::new();
+    {
         let ledger = ctx.ledger.lock().await;
-        let mut keys = HashSet::new();
         for target in &targets {
             for publication in ledger.publications(target.name())? {
                 if publication.status == PublicationStatus::Superseded {
-                    keys.insert((publication.artifact_key, publication.target));
+                    retired.insert((publication.artifact_key.clone(), publication.target));
                 }
+                fanned_out.insert(publication.artifact_key);
             }
         }
-        keys
-    };
+    }
     let rows = sample(rows, opts.sample);
 
     let mut report = VerifyReport {
@@ -225,8 +235,14 @@ pub async fn run(ctx: &Ctx, opts: VerifyOpts) -> Result<VerifyReport, VerifyErro
             check_local(ctx, row, &mut report)?;
         }
 
+        // A never-published row is not broken: the mirror simply has not
+        // reached it yet (or a collision excluded it on purpose).
+        if !fanned_out.contains(&artifact.key()) {
+            continue;
+        }
+
         for target in &targets {
-            if superseded.contains(&(artifact.key(), target.name().to_string())) {
+            if retired.contains(&(artifact.key(), target.name().to_string())) {
                 continue;
             }
             report.publications_checked += 1;

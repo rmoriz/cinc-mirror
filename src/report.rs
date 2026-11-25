@@ -26,22 +26,22 @@ pub const EXIT_CONFIG: i32 = 5;
 pub const EXIT_USAGE: i32 = 64;
 
 /// Environment variables whose values must never be printed.
-const TOKEN_ENV: [&str; 2] = ["GHCR_TOKEN", "GITHUB_TOKEN"];
+const TOKEN_ENV: [&str; 3] = ["GHCR_TOKEN", "GITHUB_TOKEN", "RSYNC_PASSWORD"];
 
 /// Hide credentials a diagnostic line may have picked up.
 ///
-/// Errors are formatted from library types rather than raw headers, so the two
+/// Errors are formatted from library types rather than raw headers, so the
 /// realistic leaks are an `Authorization` header value pasted into a message
-/// and a token that a library echoed from its environment. Both are replaced
-/// with `***`; the rest of the message stays readable.
+/// and a token or password that a library echoed from its environment. Both are
+/// replaced with `***`; the rest of the message stays readable.
 #[must_use]
 pub fn redact_secrets(text: &str) -> String {
     let mut redacted = redact_header(text);
 
-    for name in TOKEN_ENV {
-        let Ok(value) = std::env::var(name) else {
+    for (name, value) in std::env::vars() {
+        if !is_secret_env(&name) {
             continue;
-        };
+        }
         let value = value.trim();
         // A short value is far more likely a substring of unrelated text than a
         // credential; replacing it would only corrupt the diagnostic.
@@ -51,6 +51,16 @@ pub fn redact_secrets(text: &str) -> String {
     }
 
     redacted
+}
+
+/// Whether an environment variable's value is a credential.
+///
+/// The mirror hands `RSYNC_PASSWORD` (the rsync daemon password) and
+/// `CINC_MIRROR_<TARGET>_PASSWORD` (basic-auth registry credentials) to child
+/// processes and libraries, so a diagnostic that quotes one must not echo it
+/// back.
+fn is_secret_env(name: &str) -> bool {
+    TOKEN_ENV.contains(&name) || (name.starts_with("CINC_MIRROR_") && name.ends_with("_PASSWORD"))
 }
 
 /// Replace the value of every `Authorization` header occurrence.
@@ -132,6 +142,11 @@ pub struct Summary {
     pub failed: usize,
     /// Incident rows this run created (deduplicated detections are not counted).
     pub incidents_opened: usize,
+    /// Incidents still open after the run, earlier runs' included.
+    ///
+    /// Reported for the operator; only newly opened incidents drive the exit
+    /// code.
+    pub open_incidents: usize,
     /// Bytes actually transferred by the download ladder, resume offset excluded.
     pub bytes_downloaded: u64,
     /// Whether a limit stopped the run with work left in the queue.
@@ -169,7 +184,7 @@ impl Summary {
     pub fn to_text(&self) -> String {
         format!(
             "discovered={} satisfied={} downloaded={} published={} skipped={} failed={} \
-             incidents={} bytes={} exit={}",
+             incidents={} open_incidents={} bytes={} exit={}",
             self.discovered,
             self.satisfied,
             self.downloaded,
@@ -177,6 +192,7 @@ impl Summary {
             self.skipped,
             self.failed,
             self.incidents_opened,
+            self.open_incidents,
             self.bytes_downloaded,
             self.exit_code,
         )
@@ -233,6 +249,7 @@ mod tests {
             skipped: 0,
             failed: 0,
             incidents_opened: 0,
+            open_incidents: 1,
             bytes_downloaded: 2048,
             exit_code: 0,
             ..Summary::default()
@@ -240,10 +257,25 @@ mod tests {
         assert_eq!(
             summary.to_text(),
             "discovered=3 satisfied=1 downloaded=2 published=4 skipped=0 failed=0 \
-             incidents=0 bytes=2048 exit=0"
+             incidents=0 open_incidents=1 bytes=2048 exit=0"
         );
         assert!(summary.to_json().contains("\"published\": 4"));
         assert!(summary.to_json().contains("\"queued\": 2"));
+        assert!(summary.to_json().contains("\"open_incidents\": 1"));
+    }
+
+    #[test]
+    fn open_incidents_do_not_change_the_exit_code() {
+        assert_eq!(
+            Summary {
+                open_incidents: 5,
+                ..Summary::default()
+            }
+            .finish()
+            .exit_code,
+            EXIT_OK,
+            "only newly opened incidents drive the exit code"
+        );
     }
 
     #[test]
@@ -260,5 +292,56 @@ mod tests {
             super::redact_header("authorization is required"),
             "authorization is required"
         );
+    }
+
+    #[test]
+    fn password_environment_names_are_recognised() {
+        for name in [
+            "GHCR_TOKEN",
+            "GITHUB_TOKEN",
+            "RSYNC_PASSWORD",
+            "CINC_MIRROR_GHCR_PASSWORD",
+            "CINC_MIRROR_BACKUP_RSYNC_PASSWORD",
+        ] {
+            assert!(super::is_secret_env(name), "`{name}` must be redacted");
+        }
+        for name in [
+            "CINC_MIRROR_GHCR_USER",
+            "CINC_MIRROR_GHCR_TOKEN",
+            "XRSYNC_PASSWORD",
+            "HOME",
+        ] {
+            assert!(!super::is_secret_env(name), "`{name}` is not a credential");
+        }
+    }
+
+    #[test]
+    fn redaction_hides_rsync_and_mirror_password_values() {
+        /// Restores `name` to its original value when the test ends.
+        struct Restore(&'static str, Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.1.take() {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+
+        let _rsync = Restore("RSYNC_PASSWORD", std::env::var("RSYNC_PASSWORD").ok());
+        let _mirror = Restore(
+            "CINC_MIRROR_TEST_PASSWORD",
+            std::env::var("CINC_MIRROR_TEST_PASSWORD").ok(),
+        );
+        std::env::set_var("RSYNC_PASSWORD", "daemon-password-value");
+        std::env::set_var("CINC_MIRROR_TEST_PASSWORD", "registry-password-value");
+
+        let redacted = super::redact_secrets(
+            "rsync failed with RSYNC_PASSWORD=daemon-password-value and \
+             CINC_MIRROR_TEST_PASSWORD=registry-password-value",
+        );
+        assert!(redacted.contains("***"), "{redacted}");
+        assert!(!redacted.contains("daemon-password-value"), "{redacted}");
+        assert!(!redacted.contains("registry-password-value"), "{redacted}");
     }
 }

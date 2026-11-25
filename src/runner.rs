@@ -12,6 +12,11 @@
 //!   opened and the new bytes are published only under the superseded name;
 //! - a row that is itself `superseded_by` something → skipped.
 //!
+//! A tag collision found while crawling (two raw arches mapping to one public
+//! one, or the same version on two channels) is not a failed run: the kept
+//! artifact flows through the queue, the conflicting one is excluded, and one
+//! deduplicated [`IncidentKind::ArchCollision`] incident is opened per pair.
+//!
 //! Satisfied and terminal rows are removed before ordering, so the queue is a
 //! deterministic function of the ledger and the crawl. `version_desc` is the
 //! default; `smallest_first`/`largest_first` use the size the ledger learned.
@@ -53,12 +58,13 @@ use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::artifact::Artifact;
-use crate::crawl::{self, CrawlError};
+use crate::crawl::{self, CrawlError, TagCollision};
 use crate::ctx::Ctx;
 use crate::hash::ExpectedHashes;
 use crate::incident::{self, IncidentError};
 use crate::ledger::{
-    self, ArtifactRow, Event, EventKind, IncidentKind, Ledger, LedgerError, PublicationStatus,
+    self, ArtifactRow, Event, EventKind, IncidentFilter, IncidentKind, Ledger, LedgerError,
+    PublicationStatus,
 };
 use crate::report::{Summary, EXIT_USAGE};
 use crate::source::metadata::Metadata;
@@ -677,8 +683,7 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
         );
     }
 
-    let candidates = crawl_scope(ctx).await?;
-    crawl::check_tag_collisions(candidates.values().map(|(_, artifact)| artifact))?;
+    let (candidates, collisions) = crawl_scope(ctx).await?;
     let discovered = candidates.len();
 
     let snapshot = {
@@ -688,7 +693,9 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
 
     let mut queue = Vec::new();
     let mut satisfied = 0;
-    let mut skipped = 0;
+    // A collision's conflicting artifact is excluded from the queue before
+    // classification; it is still a deliberate skip the summary must show.
+    let mut skipped = collisions.len();
     let mut satisfied_gc = Vec::new();
 
     for (policy_index, artifact) in candidates.into_values() {
@@ -734,9 +741,20 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
             satisfied,
             skipped,
             queued: queue.len(),
+            open_incidents: open_incident_count(ctx).await?,
             ..Summary::default()
         }
         .finish());
+    }
+
+    // A collision is an upstream anomaly, not a reason to stop the run: open
+    // one deduplicated incident per collision and keep the kept artifacts
+    // flowing through the queue.
+    let mut collision_incidents = 0;
+    for collision in &collisions {
+        if open_collision_incident(ctx, &seq, collision).await? {
+            collision_incidents += 1;
+        }
     }
 
     queue.sort_by(|left, right| compare(left, right, opts.order));
@@ -825,6 +843,7 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
         summary.incidents_opened += report.incidents;
         summary.bytes_downloaded = summary.bytes_downloaded.saturating_add(report.bytes);
     }
+    summary.incidents_opened += collision_incidents;
     // A capped run stops with work left, so its last artifact is a valid resume
     // point. An uncapped run has nothing to resume.
     summary.capped = reports.len() < queue.len();
@@ -832,6 +851,9 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
         summary.last_version = reports.last().map(|report| report.version.clone());
         summary.last_artifact_key = reports.last().map(|report| report.key.clone());
     }
+    // Incidents opened by earlier runs still need a human; the summary names
+    // them without changing the exit-code rule.
+    summary.open_incidents = open_incident_count(ctx).await?;
     let summary = summary.finish();
 
     if opts.gc_after {
@@ -881,17 +903,97 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
 }
 
 /// Crawl every selected policy into a keyed candidate map, preserving the
-/// configuration order for tie-breaking.
-async fn crawl_scope(ctx: &Ctx) -> Result<BTreeMap<String, (usize, Artifact)>, RunError> {
+/// configuration order for tie-breaking, plus every tag collision found on
+/// the way.
+///
+/// Two policies can still bring the same descriptive tag with different bytes
+/// (the same version number on two channels); the merged candidate set gets its
+/// own collision pass and the conflicting artifacts are excluded exactly like
+/// the ones a single crawl reported.
+async fn crawl_scope(
+    ctx: &Ctx,
+) -> Result<(BTreeMap<String, (usize, Artifact)>, Vec<TagCollision>), RunError> {
     let mut candidates = BTreeMap::new();
+    let mut collisions = Vec::new();
     for (index, policy) in ctx.scope.policies.iter().enumerate() {
-        for artifact in crawl::crawl(&ctx.source, policy).await? {
+        let outcome = crawl::crawl(&ctx.source, policy).await?;
+        for artifact in outcome.artifacts {
             candidates
                 .entry(artifact.key())
                 .or_insert((index, artifact));
         }
+        collisions.extend(outcome.collisions);
     }
-    Ok(candidates)
+    for collision in
+        crawl::collect_tag_collisions(candidates.values().map(|(_, artifact)| artifact))
+    {
+        candidates.remove(&collision.conflicting.key());
+        collisions.push(collision);
+    }
+    Ok((candidates, crawl::dedup_collisions(collisions)))
+}
+
+/// How many incidents are still open, including the ones earlier runs opened.
+async fn open_incident_count(ctx: &Ctx) -> Result<usize, RunError> {
+    let ledger = ctx.ledger.lock().await;
+    let incidents = ledger.incidents(IncidentFilter::open())?;
+    let count = incidents.len();
+    Ok(count)
+}
+
+/// Open the deduplicated arch-collision incident for one crawl collision.
+///
+/// The incident names the excluded artifact with the kept artifact's digest as
+/// the old value, so a human sees exactly which pair of upstream files maps to
+/// one public reference. The excluded artifact is recorded as seen first — the
+/// incident must name a row the ledger knows. Returns whether the incident was
+/// newly opened; a later run's detection is deduplicated and only reported.
+async fn open_collision_incident(
+    ctx: &Ctx,
+    seq: &Seq,
+    collision: &TagCollision,
+) -> Result<bool, RunError> {
+    let mut ledger = ctx.ledger.lock().await;
+    let id = ledger::incident_id(
+        IncidentKind::ArchCollision,
+        Some(&collision.conflicting.key()),
+        Some(&collision.first.sha256),
+        Some(&collision.conflicting.sha256),
+    );
+    if ledger.incident(&id)?.is_some() {
+        tracing::warn!(
+            tag = %collision.tag,
+            conflicting = %collision.conflicting.key(),
+            "tag collision already has an open incident; keeping the first artifact"
+        );
+        return Ok(false);
+    }
+
+    if ledger.artifact(&collision.conflicting.key())?.is_none() {
+        let event = Event::new(
+            ctx.run_id.clone(),
+            seq.next(),
+            Utc::now(),
+            EventKind::ArtifactSeen,
+        )
+        .with_artifact(collision.conflicting.key())
+        .with_detail(json!({
+            "artifact": ledger::artifact_detail(&collision.conflicting),
+            "upstream_path": collision.conflicting.rsync_relpath(),
+            "metadata": serde_json::from_str::<Value>(&collision.conflicting.metadata_json)
+                .unwrap_or(Value::Null),
+        }));
+        ledger.append(&event)?;
+    }
+    incident::open(
+        &mut ledger,
+        ctx.config.as_ref(),
+        &collision.conflicting,
+        &collision.first.sha256,
+        IncidentKind::ArchCollision,
+    )
+    .await?;
+    Ok(true)
 }
 
 fn classify(snapshot: &Snapshot, artifact: &Artifact, targets: &[String]) -> Classification {
@@ -1018,8 +1120,9 @@ async fn recover_interrupted(ctx: &Ctx, seq: &Seq, targets: &[String]) -> Result
 /// Delete blobs that this run or a previous one published everywhere.
 ///
 /// A blob stays when any target failed, when a queued artifact shares its
-/// digest and was not finished, or when a superseded row still refers to it:
-/// the old bytes have to survive for an acknowledged republish.
+/// digest and was not finished, when a superseded row still refers to it, or
+/// when an open incident names it as a replacement: `ack --republish` needs
+/// those bytes locally, so they survive until the incident is acknowledged.
 async fn collect_garbage(
     ctx: &Ctx,
     seq: &Seq,
@@ -1039,6 +1142,14 @@ async fn collect_garbage(
             if row.superseded_by.is_some() {
                 blocked.insert(row.artifact.sha256.clone());
             }
+        }
+    }
+    // A hash change publishes the replacement under the superseded name; the
+    // incident keeps it addressable for `ack --republish`, which needs the
+    // blob in the local store.
+    for incident in ctx.ledger.lock().await.incidents(IncidentFilter::open())? {
+        if let Some(sha256) = incident.new_sha256 {
+            blocked.insert(sha256);
         }
     }
 

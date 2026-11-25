@@ -65,6 +65,13 @@ impl Spec {
         }
     }
 
+    /// Publish this package under a different raw architecture, so two specs
+    /// can share a directory (the arch collision case).
+    fn with_raw_arch(mut self, arch: &str) -> Self {
+        self.arch = arch.to_string();
+        self
+    }
+
     fn upstream_path(&self) -> String {
         format!(
             "stable/cinc/{}/{}/{}/{}",
@@ -1165,6 +1172,133 @@ async fn a_tag_that_already_holds_other_bytes_opens_a_conflict_incident() {
     assert_eq!(incidents[0].kind, IncidentKind::TagConflict);
 }
 
+#[tokio::test]
+async fn an_arch_collision_opens_one_incident_and_the_run_continues() {
+    clear_security_env();
+    let dir = TempDir::new().expect("state dir");
+    // Two raw arches mapping to one public arm64 with different bytes, plus an
+    // unrelated package that must still be processed.
+    let kept = Spec::new(
+        "19.4.46",
+        "cinc_19.4.46-1_aarch64.deb",
+        b"the aarch64 build",
+    )
+    .with_raw_arch("aarch64");
+    let conflicting = Spec::new(
+        "19.4.46",
+        "cinc_19.4.46-1_arm64.deb",
+        b"the arm64 build with different bytes",
+    )
+    .with_raw_arch("arm64");
+    let other = Spec::new(
+        "19.3.14",
+        "cinc_19.3.14-1_amd64.deb",
+        b"an unrelated package",
+    );
+
+    let specs = [kept.clone(), conflicting.clone(), other.clone()];
+    let fixture = Fixture::new(dir.path(), &specs, &["t1"], 1, 1);
+    let target = Arc::clone(&fixture.targets[0]);
+    let payload = Arc::clone(&fixture.payload);
+    let ctx = fixture.ctx("run-1");
+
+    let summary = run(&ctx, RunOpts::default()).await.expect("run");
+
+    let kept_artifact = artifact_of(&kept);
+    let conflicting_artifact = artifact_of(&conflicting);
+    let other_artifact = artifact_of(&other);
+
+    // One newly opened incident drives exit code 3; the kept artifact and the
+    // unrelated one are still published.
+    assert_eq!(summary.incidents_opened, 1, "{summary:?}");
+    assert_eq!(summary.exit_code, 3, "{summary:?}");
+    assert_eq!(summary.skipped, 1, "the conflicting artifact is excluded");
+    assert_eq!(summary.discovered, 2, "{summary:?}");
+    assert_eq!(summary.downloaded, 2, "{summary:?}");
+    assert_eq!(summary.published, 2, "{summary:?}");
+    assert_eq!(summary.open_incidents, 1, "{summary:?}");
+    assert_eq!(
+        target.owner(&kept_artifact.tag()),
+        Some(kept_artifact.sha256.clone()),
+        "the first artifact owns the descriptive tag"
+    );
+    assert_eq!(
+        target.owner(&other_artifact.tag()),
+        Some(other_artifact.sha256.clone()),
+        "other artifacts are still processed"
+    );
+    assert!(
+        target
+            .puts()
+            .iter()
+            .all(|record| record.sha256 != conflicting_artifact.sha256),
+        "the conflicting artifact is never published: {:?}",
+        target.puts()
+    );
+    assert_eq!(
+        payload.calls(),
+        2,
+        "the conflicting artifact is never downloaded either"
+    );
+
+    {
+        let ledger = ctx.ledger.lock().await;
+        let incidents = ledger.incidents(IncidentFilter::open()).expect("incidents");
+        assert_eq!(incidents.len(), 1);
+        let incident = &incidents[0];
+        assert_eq!(incident.kind, IncidentKind::ArchCollision);
+        assert_eq!(
+            incident.artifact_key.as_deref(),
+            Some(conflicting_artifact.key().as_str()),
+            "the incident names the excluded artifact"
+        );
+        assert_eq!(
+            incident.old_sha256.as_deref(),
+            Some(kept_artifact.sha256.as_str()),
+            "the kept artifact's digest is the old value"
+        );
+        assert_eq!(
+            incident.new_sha256.as_deref(),
+            Some(conflicting_artifact.sha256.as_str())
+        );
+        // The excluded artifact is recorded as seen so the incident can name
+        // it, but it never reaches a publication row.
+        assert!(ledger
+            .artifact(&conflicting_artifact.key())
+            .expect("row")
+            .is_some());
+        assert!(ledger
+            .publications_for(&conflicting_artifact.key())
+            .expect("publications")
+            .is_empty());
+    }
+
+    // A later run sees the same collision but the incident is deduplicated:
+    // no new incident, exit 0, and no bytes move.
+    let repeat_fixture = Fixture::new(dir.path(), &specs, &["t1"], 1, 1);
+    let repeat_payload = Arc::clone(&repeat_fixture.payload);
+    let repeat_target = Arc::clone(&repeat_fixture.targets[0]);
+    let repeat_ctx = repeat_fixture.ctx("run-2");
+    let repeat = run(&repeat_ctx, RunOpts::default())
+        .await
+        .expect("repeat run");
+
+    assert_eq!(repeat.incidents_opened, 0, "{repeat:?}");
+    assert_eq!(repeat.exit_code, 0, "{repeat:?}");
+    assert_eq!(repeat.satisfied, 2, "{repeat:?}");
+    assert_eq!(repeat.skipped, 1, "{repeat:?}");
+    assert_eq!(
+        repeat.open_incidents, 1,
+        "the still-open incident stays visible without failing the run"
+    );
+    assert_eq!(
+        repeat_payload.calls(),
+        0,
+        "a satisfied queue downloads nothing"
+    );
+    assert!(repeat_target.puts().is_empty());
+}
+
 // Concurrency, pacing and dry runs --------------------------------------------
 
 #[tokio::test]
@@ -1394,6 +1528,103 @@ async fn gc_after_keeps_the_blob_when_a_target_failed() {
     );
 }
 
+#[tokio::test]
+async fn gc_after_keeps_the_replacement_blob_until_the_incident_is_acked() {
+    clear_security_env();
+    let dir = TempDir::new().expect("state dir");
+    let first = one_package();
+    let second = Spec::new(
+        "19.4.46",
+        &first.basename,
+        b"replacement bytes for the same upstream path",
+    );
+
+    // Run 1 publishes the original bytes everywhere.
+    let first_fixture = Fixture::new(dir.path(), std::slice::from_ref(&first), &["t1"], 1, 1);
+    let first_ctx = first_fixture.ctx("run-1");
+    run(&first_ctx, RunOpts::default())
+        .await
+        .expect("first run");
+
+    // Upstream replaces the bytes; the run opens a hash-change incident,
+    // publishes the replacement under the superseded name and runs gc.
+    let change_fixture = Fixture::new(dir.path(), std::slice::from_ref(&second), &["t1"], 1, 1);
+    let change_config = Arc::clone(&change_fixture.config);
+    let change_targets = change_fixture.targets.clone();
+    let change_ctx = change_fixture.ctx("run-2");
+    let change = run(
+        &change_ctx,
+        RunOpts {
+            gc_after: true,
+            ..RunOpts::default()
+        },
+    )
+    .await
+    .expect("change run");
+
+    let old = artifact_of(&first);
+    let new = artifact_of(&second);
+    assert_eq!(change.incidents_opened, 1);
+    assert!(change_ctx.store.has(&new.sha256));
+
+    let incident = {
+        let ledger = change_ctx.ledger.lock().await;
+        let incidents = ledger.incidents(IncidentFilter::open()).expect("incidents");
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].kind, IncidentKind::HashChanged);
+        incidents[0].id.clone()
+    };
+
+    // The replacement blob survives --gc-after precisely so that the
+    // acknowledgement can republish it; without it the incident would dead-end.
+    assert!(
+        change_ctx.store.has(&old.sha256),
+        "the superseded blob stays for the acknowledged republish"
+    );
+    assert!(
+        change_ctx.store.has(&new.sha256),
+        "the replacement blob survives --gc-after while the incident is open"
+    );
+
+    // `ack --republish` needs the replacement locally and succeeds.
+    let mut ledger = change_ctx.ledger.into_inner();
+    let targets = TargetSet::from_targets(
+        change_targets
+            .into_iter()
+            .map(|target| target as Arc<dyn Target>)
+            .collect(),
+    );
+    cinc_mirror::incident::ack(
+        &mut ledger,
+        &targets,
+        &change_config,
+        &incident,
+        Some("replacement verified"),
+        true,
+    )
+    .await
+    .expect("ack --republish");
+
+    let acked = cinc_mirror::incident::show(&ledger, &incident).expect("incident");
+    assert_eq!(acked.state, cinc_mirror::ledger::IncidentState::Acked);
+    assert_eq!(
+        ledger
+            .publication(&old.key(), "t1")
+            .expect("old publication")
+            .expect("row")
+            .status,
+        PublicationStatus::Superseded
+    );
+    assert_eq!(
+        ledger
+            .publication(&new.key(), "t1")
+            .expect("new publication")
+            .expect("row")
+            .status,
+        PublicationStatus::Published
+    );
+}
+
 // Real targets ----------------------------------------------------------------
 
 #[tokio::test]
@@ -1452,11 +1683,7 @@ async fn fans_out_to_the_oci_registry_and_a_local_rsync_directory() {
         std::fs::read(&published).expect("rsync package"),
         package.body
     );
-    let metadata = rsync_root
-        .join(artifact.rsync_relpath())
-        .parent()
-        .expect("directory")
-        .join("metadata.json");
+    let metadata = rsync_root.join(format!("{}.metadata.json", artifact.rsync_relpath()));
     assert_eq!(
         std::fs::read_to_string(&metadata).expect("rsync metadata"),
         metadata_json(&package)

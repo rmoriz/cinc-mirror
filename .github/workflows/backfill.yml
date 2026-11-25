@@ -1,9 +1,11 @@
 name: backfill
 
 # The only workflow that talks to the live CINC upstream and GHCR. It runs a
-# bounded slice of the mirror every six hours; the ledger cursor records how far
-# the last run got, so the next scheduled run simply continues from there. No
-# run redispatches itself.
+# bounded slice of `mirror` every six hours. `mirror` resumes through the
+# ledger: artifacts whose rows are already published everywhere are classified
+# as satisfied, so the next scheduled run simply continues with what is left.
+# (The resume cursor is a `backfill`-mode feature; this workflow runs plain
+# `mirror` and does not use it.) No run redispatches itself.
 on:
   schedule:
     # Every six hours, off the hour so the job does not compete with the
@@ -76,14 +78,13 @@ jobs:
             --gc-after \
             --allow-unleased
 
-      - name: Collect plan and run events
+      - name: Collect run events
         if: always()
         run: |
           mkdir -p artifacts
-          cp -v "$HOME"/.local/state/cinc-mirror/plan-*.json artifacts/ 2>/dev/null || true
           cp -v "$HOME"/.local/state/cinc-mirror/ledger-repo/runs/*.ndjson artifacts/ 2>/dev/null || true
 
-      - name: Upload plan and run events
+      - name: Upload run events
         if: always()
         uses: actions/upload-artifact@v4
         with:

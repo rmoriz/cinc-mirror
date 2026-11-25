@@ -16,14 +16,19 @@
 //! ```text
 //! <base>/<channel>/<project>/<version>/<platform>/<platform_version>/
 //!     <basename>
-//!     metadata.json
+//!     <basename>.metadata.json
 //!     <basename>.sha256
 //! ```
 //!
-//! `metadata.json` carries the exact upstream document. The sidecar contains
-//! `<sha256>  <size>\n` and is uploaded **last**, so its presence is the commit
-//! marker: an interrupted run leaves a package without a sidecar, which the next
-//! run republishes.
+//! The metadata document is per package, exactly as upstream publishes its
+//! `*.metadata.json` files: one platform_version directory holds several
+//! architectures and builds, so a shared `metadata.json` would be overwritten
+//! by every publication of the directory. A superseded artifact's companion
+//! keeps the suffix (`<basename>.superseded-<sha12>.metadata.json`), so
+//! preserving the old bytes never touches the canonical metadata. The
+//! sidecar contains `<sha256>  <size>\n` and is uploaded **last**, so its
+//! presence is the commit marker: an interrupted run leaves a package without
+//! a sidecar, which the next run republishes.
 //!
 //! # Atomicity
 //!
@@ -62,8 +67,15 @@ use super::{PutOutcome, Target, TargetError};
 /// Sidecar suffix appended to the package basename.
 const SIDECAR_SUFFIX: &str = ".sha256";
 
-/// File name of the upstream metadata document next to the package.
+/// Staging file name for the metadata document during an upload.
+///
+/// The destination name is always the per-package
+/// `<basename>.metadata.json`; this is only the local temporary copy handed to
+/// rsync.
 const METADATA_NAME: &str = "metadata.json";
+
+/// Suffix of the metadata document a package carries, mirroring upstream.
+const METADATA_SUFFIX: &str = ".metadata.json";
 
 /// Where a rsync target lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,24 +276,22 @@ impl RsyncTarget {
 
     /// The path of the metadata document that belongs to `artifact`.
     ///
-    /// The canonical artifact keeps the historical `metadata.json`. A
-    /// superseded artifact gets a companion file next to its suffixed package,
-    /// so publishing the replacement cannot overwrite the canonical metadata.
+    /// Both the canonical and the superseded artifact get a per-package
+    /// companion next to their package file, exactly like upstream's
+    /// `*.metadata.json`: one directory holds several packages, so a shared
+    /// document would be overwritten by every publication.
     fn metadata_relpath(&self, artifact: &Artifact) -> String {
-        if artifact.superseded {
-            self.superseded_metadata_relpath(artifact)
-        } else {
-            self.canonical_metadata_relpath(artifact)
-        }
+        format!("{}{METADATA_SUFFIX}", self.reference_relpath(artifact))
     }
 
+    /// The metadata companion of the canonical package.
     fn canonical_metadata_relpath(&self, artifact: &Artifact) -> String {
-        let directory = directory_of(&artifact.rsync_relpath());
-        format!("{directory}/{METADATA_NAME}")
+        format!("{}{METADATA_SUFFIX}", artifact.rsync_relpath())
     }
 
+    /// The metadata companion of a superseded package.
     fn superseded_metadata_relpath(&self, artifact: &Artifact) -> String {
-        format!("{}.metadata.json", artifact.rsync_superseded_relpath())
+        format!("{}{METADATA_SUFFIX}", artifact.rsync_superseded_relpath())
     }
 
     /// Copy one destination-relative path to another without touching the

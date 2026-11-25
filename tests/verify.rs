@@ -167,6 +167,59 @@ async fn verify_checks_every_target_by_default() {
 }
 
 #[tokio::test]
+async fn a_pending_artifact_is_not_a_remote_finding() {
+    let state = tempfile::tempdir().expect("state dir");
+    let mut ledger = Ledger::open(state.path()).expect("ledger");
+    let root = tempfile::tempdir().expect("rsync root");
+
+    // Seen upstream and verified locally, but never fanned out: there is no
+    // publication whose remote state could be compared.
+    let package = b"a package the mirror has not published yet".to_vec();
+    let artifact = package_artifact(&package, "19.4.46");
+    seed_artifact(&mut ledger, &artifact, Some(package.len() as u64));
+    store_blob(state.path(), &package);
+
+    let targets = || TargetSet::from_targets(vec![Arc::new(rsync_target("rsync", root.path()))]);
+    let ctx = context(state.path(), ledger, targets(), source_with(Vec::new()));
+
+    let report = verify::run(&ctx, VerifyOpts::default())
+        .await
+        .expect("verify");
+    assert!(
+        report.is_clean(),
+        "a never-published row is not broken: {report}"
+    );
+    assert_eq!(
+        report.publications_checked, 0,
+        "nothing is probed without a publication row"
+    );
+
+    // A deep verify still re-hashes the local copy the ledger promises.
+    let deep = verify::run(
+        &ctx,
+        VerifyOpts {
+            deep: true,
+            ..VerifyOpts::default()
+        },
+    )
+    .await
+    .expect("deep verify");
+    assert!(deep.is_clean(), "{deep}");
+    assert_eq!(deep.artifacts_checked, 1);
+
+    // Once the mirror records a publication, the row becomes checkable.
+    let mut ledger = ctx.ledger.into_inner();
+    seed_published(&mut ledger, &artifact, "rsync", 1);
+    let ctx_after = context(state.path(), ledger, targets(), source_with(Vec::new()));
+    let after = verify::run(&ctx_after, VerifyOpts::default())
+        .await
+        .expect("verify after publishing");
+    assert_eq!(after.publications_checked, 1, "{after}");
+    assert_eq!(after.findings.len(), 1, "{after}");
+    assert_eq!(after.findings[0].kind, FindingKind::Remote);
+}
+
+#[tokio::test]
 async fn verify_ignores_current_policy_narrowing() {
     let state = tempfile::tempdir().expect("state dir");
     let mut ledger = Ledger::open(state.path()).expect("ledger");

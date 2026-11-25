@@ -20,7 +20,7 @@ use thiserror::Error;
 
 use crate::artifact::Artifact;
 use crate::config::Config;
-use crate::crawl::{check_tag_collisions, crawl, CrawlError};
+use crate::crawl::{collect_tag_collisions, crawl, dedup_collisions, CrawlError, TagCollision};
 use crate::fsutil::free_bytes;
 use crate::scope::{ResolvedPolicy, ResolvedScope};
 use crate::source::{Source, SourceError};
@@ -61,6 +61,9 @@ pub struct Plan {
     pub total_bytes: u64,
     /// Bytes of artifacts the caller reported as satisfied.
     pub satisfied_bytes: u64,
+    /// Tag collisions the crawl reported. The conflicting artifacts are
+    /// excluded from every count; `mirror` opens an incident for each.
+    pub collisions: usize,
     /// Totals per project.
     pub by_project: BTreeMap<String, GroupTotals>,
     /// Totals per platform.
@@ -117,7 +120,7 @@ impl Plan {
 ///
 /// # Errors
 ///
-/// Returns [`PlanError::Crawl`] when the crawl or a tag check fails,
+/// Returns [`PlanError::Crawl`] when the crawl fails,
 /// [`PlanError::Sizes`] when a directory listing needed for sizes fails, and
 /// [`PlanError::Bandwidth`] when `max_bandwidth` cannot be parsed.
 pub async fn build(
@@ -127,12 +130,22 @@ pub async fn build(
     satisfied: &HashSet<String>,
 ) -> Result<Plan, PlanError> {
     let mut candidates: BTreeMap<String, Artifact> = BTreeMap::new();
+    let mut collisions: Vec<TagCollision> = Vec::new();
     for policy in &scope.policies {
-        for artifact in crawl(source, policy).await? {
+        let outcome = crawl(source, policy).await?;
+        for artifact in outcome.artifacts {
             candidates.entry(artifact.key()).or_insert(artifact);
         }
+        collisions.extend(outcome.collisions);
     }
-    check_tag_collisions(candidates.values())?;
+    // The same version number on two channels can produce one descriptive tag
+    // with different bytes; keep the first candidate and report the other like
+    // a crawl collision.
+    for collision in collect_tag_collisions(candidates.values()) {
+        candidates.remove(&collision.conflicting.key());
+        collisions.push(collision);
+    }
+    let collisions = dedup_collisions(collisions);
 
     let mut directories: BTreeMap<String, Vec<&Artifact>> = BTreeMap::new();
     for artifact in candidates.values() {
@@ -163,6 +176,7 @@ pub async fn build(
         artifacts: 0,
         total_bytes: 0,
         satisfied_bytes: 0,
+        collisions: collisions.len(),
         by_project: BTreeMap::new(),
         by_platform: BTreeMap::new(),
         by_arch: BTreeMap::new(),

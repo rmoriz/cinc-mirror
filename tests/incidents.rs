@@ -569,10 +569,7 @@ async fn new_bytes_are_published_only_under_the_superseded_rsync_name() {
 
     let canonical_metadata = rsync_root
         .path()
-        .join(old.rsync_relpath())
-        .parent()
-        .expect("canonical directory")
-        .join("metadata.json");
+        .join(format!("{}.metadata.json", old.rsync_relpath()));
     assert_eq!(
         std::fs::read_to_string(canonical_metadata).expect("canonical metadata"),
         old.metadata_json,
@@ -773,10 +770,7 @@ async fn ack_with_republish_moves_tag_and_marks_old_publications_superseded() {
 
     let canonical_metadata = rsync_root
         .path()
-        .join(new.rsync_relpath())
-        .parent()
-        .expect("canonical directory")
-        .join("metadata.json");
+        .join(format!("{}.metadata.json", new.rsync_relpath()));
     assert_eq!(
         std::fs::read_to_string(canonical_metadata).expect("canonical metadata"),
         new.metadata_json,
@@ -892,11 +886,7 @@ async fn preservation_failure_leaves_canonical_rsync_files_untouched() {
             old_bytes,
             "the canonical package is untouched when preservation fails"
         );
-        let metadata = root
-            .join(old.rsync_relpath())
-            .parent()
-            .expect("canonical directory")
-            .join("metadata.json");
+        let metadata = root.join(format!("{}.metadata.json", old.rsync_relpath()));
         assert_eq!(
             std::fs::read_to_string(metadata).expect("canonical metadata"),
             old.metadata_json,

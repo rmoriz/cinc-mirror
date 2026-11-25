@@ -156,7 +156,8 @@ never contains package bytes. Do not hand-edit it; the binary commits and pushes
 each run.
 
 Because the ledger also persists the backfill cursor, an interrupted or bounded
-run continues where it stopped on the next invocation.
+`backfill` run continues where it stopped on the next invocation; a plain
+`mirror` needs no cursor, because its rows already tell it what is satisfied.
 
 ## Immutability policy
 
@@ -178,9 +179,12 @@ live upstream, a registry or GHCR.
 `.github/workflows/backfill.yml` is the only workflow that talks to the live
 CINC upstream and GHCR. It runs every six hours, and can also be started with
 `workflow_dispatch` or a `backfill` `repository_dispatch`. Each run is bounded
-(`--limit 50 --limit-bytes 8GiB`); the ledger cursor carries the position into
-the next run, so the workflow does not redispatch itself. The concurrency group
-`cinc-mirror` serialises runs instead of cancelling one mid-publication.
+(`--limit 50 --limit-bytes 8GiB`); `mirror` resumes through the ledger — the
+next run classifies already-published artifacts as satisfied and continues
+with what is left, so the workflow does not redispatch itself. (The resume
+cursor applies to `backfill` mode, which this workflow does not use.) The
+concurrency group `cinc-mirror` serialises runs instead of cancelling one
+mid-publication.
 
 ## Windows
 

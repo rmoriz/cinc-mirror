@@ -37,7 +37,7 @@ pub use config::{
     Config, ConfigError, IncidentConfig, LedgerConfig, ProjectPolicy, Selection, TargetAuth,
     TargetConfig, TargetKind, TransportKind,
 };
-pub use crawl::{crawl, CrawlError};
+pub use crawl::{crawl, CrawlError, CrawlOutcome, TagCollision};
 pub use ctx::Ctx;
 pub use hash::{hash_file, hash_reader, ExpectedHashes, Hasher, Hashes, VerifyOutcome};
 pub use ledger::{

@@ -447,6 +447,11 @@ impl Drop for LeaseGuard {
 }
 
 /// Take the lease when the command writes.
+///
+/// `--allow-unleased` only forgives a lease remote that cannot be reached:
+/// the run then proceeds unleased and says so. A live foreign lease is never
+/// downgraded — the flag cannot bypass the holder, so [`LeaseError::Busy`]
+/// always stops the command with exit code `4`.
 async fn acquire_lease(
     env: &LedgerEnv,
     run_id: &str,
@@ -458,10 +463,7 @@ async fn acquire_lease(
     match Lease::acquire(store, run_id, LEASE_TTL) {
         Ok(Some(lease)) => Ok(Some(LeaseGuard::start(lease))),
         Ok(None) => Ok(None),
-        Err(error @ LeaseError::Busy { .. }) if allow_unleased => {
-            tracing::warn!(%error, "continuing without the ledger lease");
-            Ok(None)
-        }
+        Err(error @ LeaseError::Busy { .. }) => Err(error.into()),
         Err(error) if allow_unleased => {
             tracing::warn!(%error, "continuing without the ledger lease");
             Ok(None)
@@ -1031,6 +1033,13 @@ fn print_plan(estimate: &Plan, by: PlanGrouping) {
         human_bytes(estimate.satisfied_bytes),
         human_bytes(to_fetch)
     );
+
+    if estimate.collisions > 0 {
+        println!(
+            "collisions: {} (excluded above; mirror opens an incident for each)",
+            estimate.collisions
+        );
+    }
 
     let (label, groups) = match by {
         PlanGrouping::Project => ("project", &estimate.by_project),

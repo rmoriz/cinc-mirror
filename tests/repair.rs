@@ -45,8 +45,7 @@ fn remove_remote(root: &Path, artifact: &Artifact) {
     let path = root.join(&relpath);
     fs::remove_file(&path).expect("remove remote package");
     fs::remove_file(root.join(format!("{relpath}.sha256"))).expect("remove remote sidecar");
-    let directory = path.parent().expect("canonical directory");
-    fs::remove_file(directory.join("metadata.json")).expect("remove remote metadata");
+    fs::remove_file(root.join(format!("{relpath}.metadata.json"))).expect("remove remote metadata");
 }
 
 /// Commit `bytes` and record it as the local blob of `artifact`.

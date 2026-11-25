@@ -297,16 +297,16 @@ fn lease_busy_exits_4() {
         .code(4)
         .stderr(predicate::str::contains("busy"));
 
-    // `--allow-unleased` continues past a live foreign lease; with no enabled
-    // target the run then fails as configuration, never as lease-busy.
+    // `--allow-unleased` only forgives an unreachable ledger remote: a live
+    // foreign lease still refuses the run.
     binary()
         .arg("--config")
         .arg(&config)
         .args(["mirror", "--everything", "--allow-unleased"])
         .assert()
-        .code(5);
+        .code(4)
+        .stderr(predicate::str::contains("busy"));
 
-    // With the flag the ack proceeds and then fails on the unknown incident.
     binary()
         .arg("--config")
         .arg(&config)
@@ -317,9 +317,44 @@ fn lease_busy_exits_4() {
             "--allow-unleased",
         ])
         .assert()
-        .code(64);
+        .code(4)
+        .stderr(predicate::str::contains("busy"));
 
     held.release().expect("release");
+}
+
+#[test]
+fn allow_unleased_continues_past_an_unreachable_ledger_remote() {
+    let root = tempfile::tempdir().expect("root");
+    let state = root.path().join("state");
+    // A remote path that does not exist: every git operation fails fast and
+    // nothing leaves the machine.
+    let missing = root.path().join("no-such-ledger.git");
+    let config = write_config(root.path(), &state, &missing.to_string_lossy(), "");
+
+    // Without the flag, the unreachable remote is a configuration failure.
+    binary()
+        .arg("--config")
+        .arg(&config)
+        .args(["mirror", "--everything"])
+        .assert()
+        .code(5)
+        .stderr(predicate::str::contains("cannot sync the ledger branch"));
+
+    // With the flag the run proceeds unleased and says so; it only fails on
+    // the missing targets, proving the remote failure was downgraded.
+    binary()
+        .arg("--config")
+        .arg(&config)
+        .args(["mirror", "--everything", "--allow-unleased"])
+        .assert()
+        .code(5)
+        .stderr(predicate::str::contains(
+            "continuing without the ledger remote",
+        ))
+        .stderr(predicate::str::contains(
+            "no publication targets are enabled",
+        ));
 }
 
 #[test]

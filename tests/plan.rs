@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use cinc_mirror::config::{Config, ProjectPolicy, TargetAuth, TargetConfig, TargetKind};
-use cinc_mirror::crawl::{crawl, CrawlError};
+use cinc_mirror::crawl::crawl;
 use cinc_mirror::plan::build;
 use cinc_mirror::source::size::parse_mlsd;
 use cinc_mirror::source::{Fetched, Fetcher, Source, SourceError};
@@ -434,11 +434,15 @@ async fn crawl_orders_versions_platforms_arches_and_basenames() {
     let source = source_over(fixture());
     let config = config(std::path::Path::new("/tmp"), "0");
 
-    let artifacts = crawl(&source, &scope(&config).policies[0])
+    let outcome = crawl(&source, &scope(&config).policies[0])
         .await
         .expect("crawl");
 
-    let keys: Vec<String> = artifacts.iter().map(|artifact| artifact.key()).collect();
+    let keys: Vec<String> = outcome
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.key())
+        .collect();
     assert_eq!(
         keys,
         vec![
@@ -449,8 +453,13 @@ async fn crawl_orders_versions_platforms_arches_and_basenames() {
         ],
         "order is version descending, then platform, platform_version, arch, basename"
     );
+    assert!(
+        outcome.collisions.is_empty(),
+        "the fixture has no tag collisions: {:?}",
+        outcome.collisions
+    );
     assert_eq!(
-        artifacts[0].metadata_json,
+        outcome.artifacts[0].metadata_json,
         metadata(
             "cinc_19.4.46-1_amd64.deb",
             SHA_A,
@@ -464,7 +473,7 @@ async fn crawl_orders_versions_platforms_arches_and_basenames() {
 }
 
 #[tokio::test]
-async fn crawl_refuses_two_digests_under_one_tag() {
+async fn crawl_reports_two_digests_under_one_tag_as_a_collision() {
     let mut pages = HashMap::new();
     let js = |name: &str| format!("files/stable/cinc/19.4.46/debian/13/{name}.metadata.json");
     pages.insert("files/stable/cinc/".to_string(), listing(&["19.4.46/"]));
@@ -510,14 +519,98 @@ async fn crawl_refuses_two_digests_under_one_tag() {
 
     let source = source_over(FakeUpstream::new(pages, HashMap::new()));
     let config = config(std::path::Path::new("/tmp"), "0");
-    let error = crawl(&source, &scope(&config).policies[0])
+    let outcome = crawl(&source, &scope(&config).policies[0])
         .await
-        .expect_err("two digests under one tag must be refused");
+        .expect("a collision is collected, not an error");
 
-    assert!(
-        matches!(error, CrawlError::TagCollision { .. }),
-        "unexpected error: {error:?}"
+    // `cinc-debug_...` sorts before `cinc_...`, so it is the kept artifact.
+    assert_eq!(outcome.artifacts.len(), 1);
+    assert_eq!(outcome.artifacts[0].sha256, SHA_B);
+    assert_eq!(outcome.collisions.len(), 1);
+    let collision = &outcome.collisions[0];
+    assert_eq!(collision.first.sha256, SHA_B, "the first artifact is kept");
+    assert_eq!(collision.conflicting.sha256, SHA_A);
+    assert_eq!(collision.tag, "19.4.46-debian-13-amd64");
+    assert_eq!(
+        collision.upstream_path,
+        "stable/cinc/19.4.46/debian/13/cinc_19.4.46-1_amd64.deb"
     );
+}
+
+#[tokio::test]
+async fn plan_excludes_colliding_artifacts_and_reports_them() {
+    let mut pages = HashMap::new();
+    let js = |name: &str| format!("files/stable/cinc/19.4.46/debian/13/{name}.metadata.json");
+    pages.insert("files/stable/cinc/".to_string(), listing(&["19.4.46/"]));
+    pages.insert(
+        "files/stable/cinc/19.4.46/".to_string(),
+        listing(&["debian/"]),
+    );
+    pages.insert(
+        "files/stable/cinc/19.4.46/debian/".to_string(),
+        listing(&["13/"]),
+    );
+    pages.insert(
+        "files/stable/cinc/19.4.46/debian/13/".to_string(),
+        listing(&[
+            "cinc_19.4.46-1_aarch64.deb",
+            "cinc_19.4.46-1_aarch64.deb.metadata.json",
+            "cinc_19.4.46-1_arm64.deb",
+            "cinc_19.4.46-1_arm64.deb.metadata.json",
+        ]),
+    );
+    // Two raw arches mapping to one public arm64 with different bytes.
+    pages.insert(
+        js("cinc_19.4.46-1_aarch64.deb"),
+        metadata(
+            "cinc_19.4.46-1_aarch64.deb",
+            SHA_B,
+            "debian",
+            "13",
+            "19.4.46",
+            "aarch64",
+        ),
+    );
+    pages.insert(
+        js("cinc_19.4.46-1_arm64.deb"),
+        metadata(
+            "cinc_19.4.46-1_arm64.deb",
+            SHA_C,
+            "debian",
+            "13",
+            "19.4.46",
+            "arm64",
+        ),
+    );
+
+    let state_dir = tempfile::tempdir().expect("temp dir");
+    let config = config(state_dir.path(), "0");
+    let mut lengths = HashMap::new();
+    lengths.insert(
+        "files/stable/cinc/19.4.46/debian/13/cinc_19.4.46-1_aarch64.deb".to_string(),
+        2000,
+    );
+    lengths.insert(
+        "files/stable/cinc/19.4.46/debian/13/cinc_19.4.46-1_arm64.deb".to_string(),
+        3000,
+    );
+
+    let plan = build(
+        &source_over(FakeUpstream::new(pages, lengths)),
+        &config,
+        &scope(&config),
+        &HashSet::new(),
+    )
+    .await
+    .expect("a collision does not fail the plan");
+
+    assert_eq!(plan.collisions, 1);
+    assert_eq!(
+        plan.artifacts, 1,
+        "the conflicting artifact is excluded from the totals"
+    );
+    assert_eq!(plan.total_bytes, 2000, "only the kept artifact is counted");
+    assert!(plan.to_json().contains("\"collisions\": 1"));
 }
 
 // Plan totals and grouping ---------------------------------------------------
@@ -686,6 +779,7 @@ async fn json_embeds_effective_policy_and_is_stable() {
         "\"artifacts\"",
         "\"total_bytes\"",
         "\"satisfied_bytes\"",
+        "\"collisions\"",
         "\"by_project\"",
         "\"by_platform\"",
         "\"by_arch\"",
@@ -702,6 +796,7 @@ async fn json_embeds_effective_policy_and_is_stable() {
     }
 
     let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+    assert_eq!(value["collisions"], serde_json::json!(0));
     let policies = value["effective_policy"]
         .as_array()
         .expect("effective_policy is an array");

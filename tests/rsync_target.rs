@@ -5,7 +5,8 @@
 //! rather than on a production mirror. The upload tests drive the real `rsync`
 //! binary against a local temporary directory, because the interesting
 //! behaviour is what rsync actually writes: the package, the verbatim
-//! `metadata.json` and the `<basename>.sha256` commit marker.
+//! per-package `<basename>.metadata.json` and the `<basename>.sha256` commit
+//! marker.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -314,9 +315,13 @@ async fn fresh_upload_writes_package_metadata_and_sidecar() {
         "the package lands at its upstream-shaped path"
     );
     assert_eq!(
-        std::fs::read_to_string(dir.join("metadata.json")).expect("metadata"),
+        std::fs::read_to_string(dir.join(format!("{BASENAME}.metadata.json"))).expect("metadata"),
         artifact.metadata_json,
-        "the upstream document is published byte for byte"
+        "the upstream document is published byte for byte, next to its package"
+    );
+    assert!(
+        !dir.join("metadata.json").exists(),
+        "the metadata is per package, never a shared directory document"
     );
 
     let sidecar = std::fs::read_to_string(sidecar_path(root.path(), &artifact)).expect("sidecar");
@@ -376,7 +381,7 @@ async fn preserve_superseded_copies_canonical_files_without_touching_them() {
 
     let dir = published_dir(root.path(), &artifact);
     let canonical_package = dir.join(BASENAME);
-    let canonical_metadata = dir.join("metadata.json");
+    let canonical_metadata = dir.join(format!("{BASENAME}.metadata.json"));
     let canonical_metadata_bytes = std::fs::read(&canonical_metadata).expect("canonical metadata");
     let canonical_mtime = modified(&canonical_package);
 
@@ -560,6 +565,58 @@ async fn verify_accepts_the_publication_that_put_wrote() {
 }
 
 #[tokio::test]
+async fn two_artifacts_in_one_directory_keep_their_own_metadata() {
+    require_rsync();
+
+    let source = tempfile::tempdir().expect("source dir");
+    let root = tempfile::tempdir().expect("target dir");
+
+    // The live tree publishes several packages per platform_version directory;
+    // one shared metadata document would be overwritten by every publication.
+    let main = "cinc_19.4.46-1_amd64.deb";
+    let debug = "cinc-debug_19.4.46-1_amd64.deb";
+    let main_bytes = b"the main package bytes";
+    let debug_bytes = b"the debug package bytes, which differ";
+    let main_artifact = artifact_with_basename(main_bytes, main);
+    let debug_artifact = artifact_with_basename(debug_bytes, debug);
+    let main_package = source.path().join(main);
+    let debug_package = source.path().join(debug);
+    std::fs::write(&main_package, main_bytes).expect("write main");
+    std::fs::write(&debug_package, debug_bytes).expect("write debug");
+    let target = local_target(root.path());
+
+    target
+        .put(&main_artifact, &main_package)
+        .await
+        .expect("put main");
+    target
+        .put(&debug_artifact, &debug_package)
+        .await
+        .expect("put debug");
+
+    let dir = published_dir(root.path(), &main_artifact);
+    assert_eq!(dir, published_dir(root.path(), &debug_artifact));
+    assert_eq!(
+        std::fs::read_to_string(dir.join(format!("{main}.metadata.json"))).expect("main metadata"),
+        main_artifact.metadata_json,
+        "the main publication keeps its own document"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join(format!("{debug}.metadata.json")))
+            .expect("debug metadata"),
+        debug_artifact.metadata_json,
+        "the debug publication keeps its own document"
+    );
+    assert!(
+        !dir.join("metadata.json").exists(),
+        "no shared document is written"
+    );
+
+    target.verify(&main_artifact).await.expect("verify main");
+    target.verify(&debug_artifact).await.expect("verify debug");
+}
+
+#[tokio::test]
 async fn verify_rejects_a_missing_package_behind_a_valid_sidecar() {
     require_rsync();
 
@@ -633,6 +690,50 @@ async fn put_restores_a_deleted_package_and_keeps_the_sidecar() {
 }
 
 #[tokio::test]
+async fn put_heals_a_legacy_shared_metadata_layout() {
+    require_rsync();
+
+    let source = tempfile::tempdir().expect("source dir");
+    let root = tempfile::tempdir().expect("target dir");
+    let bytes = b"the verified package bytes";
+    let artifact = artifact_for(bytes);
+    let package = write_package(source.path(), bytes);
+    let target = local_target(root.path());
+    target.put(&artifact, &package).await.expect("put");
+
+    // Rewind the directory to the historical layout: one shared document, no
+    // per-package companion.
+    let dir = published_dir(root.path(), &artifact);
+    std::fs::rename(
+        dir.join(format!("{BASENAME}.metadata.json")),
+        dir.join("metadata.json"),
+    )
+    .expect("rewind the layout");
+
+    let error = target
+        .verify(&artifact)
+        .await
+        .expect_err("the per-package companion is gone");
+    assert!(
+        matches!(error, TargetError::NotPublished { .. }),
+        "expected NotPublished before the repair, got {error:?}"
+    );
+
+    target.put(&artifact, &package).await.expect("healing put");
+
+    assert_eq!(
+        std::fs::read_to_string(dir.join(format!("{BASENAME}.metadata.json")))
+            .expect("restored companion"),
+        artifact.metadata_json,
+        "put writes the per-package companion and heals the layout"
+    );
+    target
+        .verify(&artifact)
+        .await
+        .expect("verify after healing");
+}
+
+#[tokio::test]
 async fn put_restores_a_deleted_metadata_file() {
     require_rsync();
 
@@ -646,14 +747,15 @@ async fn put_restores_a_deleted_metadata_file() {
 
     let dir = published_dir(root.path(), &artifact);
     let sidecar = sidecar_path(root.path(), &artifact);
+    let metadata = dir.join(format!("{BASENAME}.metadata.json"));
     let sidecar_mtime = modified(&sidecar);
 
-    std::fs::remove_file(dir.join("metadata.json")).expect("delete metadata");
+    std::fs::remove_file(&metadata).expect("delete metadata");
 
     let error = target
         .verify(&artifact)
         .await
-        .expect_err("a publication without metadata.json is incomplete");
+        .expect_err("a publication without its metadata document is incomplete");
     assert!(
         matches!(error, TargetError::NotPublished { .. }),
         "expected NotPublished before the repair, got {error:?}"
@@ -662,7 +764,7 @@ async fn put_restores_a_deleted_metadata_file() {
     target.put(&artifact, &package).await.expect("repair put");
 
     assert_eq!(
-        std::fs::read_to_string(dir.join("metadata.json")).expect("restored metadata"),
+        std::fs::read_to_string(&metadata).expect("restored metadata"),
         artifact.metadata_json,
         "the metadata document is restored verbatim"
     );

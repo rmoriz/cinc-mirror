@@ -9,8 +9,9 @@
 //!
 //! The result is deterministic: versions descending, then platform,
 //! platform_version, architecture and basename ascending. Two different digests
-//! under one descriptive tag are refused because they would become an incident
-//! later, not an estimate.
+//! under one descriptive tag are an upstream anomaly, not a failed run: the
+//! crawl keeps the first artifact, reports the pair as a [`TagCollision`] and
+//! leaves the decision to the incident flow.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -24,17 +25,49 @@ use crate::version::Version;
 /// Marks the metadata document beside a package.
 const METADATA_SUFFIX: &str = ".metadata.json";
 
+/// What one crawl produced.
+#[derive(Debug, Clone, Default)]
+pub struct CrawlOutcome {
+    /// Artifacts that may be published, in deterministic order, collisions
+    /// excluded.
+    pub artifacts: Vec<Artifact>,
+    /// Tag collisions found on the way; the conflicting artifact of each is
+    /// not in `artifacts`.
+    pub collisions: Vec<TagCollision>,
+}
+
+/// Two artifacts map to one descriptive tag but do not carry the same bytes.
+///
+/// Upstream publishes two raw architectures that map to one public one (or the
+/// same version on two channels); the first artifact is kept and published,
+/// the conflicting one is excluded so the descriptive tag never holds two
+/// digests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagCollision {
+    /// Upstream path of the conflicting artifact.
+    pub upstream_path: String,
+    /// The descriptive tag both artifacts map to.
+    pub tag: String,
+    /// The artifact the crawl keeps.
+    pub first: Artifact,
+    /// The artifact the crawl excludes.
+    pub conflicting: Artifact,
+}
+
 /// Crawl every artifact selected by `policy`.
+///
+/// A tag collision does not fail the crawl: the first artifact (in the
+/// deterministic directory order) is kept, the conflicting one is reported in
+/// [`CrawlOutcome::collisions`] and excluded from [`CrawlOutcome::artifacts`].
 ///
 /// # Errors
 ///
 /// Returns [`CrawlError::List`] when a directory cannot be listed,
 /// [`CrawlError::Metadata`] when a metadata document cannot be fetched or
-/// parsed, [`CrawlError::Artifact`] when the metadata contradicts the crawl
-/// context, and [`CrawlError::TagCollision`] when two different digests share a
-/// tag.
-pub async fn crawl(source: &Source, policy: &ResolvedPolicy) -> Result<Vec<Artifact>, CrawlError> {
-    let mut artifacts = Vec::new();
+/// parsed, and [`CrawlError::Artifact`] when the metadata contradicts the
+/// crawl context.
+pub async fn crawl(source: &Source, policy: &ResolvedPolicy) -> Result<CrawlOutcome, CrawlError> {
+    let mut outcome = CrawlOutcome::default();
     let mut keys = HashSet::new();
     let mut tags = BTreeMap::new();
 
@@ -84,39 +117,65 @@ pub async fn crawl(source: &Source, policy: &ResolvedPolicy) -> Result<Vec<Artif
                     if !policy.allows_arch(&artifact.arch) || !keys.insert(artifact.key()) {
                         continue;
                     }
-                    record_tag(&mut tags, &artifact)?;
-                    artifacts.push(artifact);
+                    match record_tag(&mut tags, &artifact) {
+                        Some(collision) => outcome.collisions.push(collision),
+                        None => outcome.artifacts.push(artifact),
+                    }
                 }
             }
         }
     }
 
-    Ok(artifacts)
+    Ok(outcome)
 }
 
-/// Refuse two different digests under one descriptive tag.
-pub(crate) fn check_tag_collisions<'a>(
+/// Detect tag collisions in a merged candidate list.
+///
+/// The first artifact in iteration order is kept; every artifact that maps to a
+/// tag already held by different bytes is reported as the conflicting one. The
+/// caller must exclude each `conflicting` artifact from the candidates it
+/// publishes.
+pub fn collect_tag_collisions<'a>(
     artifacts: impl IntoIterator<Item = &'a Artifact>,
-) -> Result<(), CrawlError> {
+) -> Vec<TagCollision> {
     let mut tags = BTreeMap::new();
+    let mut collisions = Vec::new();
     for artifact in artifacts {
-        record_tag(&mut tags, artifact)?;
+        if let Some(collision) = record_tag(&mut tags, artifact) {
+            collisions.push(collision);
+        }
     }
-    Ok(())
+    collisions
 }
 
-fn record_tag(tags: &mut BTreeMap<String, String>, artifact: &Artifact) -> Result<(), CrawlError> {
+/// Drop collisions that two policies reported for the same artifact pair.
+///
+/// Two policies that crawl the same directory see the same collision; the
+/// incident flow keys on the artifact pair, so one entry is enough.
+pub fn dedup_collisions(mut collisions: Vec<TagCollision>) -> Vec<TagCollision> {
+    let mut seen = HashSet::new();
+    collisions
+        .retain(|collision| seen.insert((collision.first.key(), collision.conflicting.key())));
+    collisions
+}
+
+/// Record `artifact`'s claim on its descriptive tag.
+///
+/// The first artifact to claim a tag owns it; a later artifact with different
+/// bytes under the same tag is reported as a collision and never inserted.
+fn record_tag(tags: &mut BTreeMap<String, Artifact>, artifact: &Artifact) -> Option<TagCollision> {
     let tag = artifact.tag();
     match tags.get(&tag) {
-        Some(sha256) if *sha256 != artifact.sha256 => Err(CrawlError::TagCollision {
+        Some(first) if first.sha256 != artifact.sha256 => Some(TagCollision {
+            upstream_path: artifact.rsync_relpath(),
             tag,
-            first_sha256: sha256.clone(),
-            second_sha256: artifact.sha256.clone(),
+            first: first.clone(),
+            conflicting: artifact.clone(),
         }),
-        Some(_) => Ok(()),
+        Some(_) => None,
         None => {
-            tags.insert(tag, artifact.sha256.clone());
-            Ok(())
+            tags.insert(tag, artifact.clone());
+            None
         }
     }
 }
@@ -213,18 +272,5 @@ pub enum CrawlError {
         /// Underlying artifact error.
         #[source]
         source: ArtifactError,
-    },
-
-    /// Two artifacts map to one tag but have different bytes.
-    #[error(
-        "tag `{tag}` collides: `{first_sha256}` and `{second_sha256}` are different artifacts"
-    )]
-    TagCollision {
-        /// The shared tag.
-        tag: String,
-        /// Digest of the first artifact.
-        first_sha256: String,
-        /// Digest of the second artifact.
-        second_sha256: String,
     },
 }
