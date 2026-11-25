@@ -192,19 +192,8 @@ mid-publication.
 ## Windows
 
 Windows packages (`.msi`) are mirrored like every other platform. This
-repository does not provide a Windows installer; the POSIX installer and these
-scripts remain POSIX-only. Use the mirrored `.msi` directly.
-
-## Scripts
-
-`install.sh` and `install-debian13-arm.sh` remain the installers described
-above.
-
-`cinc-mirror-single.sh` and `fetch-blob.sh` are **deprecated**. They are kept for
-historical reference only and are scheduled for deletion after two clean weeks
-of the Rust mirror. Use the `cinc-mirror` binary instead. `fetch-blob.sh` showed
-how to fetch one blob by SHA-256 with curl; for manual work, use
-[ORAS](https://oras.land/).
+repository does not provide a Windows installer; the POSIX installer remains
+POSIX-only. Use the mirrored `.msi` directly.
 
 ## Why?
 
