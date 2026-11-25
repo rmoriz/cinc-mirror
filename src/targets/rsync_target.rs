@@ -269,10 +269,60 @@ impl RsyncTarget {
     /// so publishing the replacement cannot overwrite the canonical metadata.
     fn metadata_relpath(&self, artifact: &Artifact) -> String {
         if artifact.superseded {
-            format!("{}.metadata.json", artifact.rsync_superseded_relpath())
+            self.superseded_metadata_relpath(artifact)
         } else {
-            let directory = directory_of(&artifact.rsync_relpath());
-            format!("{directory}/{METADATA_NAME}")
+            self.canonical_metadata_relpath(artifact)
+        }
+    }
+
+    fn canonical_metadata_relpath(&self, artifact: &Artifact) -> String {
+        let directory = directory_of(&artifact.rsync_relpath());
+        format!("{directory}/{METADATA_NAME}")
+    }
+
+    fn superseded_metadata_relpath(&self, artifact: &Artifact) -> String {
+        format!("{}.metadata.json", artifact.rsync_superseded_relpath())
+    }
+
+    /// Copy one destination-relative path to another without touching the
+    /// source.
+    async fn copy_path(&self, from: &str, to: &str) -> Result<(), TargetError> {
+        // A target that never received the old artifact has nothing to
+        // preserve. The replacement is published there during the republish,
+        // and there is no old publication row to retire.
+        if !self.package_exists(from).await? {
+            return Ok(());
+        }
+        match &self.address {
+            RsyncAddress::Local { .. } => {
+                let from_path = self
+                    .local_path(from)
+                    .expect("local address has a local path");
+                let to_path = self.local_path(to).expect("local address has a local path");
+                let source = fs::metadata(&from_path)
+                    .await
+                    .map_err(|source| io_error(from_path.clone(), source))?;
+                match fs::metadata(&to_path).await {
+                    Ok(existing) if existing.len() == source.len() => return Ok(()),
+                    Ok(_) => {}
+                    Err(source) if source.kind() == ErrorKind::NotFound => {}
+                    Err(source) => return Err(io_error(to_path, source)),
+                }
+                fs::copy(&from_path, &to_path)
+                    .await
+                    .map_err(|source| io_error(to_path, source))?;
+                Ok(())
+            }
+            RsyncAddress::Ssh { .. } => {
+                let remote = self.ssh_cp_args(from, to);
+                let output = self.ssh(&remote).await?;
+                ensure_success("ssh cp", output).map(|_| ())
+            }
+            RsyncAddress::Daemon { .. } => {
+                let args = vec!["-s".to_string(), self.daemon_url(from), self.daemon_url(to)];
+                let output = self.rsync(&args).await?;
+                ensure_success(&command_display("rsync", &args), output).map(|_| ())
+            }
         }
     }
 
@@ -438,6 +488,20 @@ impl RsyncTarget {
         vec![
             "cat".to_string(),
             shell_quote(&self.ssh_remote_path(relative)),
+        ]
+    }
+
+    /// Remote `cp -p -- <from> <to>` command for an SSH host.
+    ///
+    /// Both paths are one quoted argument; `--` stops `cp` from reading a
+    /// leading dash as an option.
+    fn ssh_cp_args(&self, from: &str, to: &str) -> Vec<String> {
+        vec![
+            "cp".to_string(),
+            "-p".to_string(),
+            "--".to_string(),
+            shell_quote(&self.ssh_remote_path(from)),
+            shell_quote(&self.ssh_remote_path(to)),
         ]
     }
 
@@ -731,6 +795,19 @@ impl Target for RsyncTarget {
         let mut canonical = artifact.clone();
         canonical.superseded = false;
         self.publish(&canonical, package, true).await
+    }
+
+    async fn preserve_superseded(&self, artifact: &Artifact) -> Result<(), TargetError> {
+        self.copy_path(
+            &artifact.rsync_relpath(),
+            &artifact.rsync_superseded_relpath(),
+        )
+        .await?;
+        self.copy_path(
+            &self.canonical_metadata_relpath(artifact),
+            &self.superseded_metadata_relpath(artifact),
+        )
+        .await
     }
 
     async fn verify(&self, artifact: &Artifact) -> Result<(), TargetError> {

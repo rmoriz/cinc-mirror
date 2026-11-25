@@ -449,6 +449,58 @@ async fn superseded_artifact_uses_suffixed_tag() {
 }
 
 #[tokio::test]
+async fn preserve_superseded_is_a_noop_and_the_old_manifest_stays_by_digest() {
+    let mock = MockRegistry::start(MockAuth::Anonymous).await;
+    let target = target_for(&mock);
+    let old_bytes = b"the old package bytes".as_slice();
+    let new_bytes = b"the replacement package bytes".as_slice();
+    let old = artifact_for(old_bytes);
+    let new = artifact_for(new_bytes);
+    let (_old_dir, old_path) = write_package(old_bytes);
+    let (_new_dir, new_path) = write_package(new_bytes);
+
+    target.put(&old, &old_path).await.expect("old put");
+    let old_manifest = mock.manifest(REPO, &old.tag()).expect("old manifest");
+    let old_manifest_bytes = old_manifest.bytes.clone();
+    // A real registry addresses every manifest by digest. The test mock keeps
+    // tag entries only, so seed the digest entry the registry would retain.
+    mock.store_manifest(REPO, &old_manifest.digest, &old_manifest_bytes);
+
+    target
+        .preserve_superseded(&old)
+        .await
+        .expect("oci preserve is a no-op");
+    assert_eq!(
+        mock.manifest(REPO, &old.tag())
+            .expect("canonical tag")
+            .bytes,
+        old_manifest_bytes,
+        "the no-op must not change the canonical tag"
+    );
+
+    let outcome = target.republish(&new, &new_path).await.expect("republish");
+    assert_eq!(
+        outcome.remote_digest,
+        mock.manifest(REPO, &old.tag())
+            .expect("canonical tag")
+            .digest
+    );
+
+    let by_digest = mock
+        .manifest(REPO, &old_manifest.digest)
+        .expect("old manifest by digest");
+    assert_eq!(
+        by_digest.bytes, old_manifest_bytes,
+        "the old manifest remains addressable by digest"
+    );
+    let canonical = stored_manifest(&mock, &old.tag());
+    assert_eq!(
+        canonical["layers"][0]["digest"],
+        json!(sha256_digest(new_bytes))
+    );
+}
+
+#[tokio::test]
 async fn ledger_round_trip_keeps_the_metadata_layer_digest() {
     let mock = MockRegistry::start(MockAuth::Anonymous).await;
     let target = target_for(&mock);

@@ -9,11 +9,12 @@
 //! # Acknowledgement
 //!
 //! [`ack`] always records an `incident_acked` event. With `republish` it first
-//! writes the replacement artifact back to every enabled target under its
-//! canonical reference. Every target must succeed before any old publication is
-//! marked `superseded`; a partial failure restores the targets that already
-//! moved and returns [`IncidentError::RepublishFailed`], leaving the ledger's
-//! publication rows untouched.
+//! asks every enabled target to preserve the old bytes under the superseded
+//! name, then writes the replacement artifact back under its canonical
+//! reference. Every target must succeed before any old publication is marked
+//! `superseded`; a partial failure restores the targets that already moved and
+//! returns [`IncidentError::RepublishFailed`], leaving the ledger's publication
+//! rows untouched.
 //!
 //! # Secrets
 //!
@@ -268,10 +269,12 @@ pub async fn open(
 /// Acknowledge an incident, optionally moving the canonical reference.
 ///
 /// `republish` publishes the replacement artifact under its canonical reference
-/// on every enabled target first. Only when every target succeeded are the old
-/// publication rows marked `superseded`, followed by the `incident_acked`
-/// event. A target failure restores the targets that already moved and returns
-/// [`IncidentError::RepublishFailed`] without acknowledging the incident.
+/// on every enabled target first. Before any canonical path moves, every target
+/// is asked to preserve the old bytes under the superseded name. Only when every
+/// target succeeded are the old publication rows marked `superseded`, followed
+/// by the `incident_acked` event. A target failure restores the targets that
+/// already moved and returns [`IncidentError::RepublishFailed`] without
+/// acknowledging the incident.
 ///
 /// # Errors
 ///
@@ -300,6 +303,18 @@ pub async fn ack(
                 target: "local-store".to_string(),
                 reason: format!("no verified blob for {}", plan.replacement.sha256),
             });
+        }
+
+        // Keep the old bytes recoverable before any canonical path moves. This
+        // is a server-side copy on targets that need one; OCI needs nothing.
+        for target in targets.all() {
+            if let Err(error) = target.preserve_superseded(&plan.old_artifact).await {
+                return Err(IncidentError::RepublishFailed {
+                    id: id.to_string(),
+                    target: target.name().to_string(),
+                    reason: error.to_string(),
+                });
+            }
         }
 
         let mut succeeded: Vec<(&Arc<dyn Target>, PutOutcome)> = Vec::new();

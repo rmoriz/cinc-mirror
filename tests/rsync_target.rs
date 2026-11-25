@@ -362,6 +362,88 @@ async fn local_upload_handles_a_metacharacter_basename() {
 }
 
 #[tokio::test]
+async fn preserve_superseded_copies_canonical_files_without_touching_them() {
+    require_rsync();
+
+    let source = tempfile::tempdir().expect("source dir");
+    let root = tempfile::tempdir().expect("target dir");
+    let bytes = b"the old published bytes";
+    let artifact = artifact_for(bytes);
+    let package = write_package(source.path(), bytes);
+    let target = local_target(root.path());
+
+    target.put(&artifact, &package).await.expect("put");
+
+    let dir = published_dir(root.path(), &artifact);
+    let canonical_package = dir.join(BASENAME);
+    let canonical_metadata = dir.join("metadata.json");
+    let canonical_metadata_bytes = std::fs::read(&canonical_metadata).expect("canonical metadata");
+    let canonical_mtime = modified(&canonical_package);
+
+    target
+        .preserve_superseded(&artifact)
+        .await
+        .expect("preserve");
+
+    let superseded_relpath = artifact.rsync_superseded_relpath();
+    let superseded_package = root.path().join(&superseded_relpath);
+    let superseded_metadata = root
+        .path()
+        .join(format!("{superseded_relpath}.metadata.json"));
+    assert_eq!(
+        std::fs::read(&superseded_package).expect("superseded package"),
+        bytes
+    );
+    assert_eq!(
+        std::fs::read(&superseded_metadata).expect("superseded metadata"),
+        canonical_metadata_bytes
+    );
+    assert_eq!(
+        std::fs::read(&canonical_package).expect("canonical package"),
+        bytes
+    );
+    assert_eq!(
+        std::fs::read(&canonical_metadata).expect("canonical metadata"),
+        canonical_metadata_bytes
+    );
+    assert_eq!(
+        modified(&canonical_package),
+        canonical_mtime,
+        "preservation never rewrites the canonical package"
+    );
+
+    // A second preservation with identical sizes is a no-op.
+    let superseded_mtime = modified(&superseded_package);
+    target
+        .preserve_superseded(&artifact)
+        .await
+        .expect("second preserve");
+    assert_eq!(modified(&superseded_package), superseded_mtime);
+}
+
+#[tokio::test]
+async fn preserve_superseded_skips_a_target_without_the_artifact() {
+    require_rsync();
+
+    let root = tempfile::tempdir().expect("target dir");
+    let artifact = artifact_for(b"never published here");
+    let target = local_target(root.path());
+
+    target
+        .preserve_superseded(&artifact)
+        .await
+        .expect("nothing to preserve");
+
+    assert!(
+        !root
+            .path()
+            .join(artifact.rsync_superseded_relpath())
+            .exists(),
+        "no suffixed copy is made for an artifact the target never had"
+    );
+}
+
+#[tokio::test]
 async fn same_bytes_are_not_rewritten() {
     require_rsync();
 

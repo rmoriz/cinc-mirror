@@ -167,6 +167,19 @@ pub trait Target: Send + Sync {
         self.put(artifact, package).await
     }
 
+    /// Make the old bytes of `artifact` available under its superseded name
+    /// before an acknowledged republish moves the canonical reference.
+    ///
+    /// The ledger keeps the old row, so the bytes should remain recoverable.
+    /// OCI keeps every manifest addressable by digest and needs no action; the
+    /// default is therefore a no-op. A target that overwrites the canonical
+    /// path overrides this and copies the old package and metadata aside
+    /// without touching the canonical files.
+    async fn preserve_superseded(&self, artifact: &Artifact) -> Result<(), TargetError> {
+        let _ = artifact;
+        Ok(())
+    }
+
     /// Check that the publication for `artifact` is complete and current.
     async fn verify(&self, artifact: &Artifact) -> Result<(), TargetError>;
 }

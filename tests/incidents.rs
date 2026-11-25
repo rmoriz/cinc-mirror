@@ -303,6 +303,53 @@ impl Target for FailingRepublish {
     }
 }
 
+/// A target that publishes normally but always fails the preservation step, so
+/// a test can prove the canonical files are untouched.
+struct FailingPreserve {
+    inner: RsyncTarget,
+}
+
+#[async_trait]
+impl Target for FailingPreserve {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn probe(&self) -> Result<(), TargetError> {
+        self.inner.probe().await
+    }
+
+    async fn exists(&self, artifact: &Artifact) -> Result<Option<String>, TargetError> {
+        self.inner.exists(artifact).await
+    }
+
+    async fn put(&self, artifact: &Artifact, package: &Path) -> Result<PutOutcome, TargetError> {
+        self.inner.put(artifact, package).await
+    }
+
+    async fn verify(&self, artifact: &Artifact) -> Result<(), TargetError> {
+        self.inner.verify(artifact).await
+    }
+
+    async fn republish(
+        &self,
+        artifact: &Artifact,
+        package: &Path,
+    ) -> Result<PutOutcome, TargetError> {
+        self.inner.republish(artifact, package).await
+    }
+
+    async fn preserve_superseded(&self, _artifact: &Artifact) -> Result<(), TargetError> {
+        Err(TargetError::Io {
+            path: PathBuf::from("/unwritable/preserve"),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected preserve failure",
+            ),
+        })
+    }
+}
+
 async fn open_hash_change(
     ledger: &mut Ledger,
     config: &Config,
@@ -718,6 +765,40 @@ async fn ack_with_republish_moves_tag_and_marks_old_publications_superseded() {
         sidecar(rsync_root.path(), &new).starts_with(&new.sha256),
         "the canonical rsync sidecar moves to the replacement"
     );
+    assert_eq!(
+        std::fs::read(rsync_root.path().join(new.rsync_relpath())).expect("canonical package"),
+        new_bytes,
+        "the canonical rsync package moves to the replacement"
+    );
+
+    let canonical_metadata = rsync_root
+        .path()
+        .join(new.rsync_relpath())
+        .parent()
+        .expect("canonical directory")
+        .join("metadata.json");
+    assert_eq!(
+        std::fs::read_to_string(canonical_metadata).expect("canonical metadata"),
+        new.metadata_json,
+        "the canonical metadata moves with the replacement"
+    );
+
+    let old_superseded = old.rsync_superseded_relpath();
+    assert_eq!(
+        std::fs::read(rsync_root.path().join(&old_superseded)).expect("preserved old package"),
+        old_bytes,
+        "the old package is preserved under its suffixed name"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            rsync_root
+                .path()
+                .join(format!("{old_superseded}.metadata.json"))
+        )
+        .expect("preserved old metadata"),
+        old.metadata_json,
+        "the old metadata is preserved under its suffixed name"
+    );
 
     for target in ["oci", "rsync"] {
         assert_eq!(
@@ -751,6 +832,102 @@ async fn ack_with_republish_moves_tag_and_marks_old_publications_superseded() {
     assert!(
         ledger.pending("oci").expect("pending").is_empty(),
         "repair and the next run have nothing left to publish"
+    );
+}
+
+#[tokio::test]
+async fn preservation_failure_leaves_canonical_rsync_files_untouched() {
+    let _env = env_lock().await;
+    clear_github_env();
+
+    let state = tempfile::tempdir().expect("state dir");
+    let mut ledger = Ledger::open(state.path()).expect("ledger");
+    let first_root = tempfile::tempdir().expect("first rsync root");
+    let failing_root = tempfile::tempdir().expect("failing rsync root");
+    let targets = TargetSet::from_targets(vec![
+        Arc::new(rsync_target("rsync-good", first_root.path())),
+        Arc::new(FailingPreserve {
+            inner: rsync_target("rsync-failing", failing_root.path()),
+        }),
+    ]);
+    let config = config_with(state.path(), "https://api.github.com");
+
+    let old_bytes = b"the old published package".as_slice();
+    let new_bytes = b"the replacement package".as_slice();
+    let old = artifact_for(old_bytes);
+    let new = artifact_for(new_bytes);
+    let (_old_dir, old_path) = write_package(old_bytes);
+    store_blob(state.path(), new_bytes);
+
+    publish_and_record(
+        &mut ledger,
+        targets.all()[0].as_ref(),
+        &old,
+        &old_path,
+        "run-1",
+        1,
+        true,
+    )
+    .await;
+    publish_and_record(
+        &mut ledger,
+        targets.all()[1].as_ref(),
+        &old,
+        &old_path,
+        "run-1",
+        3,
+        false,
+    )
+    .await;
+    let incident = open_hash_change(&mut ledger, &config, &old, &new).await;
+
+    let error = incident::ack(&mut ledger, &targets, &config, &incident.id, None, true)
+        .await
+        .expect_err("a preservation failure must abort the republish");
+    assert!(matches!(error, IncidentError::RepublishFailed { .. }));
+
+    for root in [first_root.path(), failing_root.path()] {
+        assert_eq!(
+            std::fs::read(root.join(old.rsync_relpath())).expect("canonical package"),
+            old_bytes,
+            "the canonical package is untouched when preservation fails"
+        );
+        let metadata = root
+            .join(old.rsync_relpath())
+            .parent()
+            .expect("canonical directory")
+            .join("metadata.json");
+        assert_eq!(
+            std::fs::read_to_string(metadata).expect("canonical metadata"),
+            old.metadata_json,
+            "the canonical metadata is untouched when preservation fails"
+        );
+    }
+    assert!(
+        !failing_root
+            .path()
+            .join(old.rsync_superseded_relpath())
+            .exists(),
+        "the failing target does not publish the suffixed copy"
+    );
+
+    for target in ["rsync-good", "rsync-failing"] {
+        assert_eq!(
+            ledger
+                .publication(&old.key(), target)
+                .expect("old publication")
+                .expect("row")
+                .status,
+            PublicationStatus::Published,
+            "{target} keeps its old publication"
+        );
+    }
+    assert_eq!(
+        incident::show(&ledger, &incident.id)
+            .expect("incident")
+            .state,
+        IncidentState::Open,
+        "a failed preservation does not acknowledge the incident"
     );
 }
 
