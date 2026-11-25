@@ -8,10 +8,12 @@ pub mod artifact;
 pub mod cli;
 pub mod config;
 pub mod crawl;
+pub mod fsutil;
 pub mod hash;
 pub mod plan;
 pub mod scope;
 pub mod source;
+pub mod store;
 pub mod version;
 
 pub use artifact::{
@@ -34,4 +36,5 @@ pub use source::transport::{
     RetryPolicy, TransportError,
 };
 pub use source::{Source, SourceConfig, SourceError};
+pub use store::{Store, StoreError};
 pub use version::{Segment, Version, VersionError, VersionGlob, VersionGlobError};

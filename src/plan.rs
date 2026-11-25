@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -21,6 +21,7 @@ use thiserror::Error;
 use crate::artifact::Artifact;
 use crate::config::Config;
 use crate::crawl::{check_tag_collisions, crawl, CrawlError};
+use crate::fsutil::free_bytes;
 use crate::scope::{ResolvedPolicy, ResolvedScope};
 use crate::source::{Source, SourceError};
 
@@ -214,7 +215,8 @@ pub async fn build(
     plan.largest.truncate(LARGEST_LIMIT);
 
     let required = plan.total_bytes.saturating_sub(plan.satisfied_bytes);
-    let free = free_bytes(&config.state_dir);
+    // An unanswerable disk check is an unknown check, never a failed plan.
+    let free = free_bytes(&config.state_dir).ok().flatten();
     plan.space = SpaceCheck {
         state_dir: config.state_dir.display().to_string(),
         free_bytes: free,
@@ -334,73 +336,6 @@ pub fn parse_bandwidth(raw: &str) -> Result<Option<u64>, &'static str> {
     }
 }
 
-/// Free bytes on the filesystem holding `path`.
-///
-/// A path that does not exist yet is resolved through its nearest existing
-/// ancestor, which is what a first run against a fresh state directory needs.
-/// `~` is expanded with `$HOME`. Returns `None` on a platform or filesystem
-/// without a usable `statvfs`, and the plan reports the check as unknown.
-fn free_bytes(path: &Path) -> Option<u64> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-
-        let expanded = expand_tilde(path);
-        let mut existing: &Path = &expanded;
-        loop {
-            if existing.exists() {
-                break;
-            }
-            existing = existing.parent()?;
-        }
-
-        let c_path = std::ffi::CString::new(existing.as_os_str().as_bytes()).ok()?;
-        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        // SAFETY: `statvfs` writes the struct on success and `c_path` is a valid
-        // NUL-terminated path.
-        let result = unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) };
-        if result != 0 {
-            return None;
-        }
-        // SAFETY: `statvfs` returned success, so the struct is initialised.
-        let stats = unsafe { stats.assume_init() };
-
-        let block_size = if stats.f_frsize == 0 {
-            stats.f_bsize
-        } else {
-            stats.f_frsize
-        };
-        let available = u128::from(stats.f_bavail) * u128::from(block_size);
-        u64::try_from(available).ok()
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        None
-    }
-}
-
-/// Replace a leading `~` with `$HOME`.
-fn expand_tilde(path: &Path) -> PathBuf {
-    let Some(text) = path.to_str() else {
-        return path.to_path_buf();
-    };
-    if text != "~" && !text.starts_with("~/") {
-        return path.to_path_buf();
-    }
-
-    let Some(home) = std::env::var_os("HOME") else {
-        return path.to_path_buf();
-    };
-    let rest = text.trim_start_matches('~').trim_start_matches('/');
-    let mut expanded = PathBuf::from(home);
-    if !rest.is_empty() {
-        expanded.push(rest);
-    }
-    expanded
-}
-
 /// Errors raised while building a plan.
 #[derive(Debug, Error)]
 pub enum PlanError {
@@ -452,18 +387,5 @@ mod tests {
                 "`{value}` must be rejected"
             );
         }
-    }
-
-    #[test]
-    fn expands_a_leading_tilde() {
-        let home = std::env::var_os("HOME").expect("HOME");
-        assert_eq!(
-            expand_tilde(Path::new("~/state")),
-            PathBuf::from(home).join("state")
-        );
-        assert_eq!(
-            expand_tilde(Path::new("/tmp/state")),
-            PathBuf::from("/tmp/state")
-        );
     }
 }
