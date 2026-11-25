@@ -408,6 +408,37 @@ fn parses_oci_and_rsync_targets() {
 }
 
 #[test]
+fn accepts_a_local_rsync_path() {
+    let config = validated(
+        r#"
+        [[targets]]
+        name = "local"
+        kind = "rsync"
+        url = "/srv/cinc-mirror"
+        "#,
+    )
+    .expect("a local filesystem path is a valid rsync target");
+    assert_eq!(config.targets[0].kind, TargetKind::Rsync);
+    assert_eq!(config.targets[0].auth, TargetAuth::Anonymous);
+
+    let wrong_auth = load_str(
+        r#"
+        [[targets]]
+        name = "local"
+        kind = "rsync"
+        url = "/srv/cinc-mirror"
+        auth = "ssh-key"
+        "#,
+    )
+    .and_then(|config| config.validate())
+    .expect_err("a local path does not use ssh-key auth");
+    assert!(
+        matches!(wrong_auth, ConfigError::InvalidTarget { .. }),
+        "unexpected error: {wrong_auth}"
+    );
+}
+
+#[test]
 fn rejects_invalid_targets() {
     let missing_registry = load_str(
         r#"

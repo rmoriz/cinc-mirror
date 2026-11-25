@@ -18,9 +18,10 @@
 //! the superseded name.
 
 pub mod oci_target;
+pub mod rsync_target;
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -31,6 +32,7 @@ use crate::config::{Config, TargetConfig, TargetKind};
 use crate::oci::OciError;
 
 pub use oci_target::OciTarget;
+pub use rsync_target::{RsyncAddress, RsyncConfig, RsyncTarget};
 
 /// What a successful publication wrote, as the target reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +83,45 @@ pub enum TargetError {
     UnsupportedKind {
         /// The configured kind.
         kind: TargetKind,
+    },
+
+    /// The configured address does not name a usable destination.
+    #[error("invalid rsync address `{url}`: {reason}")]
+    InvalidAddress {
+        /// The address as configured.
+        url: String,
+        /// Why it cannot be used.
+        reason: String,
+    },
+
+    /// A sidecar exists but does not carry a usable digest.
+    #[error("corrupt sidecar `{path}`: {reason}")]
+    Corrupt {
+        /// Sidecar path relative to the target root.
+        path: String,
+        /// What made the contents unusable.
+        reason: String,
+    },
+
+    /// An external command failed or could not be started.
+    #[error("`{command}` failed (exit {status:?}): {stderr}")]
+    Command {
+        /// Command line that was executed.
+        command: String,
+        /// Exit status, absent when the process could not start.
+        status: Option<i32>,
+        /// Trimmed standard error, or the spawn error.
+        stderr: String,
+    },
+
+    /// A local file operation failed.
+    #[error("{}: {source}", path.display())]
+    Io {
+        /// Offending path.
+        path: PathBuf,
+        /// Underlying error.
+        #[source]
+        source: std::io::Error,
     },
 
     /// The registry client failed.
@@ -154,6 +195,6 @@ impl fmt::Debug for TargetSet {
 fn build(config: &Config, target: &TargetConfig) -> Result<Arc<dyn Target>, TargetError> {
     match target.kind {
         TargetKind::Oci => Ok(Arc::new(OciTarget::from_target(target, config)?)),
-        TargetKind::Rsync => Err(TargetError::UnsupportedKind { kind: target.kind }),
+        TargetKind::Rsync => Ok(Arc::new(RsyncTarget::from_target(target)?)),
     }
 }

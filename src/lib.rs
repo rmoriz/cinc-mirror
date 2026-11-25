@@ -46,5 +46,7 @@ pub use source::transport::{
 };
 pub use source::{Source, SourceConfig, SourceError};
 pub use store::{Store, StoreError};
-pub use targets::{OciTarget, PutOutcome, Target, TargetError, TargetSet};
+pub use targets::{
+    OciTarget, PutOutcome, RsyncAddress, RsyncConfig, RsyncTarget, Target, TargetError, TargetSet,
+};
 pub use version::{Segment, Version, VersionError, VersionGlob, VersionGlobError};

@@ -599,20 +599,22 @@ async fn target_set_builds_enabled_targets_in_config_order() {
 }
 
 #[tokio::test]
-async fn target_set_refuses_rsync_until_it_is_implemented() {
-    let mock = MockRegistry::start(MockAuth::Anonymous).await;
-    let mut rsync = target_config("legacy", TargetKind::Rsync, true, &mock);
-    rsync.registry = None;
-    rsync.namespace = None;
-    rsync.url = Some("ssh://example.test/srv/cinc".to_string());
-    rsync.auth = TargetAuth::SshKey;
+async fn target_set_builds_rsync_targets_too() {
+    let root = tempfile::tempdir().expect("rsync root");
+    let rsync = TargetConfig {
+        name: "legacy".to_string(),
+        kind: TargetKind::Rsync,
+        enabled: true,
+        registry: None,
+        namespace: None,
+        url: Some(root.path().to_string_lossy().into_owned()),
+        auth: TargetAuth::Anonymous,
+        max_bandwidth: None,
+        identity_file: None,
+        password_file: None,
+    };
 
-    let error = TargetSet::from_config(&config_with(vec![rsync]))
-        .expect_err("rsync is not implemented yet");
-    assert!(matches!(
-        error,
-        TargetError::UnsupportedKind {
-            kind: TargetKind::Rsync
-        }
-    ));
+    let set = TargetSet::from_config(&config_with(vec![rsync])).expect("rsync target builds");
+    let names: Vec<&str> = set.all().iter().map(|target| target.name()).collect();
+    assert_eq!(names, vec!["legacy"]);
 }

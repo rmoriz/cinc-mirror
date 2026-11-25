@@ -439,10 +439,24 @@ impl TargetConfig {
                 let wants_ssh = url.starts_with("ssh://");
                 let wants_daemon = url.starts_with("rsync://");
                 if !wants_ssh && !wants_daemon {
-                    return Err(invalid_target(
-                        &self.name,
-                        "rsync url must start with `ssh://` or `rsync://`",
-                    ));
+                    if url.contains("://") {
+                        return Err(invalid_target(
+                            &self.name,
+                            "rsync url must start with `ssh://` or `rsync://`, \
+                             or be a local filesystem path",
+                        ));
+                    }
+                    if self.auth != TargetAuth::Anonymous {
+                        return Err(invalid_target(
+                            &self.name,
+                            format!(
+                                "auth `{}` is not valid for a local rsync path \
+                                 (use `anonymous`)",
+                                self.auth
+                            ),
+                        ));
+                    }
+                    return Ok(());
                 }
                 match self.auth {
                     TargetAuth::SshKey if wants_ssh => {}
