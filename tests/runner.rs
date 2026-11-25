@@ -691,6 +691,17 @@ fn one_package() -> Spec {
     )
 }
 
+/// Keep the incident tests off the network and out of the CI environment file.
+///
+/// `incident::open` files a GitHub issue when a token and repository are in the
+/// environment and appends `SECURITY_ALERT` to `$GITHUB_ENV`. A test run must
+/// do neither.
+fn clear_security_env() {
+    std::env::remove_var("GITHUB_TOKEN");
+    std::env::remove_var("GITHUB_REPOSITORY");
+    std::env::remove_var("GITHUB_ENV");
+}
+
 // Queue order and limits ------------------------------------------------------
 
 #[tokio::test]
@@ -1040,6 +1051,7 @@ async fn transport_failure_counts_as_a_failed_download() {
 
 #[tokio::test]
 async fn hash_change_opens_one_incident_and_publishes_only_the_superseded_ref() {
+    clear_security_env();
     let dir = TempDir::new().expect("state dir");
     let first = one_package();
     let second = Spec::new(
@@ -1123,6 +1135,7 @@ async fn hash_change_opens_one_incident_and_publishes_only_the_superseded_ref() 
 
 #[tokio::test]
 async fn a_tag_that_already_holds_other_bytes_opens_a_conflict_incident() {
+    clear_security_env();
     let dir = TempDir::new().expect("state dir");
     let package = one_package();
     let fixture = Fixture::new(dir.path(), std::slice::from_ref(&package), &["t1"], 1, 1);
