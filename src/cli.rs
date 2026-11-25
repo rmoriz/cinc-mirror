@@ -24,6 +24,11 @@ pub struct Cli {
     /// Path to mirror.toml [default: ./mirror.toml when present]
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
+
+    /// Continue when the ledger lease cannot be taken because the remote is
+    /// unreachable; a live lease held by another run still refuses the run
+    #[arg(long, global = true)]
+    pub allow_unleased: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -226,4 +231,27 @@ pub enum TargetsCommand {
 pub enum ConfigCommand {
     /// Validate the configuration without network access
     Check,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn allow_unleased_parses_before_and_after_the_subcommand() {
+        let before = Cli::try_parse_from(["cinc-mirror", "--allow-unleased", "mirror"])
+            .expect("a global flag before the subcommand");
+        assert!(before.allow_unleased);
+        assert!(matches!(before.cmd, Command::Mirror));
+
+        let after = Cli::try_parse_from(["cinc-mirror", "backfill", "--allow-unleased"])
+            .expect("a global flag after the subcommand");
+        assert!(after.allow_unleased);
+        assert!(matches!(after.cmd, Command::Backfill));
+
+        let default = Cli::try_parse_from(["cinc-mirror", "mirror"]).expect("no flag");
+        assert!(!default.allow_unleased);
+    }
 }

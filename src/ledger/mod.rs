@@ -52,6 +52,19 @@
 //! `artifacts.local` is 1 after `verified` and 0 after `local_gc`. A publication
 //! therefore keeps its `published` status when the local blob is deleted;
 //! verification uses the flag to skip a deliberate local removal.
+//!
+//! # Durable files
+//!
+//! [`files::LedgerStore`] keeps the event log as NDJSON in a git worktree and
+//! [`git::Lease`] guards a run with an advisory lease on its own ref. The
+//! database can be thrown away at any time; [`files::LedgerStore::load_all`]
+//! rebuilds it from the branch.
+
+pub mod files;
+pub mod git;
+
+pub use files::{LedgerFilesError, LedgerStore, RUNS_DIR};
+pub use git::{Lease, LeaseError, LeaseHolder, LedgerGitError, LEASE_REF};
 
 use std::collections::HashSet;
 use std::fmt;
@@ -851,6 +864,25 @@ impl Ledger {
         )?;
         let rows = statement.query_map(params![target], |row| row.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<HashSet<_>>>()
+            .map_err(LedgerError::from)
+    }
+
+    /// Every applied event in append order.
+    ///
+    /// The order is the insertion order of the `events` table, which is the
+    /// order the projection was built in. Compaction writes snapshots in this
+    /// order and export prints them in it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] when the query fails.
+    pub fn events(&self) -> Result<Vec<Event>, LedgerError> {
+        let mut statement = self.conn.prepare(
+            "SELECT run_id, seq, ts, kind, artifact_key, target, detail_json
+             FROM events ORDER BY id",
+        )?;
+        let rows = statement.query_map([], event_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(LedgerError::from)
     }
 
