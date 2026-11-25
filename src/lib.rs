@@ -16,12 +16,14 @@ pub mod ledger;
 pub mod net;
 pub mod oci;
 pub mod plan;
+pub mod repair;
 pub mod report;
 pub mod runner;
 pub mod scope;
 pub mod source;
 pub mod store;
 pub mod targets;
+pub mod verify;
 pub mod version;
 
 pub use artifact::{
@@ -44,6 +46,7 @@ pub use ledger::{
 pub use net::RateLimiter;
 pub use oci::{AuthError, HttpFailure, OciAuth, OciConfig, OciError, Registry};
 pub use plan::{build, GroupTotals, Plan, PlanError, SpaceCheck};
+pub use repair::{RepairAction, RepairError, RepairOpts, RepairOutcome, RepairReport};
 pub use report::Summary;
 pub use runner::{run, Order, RunError, RunOpts};
 pub use scope::{PlatformVersion, ResolvedPolicy, ResolvedScope, ScopeArgs, ScopeError};
@@ -58,4 +61,5 @@ pub use store::{Store, StoreError};
 pub use targets::{
     OciTarget, PutOutcome, RsyncAddress, RsyncConfig, RsyncTarget, Target, TargetError, TargetSet,
 };
+pub use verify::{Finding, FindingKind, VerifyError, VerifyOpts, VerifyReport};
 pub use version::{Segment, Version, VersionError, VersionGlob, VersionGlobError};

@@ -29,8 +29,10 @@
 //!   optionally `size`, `upstream_path`, `metadata`.
 //! - `verified`: `size` when the download learned it.
 //! - `published`: `remote_ref` and `remote_digest` when the target reports them.
-//! - `publication_failed`, `publication_interrupted`: `error`, and optionally
-//!   `next_attempt_at` as RFC3339.
+//! - `publication_failed`, `publication_interrupted` and
+//!   `publication_unrecoverable`: `error`, and optionally `next_attempt_at` as
+//!   RFC3339. `publication_unrecoverable` is terminal: the blob is gone locally
+//!   and upstream no longer serves it, so the row is not retried.
 //! - `hash_changed`: `old_sha256` (required), `new_sha256` (defaults to the new
 //!   artifact's digest), optional `old_key` (otherwise derived from the new key)
 //!   and the complete replacement under `artifact`, including its
@@ -137,6 +139,9 @@ pub enum EventKind {
     PublicationInterrupted,
     /// An acknowledged superseded publication is retired.
     PublicationSuperseded,
+    /// A publication this mirror cannot restore: the local blob is gone and
+    /// upstream no longer serves it.
+    PublicationUnrecoverable,
     /// The bytes behind a published artifact changed upstream.
     HashChanged,
     /// An incident was opened.
@@ -168,6 +173,7 @@ impl EventKind {
             Self::PublicationFailed => "publication_failed",
             Self::PublicationInterrupted => "publication_interrupted",
             Self::PublicationSuperseded => "publication_superseded",
+            Self::PublicationUnrecoverable => "publication_unrecoverable",
             Self::HashChanged => "hash_changed",
             Self::IncidentOpened => "incident_opened",
             Self::IncidentAcked => "incident_acked",
@@ -200,6 +206,7 @@ impl FromStr for EventKind {
             "publication_failed" => Self::PublicationFailed,
             "publication_interrupted" => Self::PublicationInterrupted,
             "publication_superseded" => Self::PublicationSuperseded,
+            "publication_unrecoverable" => Self::PublicationUnrecoverable,
             "hash_changed" => Self::HashChanged,
             "incident_opened" => Self::IncidentOpened,
             "incident_acked" => Self::IncidentAcked,
@@ -237,6 +244,9 @@ pub enum PublicationStatus {
     Published,
     /// The publication was retired after an acknowledged hash change.
     Superseded,
+    /// The publication cannot be restored: the local blob is gone and upstream
+    /// no longer serves the bytes. An incident records it for a human.
+    Unrecoverable,
 }
 
 impl PublicationStatus {
@@ -251,6 +261,7 @@ impl PublicationStatus {
             Self::Interrupted => "interrupted",
             Self::Published => "published",
             Self::Superseded => "superseded",
+            Self::Unrecoverable => "unrecoverable",
         }
     }
 }
@@ -273,6 +284,7 @@ impl FromStr for PublicationStatus {
             "interrupted" => Self::Interrupted,
             "published" => Self::Published,
             "superseded" => Self::Superseded,
+            "unrecoverable" => Self::Unrecoverable,
             other => {
                 return Err(LedgerError::PublicationStatus {
                     value: other.to_string(),
@@ -760,6 +772,39 @@ impl Ledger {
             .map_err(LedgerError::from)
     }
 
+    /// Every artifact, including rows superseded by a hash change, ordered by
+    /// key.
+    ///
+    /// Verification and repair work from the complete ledger, not from the
+    /// policies of the current run: an artifact that today's policy no longer
+    /// selects is still part of the mirror. [`Ledger::artifacts`] is the same
+    /// list with the materialised columns; use it when the local-presence flag
+    /// matters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] when the query fails.
+    pub fn all_artifacts(&self) -> Result<Vec<Artifact>, LedgerError> {
+        self.artifacts()
+            .map(|rows| rows.into_iter().map(|row| row.artifact).collect())
+    }
+
+    /// Every publication row for one artifact, ordered by target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] when the query fails.
+    pub fn publications_for(&self, artifact_key: &str) -> Result<Vec<Publication>, LedgerError> {
+        let sql = format!(
+            "SELECT {PUBLICATION_COLUMNS} FROM publications WHERE artifact_key = ?1 \
+             ORDER BY target"
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(params![artifact_key], publication_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(LedgerError::from)
+    }
+
     /// Every publication row for `target`, ordered by artifact key.
     ///
     /// # Errors
@@ -997,6 +1042,9 @@ fn reduce(conn: &Connection, event: &Event) -> Result<(), LedgerError> {
             reduce_publication_attempt(conn, event, PublicationStatus::Interrupted)
         }
         EventKind::PublicationSuperseded => reduce_publication_superseded(conn, event),
+        EventKind::PublicationUnrecoverable => {
+            reduce_publication_attempt(conn, event, PublicationStatus::Unrecoverable)
+        }
         EventKind::HashChanged => reduce_hash_changed(conn, event),
         EventKind::IncidentOpened => reduce_incident_opened(conn, event),
         EventKind::IncidentAcked => reduce_incident_acked(conn, event),

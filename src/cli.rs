@@ -9,8 +9,10 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::config::{Config, ConfigError};
+use crate::repair::RepairOpts;
 use crate::runner::{Order, RunOpts};
 use crate::scope::ScopeArgs;
+use crate::verify::VerifyOpts;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -41,9 +43,9 @@ pub enum Command {
     /// Fill historical versions that are not mirrored yet
     Backfill,
     /// Re-hash and compare known artifacts
-    Verify,
+    Verify(VerifyArgs),
     /// Re-publish or re-fetch artifacts that need repair
-    Repair,
+    Repair(RepairArgs),
     /// Inspect and acknowledge integrity incidents
     Incidents {
         #[command(subcommand)]
@@ -74,8 +76,8 @@ impl Command {
             Self::Mirror(_) => "mirror",
             Self::Plan(_) => "plan",
             Self::Backfill => "backfill",
-            Self::Verify => "verify",
-            Self::Repair => "repair",
+            Self::Verify(_) => "verify",
+            Self::Repair(_) => "repair",
             Self::Incidents { .. } => "incidents",
             Self::Ledger { .. } => "ledger",
             Self::Targets { .. } => "targets",
@@ -224,6 +226,73 @@ impl RunArgs {
             dry_run: self.dry_run,
         }
     }
+}
+
+/// Arguments to `verify`.
+#[derive(Debug, Args)]
+pub struct VerifyArgs {
+    /// Verify only these targets; repeatable (default: every enabled target)
+    #[arg(long = "target", value_name = "NAME")]
+    pub targets: Vec<String>,
+
+    /// Re-hash the local store blobs as well
+    #[arg(long, conflicts_with = "sample")]
+    pub deep: bool,
+
+    /// Check a deterministic sample of this many artifacts
+    #[arg(long, value_name = "N", value_parser = parse_sample)]
+    pub sample: Option<usize>,
+}
+
+impl VerifyArgs {
+    /// Project the parsed flags onto [`VerifyOpts`].
+    #[must_use]
+    pub fn to_opts(&self) -> VerifyOpts {
+        VerifyOpts {
+            targets: non_empty(&self.targets),
+            deep: self.deep,
+            sample: self.sample,
+        }
+    }
+}
+
+/// Arguments to `repair`.
+#[derive(Debug, Args)]
+pub struct RepairArgs {
+    /// Repair only these targets; repeatable (default: every enabled target)
+    #[arg(long = "target", value_name = "NAME")]
+    pub targets: Vec<String>,
+
+    /// Repair at most this many broken publications
+    #[arg(long = "limit", value_name = "N")]
+    pub limit: Option<usize>,
+}
+
+impl RepairArgs {
+    /// Project the parsed flags onto [`RepairOpts`].
+    #[must_use]
+    pub fn to_opts(&self) -> RepairOpts {
+        RepairOpts {
+            targets: non_empty(&self.targets),
+            limit: self.limit,
+        }
+    }
+}
+
+/// `None` when the repeatable flag was not given at all.
+fn non_empty(values: &[String]) -> Option<Vec<String>> {
+    (!values.is_empty()).then(|| values.to_vec())
+}
+
+/// Accept a positive artifact count for `--sample`.
+fn parse_sample(raw: &str) -> Result<usize, String> {
+    let value: usize = raw
+        .parse()
+        .map_err(|_| "expected a positive integer".to_string())?;
+    if value == 0 {
+        return Err("the sample must be greater than zero".to_string());
+    }
+    Ok(value)
 }
 
 /// Arguments to `mirror`.
@@ -430,6 +499,65 @@ mod tests {
         assert_eq!(opts.order, crate::runner::Order::SmallestFirst);
         assert!(opts.gc_after);
         assert!(opts.dry_run);
+    }
+
+    #[test]
+    fn verify_parses_targets_deep_and_sample() {
+        let cli = Cli::try_parse_from([
+            "cinc-mirror",
+            "verify",
+            "--target",
+            "oci",
+            "--target",
+            "rsync",
+            "--deep",
+        ])
+        .expect("verify arguments");
+
+        let Command::Verify(args) = cli.cmd else {
+            panic!("expected verify");
+        };
+        let opts = args.to_opts();
+        assert_eq!(
+            opts.targets,
+            Some(vec!["oci".to_string(), "rsync".to_string()])
+        );
+        assert!(opts.deep);
+        assert_eq!(opts.sample, None);
+
+        let default = Cli::try_parse_from(["cinc-mirror", "verify"]).expect("no flags");
+        let Command::Verify(args) = default.cmd else {
+            panic!("expected verify");
+        };
+        assert_eq!(args.to_opts().targets, None);
+        assert!(!args.to_opts().deep);
+    }
+
+    #[test]
+    fn verify_rejects_deep_with_sample_and_a_zero_sample() {
+        for arguments in [
+            vec!["cinc-mirror", "verify", "--deep", "--sample", "2"],
+            vec!["cinc-mirror", "verify", "--sample", "0"],
+        ] {
+            assert!(
+                Cli::try_parse_from(arguments.clone()).is_err(),
+                "{arguments:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn repair_parses_targets_and_limit() {
+        let cli =
+            Cli::try_parse_from(["cinc-mirror", "repair", "--target", "rsync", "--limit", "4"])
+                .expect("repair arguments");
+
+        let Command::Repair(args) = cli.cmd else {
+            panic!("expected repair");
+        };
+        let opts = args.to_opts();
+        assert_eq!(opts.targets, Some(vec!["rsync".to_string()]));
+        assert_eq!(opts.limit, Some(4));
     }
 
     #[test]
