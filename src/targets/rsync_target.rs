@@ -290,7 +290,7 @@ impl RsyncTarget {
         // A target that never received the old artifact has nothing to
         // preserve. The replacement is published there during the republish,
         // and there is no old publication row to retire.
-        if !self.package_exists(from).await? {
+        if !self.file_exists(from).await? {
             return Ok(());
         }
         match &self.address {
@@ -635,7 +635,8 @@ impl RsyncTarget {
             .transpose()
     }
 
-    async fn package_exists(&self, relative: &str) -> Result<bool, TargetError> {
+    /// Whether a destination-relative path is a file.
+    async fn file_exists(&self, relative: &str) -> Result<bool, TargetError> {
         match &self.address {
             RsyncAddress::Local { .. } => {
                 let path = self
@@ -687,15 +688,23 @@ impl RsyncTarget {
         package: &Path,
         allow_replace: bool,
     ) -> Result<PutOutcome, TargetError> {
+        let relpath = self.reference_relpath(artifact);
+        let metadata_relpath = self.metadata_relpath(artifact);
+
+        // A sidecar alone is not a publication. If the package or the metadata
+        // companion is gone, fall through to a normal upload so a repair pass
+        // can heal the target; skipping the sidecar write keeps its mtime as
+        // the "byte-identical" evidence.
+        let mut sidecar_matches = false;
         if let Some(existing) = self.exists(artifact).await? {
             if existing == artifact.sha256 {
-                // The sidecar already names these exact bytes; the publication
-                // is complete and no bytes cross the wire.
-                return Ok(self.outcome(artifact));
-            }
-            if !allow_replace {
+                if self.file_exists(&relpath).await? && self.file_exists(&metadata_relpath).await? {
+                    return Ok(self.outcome(artifact));
+                }
+                sidecar_matches = true;
+            } else if !allow_replace {
                 return Err(TargetError::TagConflict {
-                    tag: self.reference_relpath(artifact),
+                    tag: relpath,
                     existing,
                     incoming: artifact.sha256.clone(),
                 });
@@ -707,7 +716,6 @@ impl RsyncTarget {
             .map_err(|source| io_error(package.to_path_buf(), source))?
             .len();
 
-        let relpath = self.reference_relpath(artifact);
         let directory = directory_of(&relpath);
         self.prepare_directory(&directory).await?;
 
@@ -719,22 +727,24 @@ impl RsyncTarget {
         fs::write(&metadata, artifact.metadata_json.as_bytes())
             .await
             .map_err(|source| io_error(metadata.clone(), source))?;
-        self.upload_file_with(&metadata, &self.metadata_relpath(artifact), allow_replace)
+        self.upload_file_with(&metadata, &metadata_relpath, allow_replace)
             .await?;
 
         // Sidecar last: its presence is the commit marker for the pair above.
-        let sidecar_dir = TempDir::create()?;
-        let sidecar_name = format!("{}{SIDECAR_SUFFIX}", artifact.basename);
-        let sidecar = sidecar_dir.path().join(&sidecar_name);
-        fs::write(&sidecar, format!("{}  {size}\n", artifact.sha256))
-            .await
-            .map_err(|source| io_error(sidecar.clone(), source))?;
-        self.upload_file_with(
-            &sidecar,
-            &format!("{relpath}{SIDECAR_SUFFIX}"),
-            allow_replace,
-        )
-        .await?;
+        if !sidecar_matches {
+            let sidecar_dir = TempDir::create()?;
+            let sidecar_name = format!("{}{SIDECAR_SUFFIX}", artifact.basename);
+            let sidecar = sidecar_dir.path().join(&sidecar_name);
+            fs::write(&sidecar, format!("{}  {size}\n", artifact.sha256))
+                .await
+                .map_err(|source| io_error(sidecar.clone(), source))?;
+            self.upload_file_with(
+                &sidecar,
+                &format!("{relpath}{SIDECAR_SUFFIX}"),
+                allow_replace,
+            )
+            .await?;
+        }
 
         Ok(self.outcome(artifact))
     }
@@ -822,8 +832,14 @@ impl Target for RsyncTarget {
                 incoming: artifact.sha256.clone(),
             });
         }
-        if !self.package_exists(&relpath).await? {
+        if !self.file_exists(&relpath).await? {
             return Err(TargetError::NotPublished { tag: relpath });
+        }
+        let metadata_relpath = self.metadata_relpath(artifact);
+        if !self.file_exists(&metadata_relpath).await? {
+            return Err(TargetError::NotPublished {
+                tag: metadata_relpath,
+            });
         }
         Ok(())
     }

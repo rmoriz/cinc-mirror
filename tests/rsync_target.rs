@@ -585,6 +585,120 @@ async fn verify_rejects_a_missing_package_behind_a_valid_sidecar() {
 }
 
 #[tokio::test]
+async fn put_restores_a_deleted_package_and_keeps_the_sidecar() {
+    require_rsync();
+
+    let source = tempfile::tempdir().expect("source dir");
+    let root = tempfile::tempdir().expect("target dir");
+    let bytes = b"the verified package bytes";
+    let artifact = artifact_for(bytes);
+    let package = write_package(source.path(), bytes);
+    let target = local_target(root.path());
+    target.put(&artifact, &package).await.expect("put");
+
+    let dir = published_dir(root.path(), &artifact);
+    let sidecar = sidecar_path(root.path(), &artifact);
+    let sidecar_contents = std::fs::read(&sidecar).expect("sidecar");
+    let sidecar_mtime = modified(&sidecar);
+
+    std::fs::remove_file(dir.join(BASENAME)).expect("delete package");
+
+    let error = target
+        .verify(&artifact)
+        .await
+        .expect_err("a package-less publication is incomplete");
+    assert!(
+        matches!(error, TargetError::NotPublished { .. }),
+        "expected NotPublished before the repair, got {error:?}"
+    );
+
+    target.put(&artifact, &package).await.expect("repair put");
+
+    assert_eq!(
+        std::fs::read(dir.join(BASENAME)).expect("restored package"),
+        bytes,
+        "put must restore the missing package"
+    );
+    assert_eq!(
+        std::fs::read(&sidecar).expect("sidecar"),
+        sidecar_contents,
+        "the commit marker content is unchanged"
+    );
+    assert_eq!(
+        modified(&sidecar),
+        sidecar_mtime,
+        "an unchanged sidecar must not be re-uploaded"
+    );
+    target.verify(&artifact).await.expect("verify after repair");
+}
+
+#[tokio::test]
+async fn put_restores_a_deleted_metadata_file() {
+    require_rsync();
+
+    let source = tempfile::tempdir().expect("source dir");
+    let root = tempfile::tempdir().expect("target dir");
+    let bytes = b"the verified package bytes";
+    let artifact = artifact_for(bytes);
+    let package = write_package(source.path(), bytes);
+    let target = local_target(root.path());
+    target.put(&artifact, &package).await.expect("put");
+
+    let dir = published_dir(root.path(), &artifact);
+    let sidecar = sidecar_path(root.path(), &artifact);
+    let sidecar_mtime = modified(&sidecar);
+
+    std::fs::remove_file(dir.join("metadata.json")).expect("delete metadata");
+
+    let error = target
+        .verify(&artifact)
+        .await
+        .expect_err("a publication without metadata.json is incomplete");
+    assert!(
+        matches!(error, TargetError::NotPublished { .. }),
+        "expected NotPublished before the repair, got {error:?}"
+    );
+
+    target.put(&artifact, &package).await.expect("repair put");
+
+    assert_eq!(
+        std::fs::read_to_string(dir.join("metadata.json")).expect("restored metadata"),
+        artifact.metadata_json,
+        "the metadata document is restored verbatim"
+    );
+    assert_eq!(
+        modified(&sidecar),
+        sidecar_mtime,
+        "an unchanged sidecar must not be re-uploaded"
+    );
+    target.verify(&artifact).await.expect("verify after repair");
+}
+
+#[tokio::test]
+async fn put_republishes_a_fully_deleted_publication() {
+    require_rsync();
+
+    let source = tempfile::tempdir().expect("source dir");
+    let root = tempfile::tempdir().expect("target dir");
+    let bytes = b"the verified package bytes";
+    let artifact = artifact_for(bytes);
+    let package = write_package(source.path(), bytes);
+    let target = local_target(root.path());
+    target.put(&artifact, &package).await.expect("put");
+
+    std::fs::remove_dir_all(published_dir(root.path(), &artifact))
+        .expect("delete the whole publication");
+
+    assert_eq!(target.exists(&artifact).await.expect("exists"), None);
+
+    target.put(&artifact, &package).await.expect("republish");
+    target
+        .verify(&artifact)
+        .await
+        .expect("verify after republish");
+}
+
+#[tokio::test]
 async fn a_corrupt_sidecar_is_an_error_not_a_miss() {
     require_rsync();
 
