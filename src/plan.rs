@@ -52,6 +52,30 @@ pub struct SpaceCheck {
     pub fits: Option<bool>,
 }
 
+/// One tag collision as the plan reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CollisionDetail {
+    /// Descriptive tag both artifacts claim.
+    pub tag: String,
+    /// Canonical key of the artifact the crawl keeps.
+    pub kept: String,
+    /// Canonical key of the artifact the crawl excludes.
+    pub conflicting: String,
+    /// Upstream path of the excluded artifact, which may be an alias path.
+    pub upstream_path: String,
+}
+
+impl CollisionDetail {
+    fn new(collision: &TagCollision) -> Self {
+        Self {
+            tag: collision.tag.clone(),
+            kept: collision.first.key(),
+            conflicting: collision.conflicting.key(),
+            upstream_path: collision.upstream_path.clone(),
+        }
+    }
+}
+
 /// The estimate produced by [`build`].
 #[derive(Debug, Clone, Serialize)]
 pub struct Plan {
@@ -64,6 +88,8 @@ pub struct Plan {
     /// Tag collisions the crawl reported. The conflicting artifacts are
     /// excluded from every count; `mirror` opens an incident for each.
     pub collisions: usize,
+    /// The collisions behind [`Plan::collisions`], for inspection.
+    pub collision_details: Vec<CollisionDetail>,
     /// Totals per project.
     pub by_project: BTreeMap<String, GroupTotals>,
     /// Totals per platform.
@@ -177,6 +203,7 @@ pub async fn build(
         total_bytes: 0,
         satisfied_bytes: 0,
         collisions: collisions.len(),
+        collision_details: collisions.iter().map(CollisionDetail::new).collect(),
         by_project: BTreeMap::new(),
         by_platform: BTreeMap::new(),
         by_arch: BTreeMap::new(),

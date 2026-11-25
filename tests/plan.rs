@@ -754,12 +754,28 @@ async fn plan_excludes_colliding_artifacts_and_reports_them() {
     .expect("a collision does not fail the plan");
 
     assert_eq!(plan.collisions, 1);
+    assert_eq!(plan.collision_details.len(), 1, "details back the count");
+    let collision = &plan.collision_details[0];
+    assert_eq!(collision.tag, "19.4.46-debian-13-arm64");
+    assert_eq!(
+        collision.kept,
+        format!("stable/cinc/19.4.46/debian/13/arm64/{SHA_B}")
+    );
+    assert_eq!(
+        collision.conflicting,
+        format!("stable/cinc/19.4.46/debian/13/arm64/{SHA_C}")
+    );
+    assert_eq!(
+        collision.upstream_path,
+        "stable/cinc/19.4.46/debian/13/cinc_19.4.46-1_arm64.deb"
+    );
     assert_eq!(
         plan.artifacts, 1,
         "the conflicting artifact is excluded from the totals"
     );
     assert_eq!(plan.total_bytes, 2000, "only the kept artifact is counted");
     assert!(plan.to_json().contains("\"collisions\": 1"));
+    assert!(plan.to_json().contains("\"collision_details\""));
 }
 
 // Plan totals and grouping ---------------------------------------------------
@@ -929,6 +945,7 @@ async fn json_embeds_effective_policy_and_is_stable() {
         "\"total_bytes\"",
         "\"satisfied_bytes\"",
         "\"collisions\"",
+        "\"collision_details\"",
         "\"by_project\"",
         "\"by_platform\"",
         "\"by_arch\"",

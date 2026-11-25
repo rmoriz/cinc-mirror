@@ -1039,6 +1039,14 @@ fn print_plan(estimate: &Plan, by: PlanGrouping) {
             "collisions: {} (excluded above; mirror opens an incident for each)",
             estimate.collisions
         );
+        for collision in &estimate.collision_details {
+            println!("  tag: {}", collision.tag);
+            println!("    kept:        {}", collision.kept);
+            println!(
+                "    conflicting: {} (upstream {})",
+                collision.conflicting, collision.upstream_path
+            );
+        }
     }
 
     let (label, groups) = match by {
