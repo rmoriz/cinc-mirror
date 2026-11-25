@@ -2,7 +2,7 @@
 name = "cinc-mirror"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 description = "Mirror CINC packages from upstream to OCI registries and rsync targets"
 license = "Apache-2.0"
 
@@ -17,7 +17,6 @@ futures-rustls = { version = "0.26", default-features = false, features = ["ring
 humantime = "2"
 indicatif = "0.17"
 libc = "0.2"
-oci-client = "0.14"
 percent-encoding = "2"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
