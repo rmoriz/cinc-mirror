@@ -213,6 +213,60 @@ fn zero_byte_limit_is_a_usage_error() {
 }
 
 #[test]
+fn a_failed_mirror_still_writes_its_run_file() {
+    let root = tempfile::tempdir().expect("root");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let target_root = root.path().join("rsync");
+    std::fs::create_dir_all(&target_root).expect("target root");
+    let remote = bare_remote(root.path());
+    // A project name with a traversal segment makes the crawl fail locally,
+    // after the runner has appended `run_started` and before any network I/O.
+    let config = write_config(
+        root.path(),
+        &state,
+        &remote,
+        &format!(
+            r#"[[projects]]
+id = "broken"
+project = ".."
+channel = "stable"
+
+[[targets]]
+name = "rsync"
+kind = "rsync"
+url = {target_root:?}
+auth = "anonymous"
+"#
+        ),
+    );
+
+    binary()
+        .arg("--config")
+        .arg(&config)
+        .args(["mirror", "--everything"])
+        .assert()
+        .code(1);
+
+    let runs = state.join("ledger-repo").join("runs");
+    let files: Vec<PathBuf> = std::fs::read_dir(&runs)
+        .expect("run files directory")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "ndjson"))
+        .collect();
+    assert_eq!(files.len(), 1, "the failed run must leave one event file");
+    let body = std::fs::read_to_string(&files[0]).expect("run file");
+    assert!(
+        body.contains("\"run_started\""),
+        "the events appended before the failure are kept: {body}"
+    );
+    assert!(
+        !body.contains("\"run_finished\""),
+        "a failed run has no finished event: {body}"
+    );
+}
+
+#[test]
 fn lease_busy_exits_4() {
     let root = tempfile::tempdir().expect("root");
     let state = root.path().join("state");
@@ -234,6 +288,15 @@ fn lease_busy_exits_4() {
         .code(4)
         .stderr(predicate::str::contains("busy"));
 
+    // A plain acknowledgement writes events too, so it takes the lease as well.
+    binary()
+        .arg("--config")
+        .arg(&config)
+        .args(["incidents", "ack", "tag_conflict-0000000000000000"])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("busy"));
+
     // `--allow-unleased` continues past a live foreign lease; with no enabled
     // target the run then fails as configuration, never as lease-busy.
     binary()
@@ -242,6 +305,19 @@ fn lease_busy_exits_4() {
         .args(["mirror", "--everything", "--allow-unleased"])
         .assert()
         .code(5);
+
+    // With the flag the ack proceeds and then fails on the unknown incident.
+    binary()
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "incidents",
+            "ack",
+            "tag_conflict-0000000000000000",
+            "--allow-unleased",
+        ])
+        .assert()
+        .code(64);
 
     held.release().expect("release");
 }

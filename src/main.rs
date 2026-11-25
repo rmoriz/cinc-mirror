@@ -8,8 +8,9 @@
 //! lease.
 //!
 //! Exit codes are the specification's: `0` clean, `2` partial or a failed ledger
-//! push, `3` newly opened incidents, `4` a live foreign lease, `5` configuration
-//! or auth, `64` usage.
+//! push, `3` newly opened incidents (also an incident-flow error nested in
+//! another error), `4` a live foreign lease, `5` configuration or auth, `64`
+//! usage. `1` is the documented internal-error code for anything unclassified.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -117,14 +118,14 @@ fn exit_code(error: &anyhow::Error) -> i32 {
     if error.downcast_ref::<PushFailure>().is_some() {
         return EXIT_PARTIAL;
     }
-    if let Some(error) = error.downcast_ref::<ScopeError>() {
-        let _ = error;
+    if error.downcast_ref::<ScopeError>().is_some() {
         return EXIT_USAGE;
     }
     if let Some(error) = error.downcast_ref::<RunError>() {
         return match error {
             RunError::Usage { .. } => EXIT_USAGE,
             RunError::NoTargets => EXIT_CONFIG,
+            RunError::Incident(_) => EXIT_INCIDENTS,
             _ => 1,
         };
     }
@@ -258,6 +259,7 @@ struct LedgerEnv {
     ledger: Option<Ledger>,
     store: Option<LedgerStore>,
     unavailable: Option<String>,
+    state_dir: PathBuf,
 }
 
 impl LedgerEnv {
@@ -281,6 +283,18 @@ impl LedgerEnv {
 
     fn restore(&mut self, ledger: Ledger) {
         self.ledger = Some(ledger);
+    }
+
+    /// Reopen the database after a command moved the connection into a [`Ctx`]
+    /// and failed before giving it back.
+    ///
+    /// The events are already committed to SQLite, so the reopened connection
+    /// sees them and the error path can still write the run file.
+    fn reopen_if_needed(&mut self) -> anyhow::Result<()> {
+        if self.ledger.is_none() {
+            self.ledger = Some(Ledger::open(&self.state_dir)?);
+        }
+        Ok(())
     }
 
     fn require_store(&self) -> anyhow::Result<&LedgerStore> {
@@ -308,6 +322,7 @@ fn open_ledger(config: &Config, allow_unleased: bool) -> anyhow::Result<LedgerEn
                 ledger: Some(ledger),
                 store: None,
                 unavailable: Some(reason),
+                state_dir,
             });
         }
         Err(error) => return Err(error),
@@ -329,6 +344,7 @@ fn open_ledger(config: &Config, allow_unleased: bool) -> anyhow::Result<LedgerEn
                 ledger: Some(ledger),
                 store: Some(store),
                 unavailable: None,
+                state_dir,
             })
         }
         Err(error) if allow_unleased => {
@@ -338,6 +354,7 @@ fn open_ledger(config: &Config, allow_unleased: bool) -> anyhow::Result<LedgerEn
                 ledger: Some(ledger),
                 store: None,
                 unavailable: Some(reason),
+                state_dir,
             })
         }
         Err(error) => Err(error.context("cannot sync the ledger branch")),
@@ -510,7 +527,7 @@ impl RunRecorder {
     ///
     /// The primary run is written from [`Ledger::events_for_run`]; the incident
     /// flow uses its own run ids, and those files are written here as well.
-    fn finish(self, env: &LedgerEnv, primary: &str, message: &str) -> anyhow::Result<()> {
+    fn finish(&self, env: &LedgerEnv, primary: &str, message: &str) -> anyhow::Result<()> {
         let mut groups: BTreeMap<String, Vec<Event>> = BTreeMap::new();
         for event in env.ledger()?.events_since(self.cursor)? {
             groups.entry(event.run_id.clone()).or_default().push(event);
@@ -522,6 +539,21 @@ impl RunRecorder {
             persist_group(env, &run_id, &events, &format!("{run_id}: {message}"))?;
         }
         Ok(())
+    }
+
+    /// Best-effort variant for an error path: never masks the original error.
+    fn finish_or_warn(&self, env: &mut LedgerEnv, primary: &str, message: &str) {
+        let result = env
+            .reopen_if_needed()
+            .and_then(|()| self.finish(env, primary, message));
+        if let Err(error) = result {
+            tracing::warn!(
+                %error,
+                run_id = primary,
+                "the run's events could not be written and pushed; \
+                 they exist only in the local ledger"
+            );
+        }
     }
 }
 
@@ -844,20 +876,40 @@ async fn run_mirror_like(
         opts.cursor_fingerprint = Some(fingerprint);
     }
 
+    let mode_name = match mode {
+        BackfillMode::Mirror => "mirror",
+        BackfillMode::Backfill => "backfill",
+    };
     let recorder = RunRecorder::begin(env.ledger()?)?;
     let ledger = env.take_ledger()?;
-    let ctx = build_context(config, scope, ledger, run_id.clone())?;
-    let summary = runner::run(&ctx, opts).await?;
-    env.restore(take_ledger(ctx));
+
+    // The body runs in an inner block so a failure still hands the ledger back
+    // to the recorder below.
+    let outcome = async {
+        let ctx = build_context(config, scope, ledger, run_id.clone())?;
+        let summary = runner::run(&ctx, opts).await?;
+        env.restore(take_ledger(ctx));
+        Ok::<Summary, anyhow::Error>(summary)
+    }
+    .await;
+
+    let summary = match outcome {
+        Ok(summary) => summary,
+        Err(error) => {
+            // A run that failed after `run_started` has events worth keeping.
+            recorder.finish_or_warn(
+                &mut env,
+                &run_id,
+                &format!("{mode_name} {run_id} (incomplete)"),
+            );
+            return Err(error);
+        }
+    };
 
     print_summary(&summary, run_args.json);
     if run_args.dry_run {
         println!("dry run: {} artifact(s) would be queued", summary.queued);
     }
-    let mode_name = match mode {
-        BackfillMode::Mirror => "mirror",
-        BackfillMode::Backfill => "backfill",
-    };
     recorder.finish(
         &env,
         &run_id,
@@ -929,14 +981,17 @@ async fn plan_command(base: &Config, args: PlanArgs, allow_unleased: bool) -> an
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>(),
-                "host": hostname(),
+                "host": cinc_mirror::hostname(),
                 "summary": {
                     "artifacts": estimate.artifacts,
                     "total_bytes": estimate.total_bytes,
                     "satisfied_bytes": estimate.satisfied_bytes,
                 },
             }));
-        env.ledger_mut()?.append(&event)?;
+        if let Err(error) = env.ledger_mut()?.append(&event) {
+            recorder.finish_or_warn(&mut env, &run_id, &format!("plan {run_id} (incomplete)"));
+            return Err(error.into());
+        }
         recorder.finish(&env, &run_id, &format!("plan {run_id} recorded"))?;
     }
 
@@ -1036,12 +1091,6 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-fn hostname() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("HOST"))
-        .unwrap_or_default()
-}
-
 // ---------------------------------------------------------------------------
 // verify / repair
 // ---------------------------------------------------------------------------
@@ -1098,9 +1147,22 @@ async fn repair_command(
     let mut env = open_ledger(&config, allow_unleased)?;
     let recorder = RunRecorder::begin(env.ledger()?)?;
     let ledger = env.take_ledger()?;
-    let ctx = build_context(config, ResolvedScope::default(), ledger, run_id.clone())?;
-    let report = repair::run(&ctx, args.to_opts()).await?;
-    env.restore(take_ledger(ctx));
+
+    let outcome = async {
+        let ctx = build_context(config, ResolvedScope::default(), ledger, run_id.clone())?;
+        let report = repair::run(&ctx, args.to_opts()).await?;
+        env.restore(take_ledger(ctx));
+        Ok::<RepairReport, anyhow::Error>(report)
+    }
+    .await;
+
+    let report = match outcome {
+        Ok(report) => report,
+        Err(error) => {
+            recorder.finish_or_warn(&mut env, &run_id, &format!("repair {run_id} (incomplete)"));
+            return Err(error);
+        }
+    };
 
     if args.json {
         println!("{}", repair_json(&report));
@@ -1196,23 +1258,30 @@ async fn incidents_command(
         } => {
             let run_id = new_run_id();
             let mut env = open_ledger(config, allow_unleased)?;
-            let guard = if republish {
-                acquire_lease(&env, &run_id, allow_unleased).await?
-            } else {
-                None
-            };
+            // An acknowledgement appends events and pushes a run file, so it
+            // serialises against mirror and backfill writers like they do.
+            let guard = acquire_lease(&env, &run_id, allow_unleased).await?;
 
             let recorder = RunRecorder::begin(env.ledger()?)?;
-            let targets = TargetSet::from_config(config)?;
-            incident::ack(
-                env.ledger_mut()?,
-                &targets,
-                config,
-                &id,
-                note.as_deref(),
-                republish,
-            )
-            .await?;
+            let outcome = async {
+                let targets = TargetSet::from_config(config)?;
+                incident::ack(
+                    env.ledger_mut()?,
+                    &targets,
+                    config,
+                    &id,
+                    note.as_deref(),
+                    republish,
+                )
+                .await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            if let Err(error) = outcome {
+                recorder.finish_or_warn(&mut env, &run_id, &format!("incident {id} (incomplete)"));
+                return Err(error);
+            }
             recorder.finish(&env, &run_id, &format!("incident {id}: acknowledged"))?;
             if let Some(guard) = guard {
                 guard.release().await;
@@ -1258,9 +1327,27 @@ async fn ledger_command(
             let scope = config.resolve(&ScopeArgs::default())?;
             let recorder = RunRecorder::begin(env.ledger()?)?;
             let ledger = env.take_ledger()?;
-            let ctx = build_context(config.clone(), scope, ledger, run_id.clone())?;
-            let report = cinc_mirror::bootstrap::run(&ctx).await?;
-            env.restore(take_ledger(ctx));
+
+            let outcome = async {
+                let ctx = build_context(config.clone(), scope, ledger, run_id.clone())?;
+                let report = cinc_mirror::bootstrap::run(&ctx).await?;
+                env.restore(take_ledger(ctx));
+                Ok::<cinc_mirror::BootstrapReport, anyhow::Error>(report)
+            }
+            .await;
+
+            let report = match outcome {
+                Ok(report) => report,
+                Err(error) => {
+                    recorder.finish_or_warn(
+                        &mut env,
+                        &run_id,
+                        &format!("bootstrap {run_id} (incomplete)"),
+                    );
+                    return Err(error);
+                }
+            };
+
             println!("{report}");
             recorder.finish(&env, &run_id, &format!("bootstrap {run_id}"))?;
             if let Some(guard) = guard {

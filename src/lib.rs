@@ -65,3 +65,14 @@ pub use targets::{
 };
 pub use verify::{Finding, FindingKind, VerifyError, VerifyOpts, VerifyReport};
 pub use version::{Segment, Version, VersionError, VersionGlob, VersionGlobError};
+
+/// Host name for run events, or an empty string when the environment omits it.
+///
+/// Kept in one place so the runner, bootstrap and the command layer record the
+/// same value.
+#[must_use]
+pub fn hostname() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("HOST"))
+        .unwrap_or_default()
+}

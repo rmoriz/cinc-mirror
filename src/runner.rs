@@ -987,7 +987,7 @@ fn started_event(ctx: &Ctx, opts: &RunOpts, seq: u64) -> Event {
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
-        "host": hostname(),
+        "host": crate::hostname(),
     }))
 }
 
@@ -1119,12 +1119,6 @@ fn failed_event(ctx: &Ctx, seq: u64, artifact: &Artifact, target: &str, error: &
 async fn append(ctx: &Ctx, event: Event) -> Result<(), RunError> {
     ctx.ledger.lock().await.append(&event)?;
     Ok(())
-}
-
-fn hostname() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("HOST"))
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

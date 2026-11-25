@@ -157,7 +157,7 @@ pub async fn run(ctx: &Ctx) -> Result<BootstrapReport, BootstrapError> {
         )
         .with_detail(json!({
             "mode": "bootstrap",
-            "host": hostname(),
+            "host": crate::hostname(),
             "transport_order": ctx
                 .config
                 .transport
@@ -217,13 +217,6 @@ pub async fn run(ctx: &Ctx) -> Result<BootstrapReport, BootstrapError> {
     )?;
 
     Ok(report)
-}
-
-/// Host name for the run event; empty when the environment does not say.
-fn hostname() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("HOST"))
-        .unwrap_or_default()
 }
 
 /// Crawl every selected policy into one artifact list.
