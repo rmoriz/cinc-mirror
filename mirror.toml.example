@@ -1,9 +1,22 @@
-# cinc-mirror example configuration.
+# cinc-mirror example configuration: mirror to GHCR.
 #
-# Copy this file to mirror.toml (git-ignored, mode 0600) and adjust it.
-# Credentials are never stored here: each target names an auth mode and the
-# real secret is read from the environment, Docker config or a key file at use
-# time.
+# Copy this file to mirror.toml (git-ignored, mode 0600) and replace the
+# placeholders:
+#
+#   cp mirror.toml.example mirror.toml && chmod 600 mirror.toml
+#
+# Credentials are never stored in this file. The `ghcr` target uses
+# `auth = "docker"`, so log in once and let Docker keep the credential:
+#
+#   echo "$GHCR_TOKEN" | docker login ghcr.io -u <github-user> --password-stdin
+#
+# with a token that carries `write:packages` (plus `read:packages`, `repo`).
+# In GitHub Actions the workflow writes the same docker config from
+# `GITHUB_TOKEN`, so nothing here changes there.
+#
+# Replace `<owner>` with your GitHub user or organization. New GHCR packages
+# are private; make them public once under
+# Package settings -> Change package visibility.
 
 state_dir = "~/.local/state/cinc-mirror"
 concurrency = 4
@@ -18,7 +31,7 @@ id = "cinc-stable"
 project = "cinc"
 channel = "stable"
 min_version = "19.0.0"
-platforms = ["debian", "ubuntu", "el"]
+platforms = ["debian", "ubuntu"]
 arches = ["amd64", "arm64"]
 
 [projects.platform_versions]
@@ -29,7 +42,7 @@ id = "cinc-auditor"
 project = "cinc-auditor"
 channel = "stable"
 min_version = "7.0.0"
-platforms = ["debian", "ubuntu", "el", "windows"]
+platforms = ["debian", "ubuntu"]
 arches = ["amd64", "arm64"]
 
 [[projects]]
@@ -44,16 +57,23 @@ arches = "*"
 branch = "ledger"
 remote = "origin"
 
+# Repository that receives incident issues, as `owner/repo`. Defaults to
+# `GITHUB_REPOSITORY` inside GitHub Actions.
+# issue_repo = "<owner>/cinc-mirror"
+
 [[targets]]
 name = "ghcr"
 kind = "oci"
 registry = "ghcr.io"
-namespace = "rmoriz/cinc-mirror"
+namespace = "<owner>/cinc-mirror"
 auth = "docker"
 
-[[targets]]
-name = "rsync"
-kind = "rsync"
-url = "ssh://mirror@backup.example.org/srv/cinc-mirror"
-auth = "ssh-key"
-enabled = false
+# A second, ordinary target. Enable it and fill in the host or path; the same
+# bytes are always fanned out to every enabled target.
+#
+# [[targets]]
+# name = "rsync"
+# kind = "rsync"
+# url = "ssh://mirror@backup.example.org/srv/cinc-mirror"
+# auth = "ssh-key"
+# identity_file = "~/.ssh/id_ed25519"

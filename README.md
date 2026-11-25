@@ -56,6 +56,9 @@ with `--config`. The file is git-ignored and should be mode `0600`. It never
 contains credentials: a target names an auth mode and the secret is read from
 the environment, Docker config or a key file at use time.
 
+A commented, ready-to-edit example that publishes to GHCR is in
+`mirror.toml.example`; copy it to `mirror.toml`.
+
 Every project is an explicit policy. Version bounds, globs, platforms, platform
 versions and architectures narrow what is crawled; `all_versions` and `"*"`
 widen it.
