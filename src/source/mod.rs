@@ -1,31 +1,39 @@
 //! Upstream source access.
 //!
-//! Two upstream views are needed and both are HTTPS only:
+//! Three upstream views are needed:
 //!
 //! - the autoindex Apache serves for a directory, parsed into [`IndexEntry`]
 //!   values by [`Source::list`];
 //! - the `*.metadata.json` sibling beside every package, parsed by
-//!   [`Source::metadata`].
+//!   [`Source::metadata`];
+//! - the package bytes themselves, fetched by [`Source::download`] through the
+//!   FTP/FTPS/HTTPS ladder in [`transport`].
 //!
-//! The mirror never falls back to cleartext. The request URL is checked before
-//! anything is sent, a redirect to a non-HTTPS URL is refused before it is
-//! followed, and the *final* URL is checked again after redirects as defense in
-//! depth. Redirects are additionally limited to ten hops and to the configured
-//! host, so a listed or metadata response cannot quietly move the crawl to a
-//! third party.
+//! Listings and metadata are HTTPS only. The mirror never falls back to
+//! cleartext for either: the request URL is checked before anything is sent, a
+//! redirect to a non-HTTPS URL is refused before it is followed, and the *final*
+//! URL is checked again after redirects as defense in depth. Redirects are
+//! additionally limited to ten hops and to the configured host, so a listed or
+//! metadata response cannot quietly move the crawl to a third party.
+//!
+//! Payloads may travel over plain FTP because upstream is measurably faster
+//! there; the SHA-256 gate, not the transport, carries integrity, and a file is
+//! only accepted after its full digest has been verified.
 //!
 //! The client construction is not async; only [`Source::list`],
-//! [`Source::metadata`] and [`Source::sizes`] perform I/O. The first two read
-//! through [`Fetcher`], which keeps the scheme enforcement in [`Source`]
-//! testable without a TLS server; sizes additionally use the configured FTP
-//! host as a cheap source of advisory byte counts.
+//! [`Source::metadata`], [`Source::sizes`] and [`Source::download`] perform I/O.
+//! The first two read through [`Fetcher`], which keeps the scheme enforcement in
+//! [`Source`] testable without a TLS server; sizes additionally use the
+//! configured FTP host as a cheap source of advisory byte counts.
 
 pub mod index;
 pub mod metadata;
 pub mod size;
+pub mod transport;
 
 use std::fmt;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use reqwest::redirect::Policy;
@@ -34,7 +42,12 @@ use thiserror::Error;
 use url::Url;
 
 use crate::config::{Config, TransportKind};
+use crate::hash::ExpectedHashes;
 use crate::source::metadata::Metadata;
+use crate::source::transport::{
+    DownloadError, DownloadOutcome, FtpTransport, FtpsTransport, HttpsTransport, PayloadTransport,
+    RetryPolicy, DEFAULT_TRANSPORTS,
+};
 
 pub use index::{parse_index, IndexEntry};
 
@@ -51,7 +64,7 @@ pub const DEFAULT_FTP_BASE_PATH: &str = "pub/cinc/files";
 const MAX_REDIRECTS: usize = 10;
 
 /// User agent sent with every upstream request.
-const USER_AGENT: &str = concat!("cinc-mirror/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("cinc-mirror/", env!("CARGO_PKG_VERSION"));
 
 /// Where upstream artifacts and metadata are read from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +252,10 @@ pub struct Source {
     ftp_host: String,
     ftp_port: u16,
     ftp_base_path: String,
+    transports: Vec<TransportKind>,
+    payload: Option<Vec<Arc<dyn PayloadTransport>>>,
+    payload_client: Arc<OnceLock<Client>>,
+    retry: RetryPolicy,
 }
 
 impl fmt::Debug for Source {
@@ -263,13 +280,13 @@ impl Source {
     /// [`SourceError::Http`] when the HTTP client cannot be built.
     pub fn new(config: &SourceConfig) -> Result<Self, SourceError> {
         let fetcher = HttpFetcher::new(config)?;
-        Ok(
-            Self::with_fetcher(Arc::new(fetcher), config.https_base.clone()).with_ftp(
-                config.ftp_host.clone(),
-                config.ftp_port,
-                config.ftp_base_path.clone(),
-            ),
-        )
+        let mut source = Self::with_fetcher(Arc::new(fetcher), config.https_base.clone()).with_ftp(
+            config.ftp_host.clone(),
+            config.ftp_port,
+            config.ftp_base_path.clone(),
+        );
+        source.transports = config.transports.clone();
+        Ok(source)
     }
 
     /// Build a source over an arbitrary fetcher.
@@ -285,7 +302,28 @@ impl Source {
             ftp_host: DEFAULT_FTP_HOST.to_string(),
             ftp_port: DEFAULT_FTP_PORT,
             ftp_base_path: DEFAULT_FTP_BASE_PATH.to_string(),
+            transports: Vec::from(DEFAULT_TRANSPORTS),
+            payload: None,
+            payload_client: Arc::new(OnceLock::new()),
+            retry: RetryPolicy::default(),
         }
+    }
+
+    /// Replace the payload ladder.
+    ///
+    /// This is the seam that lets resume, retry and verification run without a
+    /// TLS or FTP server. The order of `transports` is the ladder order.
+    #[must_use]
+    pub fn with_payload_transports(mut self, transports: Vec<Arc<dyn PayloadTransport>>) -> Self {
+        self.payload = Some(transports);
+        self
+    }
+
+    /// Set the retry and backoff policy used by [`Source::download`].
+    #[must_use]
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry = policy;
+        self
     }
 
     /// Point size resolution at another FTP endpoint.
@@ -352,6 +390,62 @@ impl Source {
         ensure_https(fetched.final_url.clone())?;
 
         metadata_from_body(&fetched.final_url, &fetched.body)
+    }
+
+    /// Download `remote_path` into `dest` through the payload ladder and verify
+    /// it against `expected`.
+    ///
+    /// `dest` is a partial file the caller owns (the store uses
+    /// `<state>/partial/<sha256>.part`). Its current length is the resume offset;
+    /// a transport only continues it when the remote object is known to be
+    /// larger. On success the file holds the verified bytes and
+    /// [`DownloadOutcome`] reports which rung served them. A complete file whose
+    /// digests do not match is deleted and reported as
+    /// [`DownloadError::Corrupt`]; a partial left by a failed transfer is kept so
+    /// the next run can resume it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DownloadError::Rejected`] when a rung refuses the path
+    /// permanently (missing, authentication, forbidden), [`DownloadError::Corrupt`]
+    /// when the bytes are complete but wrong, [`DownloadError::Exhausted`] when no
+    /// rung produced a file, and [`DownloadError::Io`] when the local `.part`
+    /// cannot be read or written.
+    pub async fn download(
+        &self,
+        remote_path: &str,
+        dest: &Path,
+        expected: &ExpectedHashes,
+    ) -> Result<DownloadOutcome, DownloadError> {
+        let ladder = self.payload_ladder();
+        transport::download(&ladder, &self.retry, remote_path, dest, expected).await
+    }
+
+    /// The configured ladder, or the injected one.
+    fn payload_ladder(&self) -> Vec<Arc<dyn PayloadTransport>> {
+        if let Some(explicit) = &self.payload {
+            return explicit.clone();
+        }
+
+        self.transports
+            .iter()
+            .map(|kind| match kind {
+                TransportKind::Ftp => Arc::new(FtpTransport::new(
+                    self.ftp_host.clone(),
+                    self.ftp_port,
+                    self.ftp_base_path.clone(),
+                )) as Arc<dyn PayloadTransport>,
+                TransportKind::Ftps => Arc::new(FtpsTransport::new(
+                    self.ftp_host.clone(),
+                    self.ftp_port,
+                    self.ftp_base_path.clone(),
+                )),
+                TransportKind::Https => Arc::new(HttpsTransport::with_client(
+                    self.https_base.clone(),
+                    Arc::clone(&self.payload_client),
+                )),
+            })
+            .collect()
     }
 }
 
@@ -460,7 +554,7 @@ fn metadata_from_body(url: &Url, body: &str) -> Result<Metadata, SourceError> {
 }
 
 /// Redirect policy: at most [`MAX_REDIRECTS`] hops, same host only.
-fn redirect_policy(allowed_host: &str) -> Policy {
+pub(crate) fn redirect_policy(allowed_host: &str) -> Policy {
     let allowed_host = allowed_host.to_string();
 
     Policy::custom(move |attempt| {
@@ -527,6 +621,23 @@ mod tests {
         let error = SourceConfig::from_config(&config).expect_err("cleartext must be refused");
 
         assert!(matches!(error, SourceError::Config { .. }));
+    }
+
+    #[test]
+    fn payload_ladder_follows_the_configured_order() {
+        let config = SourceConfig {
+            transports: vec![TransportKind::Https, TransportKind::Ftp],
+            ..config()
+        };
+        let source = Source::new(&config).expect("source");
+
+        let kinds: Vec<TransportKind> = source
+            .payload_ladder()
+            .iter()
+            .map(|rung| rung.kind())
+            .collect();
+
+        assert_eq!(kinds, vec![TransportKind::Https, TransportKind::Ftp]);
     }
 
     #[test]

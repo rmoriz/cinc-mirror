@@ -24,10 +24,14 @@ pub use config::{
     TargetKind, TransportKind,
 };
 pub use crawl::{crawl, CrawlError};
-pub use hash::{hash_file, hash_reader, ExpectedHashes, Hashes, VerifyOutcome};
+pub use hash::{hash_file, hash_reader, ExpectedHashes, Hasher, Hashes, VerifyOutcome};
 pub use plan::{build, GroupTotals, Plan, PlanError, SpaceCheck};
 pub use scope::{PlatformVersion, ResolvedPolicy, ResolvedScope, ScopeArgs, ScopeError};
 pub use source::index::{parse_index, IndexEntry};
 pub use source::metadata::{Metadata, MetadataError};
+pub use source::transport::{
+    DownloadError, DownloadOutcome, FtpTransport, FtpsTransport, HttpsTransport, PayloadTransport,
+    RetryPolicy, TransportError,
+};
 pub use source::{Source, SourceConfig, SourceError};
 pub use version::{Segment, Version, VersionError, VersionGlob, VersionGlobError};

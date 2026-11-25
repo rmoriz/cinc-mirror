@@ -11,7 +11,9 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use libunftp::auth::DefaultUser;
-use libunftp::storage::{Error, ErrorKind, Fileinfo, Metadata, Result, StorageBackend};
+use libunftp::storage::{
+    Error, ErrorKind, Fileinfo, Metadata, Result, StorageBackend, FEATURE_RESTART,
+};
 
 /// Metadata for one file below the test root.
 #[derive(Debug, Clone)]
@@ -97,6 +99,12 @@ fn read_only() -> Error {
 #[async_trait]
 impl StorageBackend<DefaultUser> for ReadOnlyFs {
     type Metadata = FsMetadata;
+
+    /// Advertise `REST STREAM` so the payload ladder's resume path can be
+    /// exercised over a real FTP control connection.
+    fn supported_features(&self) -> u32 {
+        FEATURE_RESTART
+    }
 
     async fn metadata<P: AsRef<Path> + Send + fmt::Debug>(
         &self,

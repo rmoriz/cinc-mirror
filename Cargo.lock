@@ -488,6 +488,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "futures-rustls",
  "humantime",
  "indicatif",
  "libc",
@@ -511,6 +512,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "webpki-roots",
  "wiremock",
 ]
 

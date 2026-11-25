@@ -6,7 +6,7 @@
 
 use std::io::Write as _;
 
-use cinc_mirror::hash::{hash_file, hash_reader, ExpectedHashes, VerifyOutcome};
+use cinc_mirror::hash::{hash_file, hash_reader, ExpectedHashes, Hasher, VerifyOutcome};
 use cinc_mirror::source::metadata::{Metadata, MetadataError};
 use sha2::{Digest, Sha256};
 
@@ -73,6 +73,30 @@ fn streams_files_larger_than_one_buffer() {
 
     assert_eq!(hashes.size, contents.len() as u64);
     assert_eq!(hashes.sha256, expected);
+}
+
+#[test]
+fn resumable_hasher_continues_from_a_prefix() {
+    let contents: Vec<u8> = (0..300_000).map(|index| (index % 241) as u8).collect();
+    let split = 123_457;
+    let (_dir, path) = write_temp(&contents);
+
+    let full = hash_file(&path).expect("hash file");
+    let primed = Hasher::read_prefix(&path, split).expect("hash prefix");
+    assert_eq!(primed.size(), split);
+    let resumed = primed.read_tail(&path, split).expect("hash tail");
+
+    assert_eq!(
+        resumed, full,
+        "a primed hasher must see the same bytes as one full read"
+    );
+}
+
+#[test]
+fn a_prefix_beyond_the_file_is_an_error() {
+    let (_dir, path) = write_temp(b"abc");
+
+    assert!(Hasher::read_prefix(&path, 10).is_err());
 }
 
 #[test]

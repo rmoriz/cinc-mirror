@@ -12,6 +12,7 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
+futures-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 humantime = "2"
 indicatif = "0.17"
 libc = "0.2"
@@ -32,6 +33,7 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 url = "2"
+webpki-roots = "1"
 
 [lints.cargo]
 # Dependencies are declared up front by the implementation plan and are wired
