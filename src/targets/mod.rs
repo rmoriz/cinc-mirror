@@ -151,6 +151,22 @@ pub trait Target: Send + Sync {
     /// that returns the existing publication.
     async fn put(&self, artifact: &Artifact, package: &Path) -> Result<PutOutcome, TargetError>;
 
+    /// Publish `artifact` under its canonical reference, replacing different
+    /// bytes that a human acknowledged through an incident.
+    ///
+    /// This is the only operation allowed to move an existing canonical tag or
+    /// path away from the bytes it holds. The default delegates to
+    /// [`Target::put`], so a target that cannot replace stays safe: it reports
+    /// [`TargetError::TagConflict`] instead of overwriting. Implementations
+    /// that can move a reference override this.
+    async fn republish(
+        &self,
+        artifact: &Artifact,
+        package: &Path,
+    ) -> Result<PutOutcome, TargetError> {
+        self.put(artifact, package).await
+    }
+
     /// Check that the publication for `artifact` is complete and current.
     async fn verify(&self, artifact: &Artifact) -> Result<(), TargetError>;
 }
@@ -174,6 +190,15 @@ impl TargetSet {
             targets.push(build(config, target)?);
         }
         Ok(Self { targets })
+    }
+
+    /// Build a target set from already constructed targets.
+    ///
+    /// Production builds through [`TargetSet::from_config`]; this is the seam
+    /// tests and embedders use to inject a target without a configuration file.
+    #[must_use]
+    pub fn from_targets(targets: Vec<Arc<dyn Target>>) -> Self {
+        Self { targets }
     }
 
     /// Every enabled target, in configuration order.

@@ -242,6 +242,26 @@ impl Default for LedgerConfig {
     }
 }
 
+/// Where incident issues are filed.
+///
+/// `api_base` is the GitHub-compatible API root. It exists as configuration so
+/// tests and a GitHub Enterprise installation can point at a local endpoint
+/// without changing the code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct IncidentConfig {
+    /// API root, e.g. `https://api.github.com`.
+    pub api_base: String,
+}
+
+impl Default for IncidentConfig {
+    fn default() -> Self {
+        Self {
+            api_base: "https://api.github.com".to_string(),
+        }
+    }
+}
+
 /// One mirrored project, scoped to a channel and an allow-list of versions,
 /// platforms and architectures.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -501,6 +521,15 @@ pub struct Config {
     pub projects: Vec<ProjectPolicy>,
     pub ledger: LedgerConfig,
     pub targets: Vec<TargetConfig>,
+    /// Repository that receives incident issues, as `owner/repo`.
+    ///
+    /// `GITHUB_REPOSITORY` wins when it is set; this field is the fallback for
+    /// a run outside GitHub Actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_repo: Option<String>,
+    /// Incident issue filing endpoint.
+    #[serde(default)]
+    pub incident: IncidentConfig,
 }
 
 impl Default for Config {
@@ -520,6 +549,8 @@ impl Default for Config {
             projects: Vec::new(),
             ledger: LedgerConfig::default(),
             targets: Vec::new(),
+            issue_repo: None,
+            incident: IncidentConfig::default(),
         }
     }
 }

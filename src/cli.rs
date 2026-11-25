@@ -187,7 +187,7 @@ pub struct PlanArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum IncidentsCommand {
-    /// List open incidents
+    /// List incidents, open first and newest first
     List,
     /// Show one incident
     Show { id: String },
@@ -198,7 +198,7 @@ pub enum IncidentsCommand {
         #[arg(long)]
         republish: bool,
         /// Note recorded with the acknowledgement
-        #[arg(short, long)]
+        #[arg(short = 'm', long)]
         note: Option<String>,
     },
 }
@@ -237,7 +237,7 @@ pub enum ConfigCommand {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, IncidentsCommand};
 
     #[test]
     fn allow_unleased_parses_before_and_after_the_subcommand() {
@@ -253,5 +253,34 @@ mod tests {
 
         let default = Cli::try_parse_from(["cinc-mirror", "mirror"]).expect("no flag");
         assert!(!default.allow_unleased);
+    }
+
+    #[test]
+    fn incidents_ack_parses_republish_and_the_short_note() {
+        let cli = Cli::try_parse_from([
+            "cinc-mirror",
+            "incidents",
+            "ack",
+            "hash_changed-0123456789abcdef",
+            "--republish",
+            "-m",
+            "checked upstream",
+        ])
+        .expect("ack arguments");
+
+        let Command::Incidents {
+            action:
+                IncidentsCommand::Ack {
+                    id,
+                    republish,
+                    note,
+                },
+        } = cli.cmd
+        else {
+            panic!("expected incidents ack");
+        };
+        assert_eq!(id, "hash_changed-0123456789abcdef");
+        assert!(republish);
+        assert_eq!(note.as_deref(), Some("checked upstream"));
     }
 }

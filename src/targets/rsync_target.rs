@@ -248,7 +248,18 @@ impl RsyncTarget {
     }
 
     fn upload_args(&self, source: &Path, relative: &str) -> Vec<String> {
+        self.upload_args_with(source, relative, false)
+    }
+
+    fn upload_args_with(&self, source: &Path, relative: &str, ignore_times: bool) -> Vec<String> {
         let mut args = vec!["-a".to_string(), "--partial-dir=.rsync-partial".to_string()];
+        if ignore_times {
+            // An acknowledged republish must overwrite a canonical file even
+            // when the new sidecar or metadata happens to have the same length
+            // and mtime as the old one. Ordinary puts never force past rsync's
+            // quick check.
+            args.push("--ignore-times".to_string());
+        }
         match &self.address {
             RsyncAddress::Local { .. } => {}
             RsyncAddress::Ssh { .. } => {
@@ -465,8 +476,13 @@ impl RsyncTarget {
         }
     }
 
-    async fn upload_file(&self, source: &Path, relative: &str) -> Result<(), TargetError> {
-        let args = self.upload_args(source, relative);
+    async fn upload_file_with(
+        &self,
+        source: &Path,
+        relative: &str,
+        ignore_times: bool,
+    ) -> Result<(), TargetError> {
+        let args = self.upload_args_with(source, relative, ignore_times);
         let output = self.rsync(&args).await?;
         ensure_success(&command_display("rsync", &args), output).map(|_| ())
     }
@@ -567,6 +583,73 @@ impl RsyncTarget {
         }
     }
 
+    /// Write the package, metadata and sidecar.
+    ///
+    /// `allow_replace` is the acknowledged-republish switch: with it a sidecar
+    /// that names different bytes is overwritten. Ordinary [`Target::put`]
+    /// passes `false`, so a conflict is reported before any byte is transferred.
+    async fn publish(
+        &self,
+        artifact: &Artifact,
+        package: &Path,
+        allow_replace: bool,
+    ) -> Result<PutOutcome, TargetError> {
+        if let Some(existing) = self.exists(artifact).await? {
+            if existing == artifact.sha256 {
+                // The sidecar already names these exact bytes; the publication
+                // is complete and no bytes cross the wire.
+                return Ok(self.outcome(artifact));
+            }
+            if !allow_replace {
+                return Err(TargetError::TagConflict {
+                    tag: artifact.rsync_relpath(),
+                    existing,
+                    incoming: artifact.sha256.clone(),
+                });
+            }
+        }
+
+        let size = fs::metadata(package)
+            .await
+            .map_err(|source| io_error(package.to_path_buf(), source))?
+            .len();
+
+        let relpath = artifact.rsync_relpath();
+        let directory = directory_of(&relpath);
+        self.prepare_directory(&directory).await?;
+
+        self.upload_file_with(package, &relpath, allow_replace)
+            .await?;
+
+        let metadata_dir = TempDir::create()?;
+        let metadata = metadata_dir.path().join(METADATA_NAME);
+        fs::write(&metadata, artifact.metadata_json.as_bytes())
+            .await
+            .map_err(|source| io_error(metadata.clone(), source))?;
+        self.upload_file_with(
+            &metadata,
+            &format!("{directory}/{METADATA_NAME}"),
+            allow_replace,
+        )
+        .await?;
+
+        // Sidecar last: its presence is the commit marker for the pair above.
+        let sidecar_dir = TempDir::create()?;
+        let sidecar_name = format!("{}{SIDECAR_SUFFIX}", artifact.basename);
+        let sidecar = sidecar_dir.path().join(&sidecar_name);
+        fs::write(&sidecar, format!("{}  {size}\n", artifact.sha256))
+            .await
+            .map_err(|source| io_error(sidecar.clone(), source))?;
+        self.upload_file_with(
+            &sidecar,
+            &format!("{directory}/{sidecar_name}"),
+            allow_replace,
+        )
+        .await?;
+
+        Ok(self.outcome(artifact))
+    }
+
     fn outcome(&self, artifact: &Artifact) -> PutOutcome {
         PutOutcome {
             remote_ref: self.destination_spec(&artifact.rsync_relpath()),
@@ -610,49 +693,19 @@ impl Target for RsyncTarget {
     }
 
     async fn put(&self, artifact: &Artifact, package: &Path) -> Result<PutOutcome, TargetError> {
-        if let Some(existing) = self.exists(artifact).await? {
-            if existing == artifact.sha256 {
-                // The sidecar already names these exact bytes; the publication
-                // is complete and no bytes cross the wire.
-                return Ok(self.outcome(artifact));
-            }
-            return Err(TargetError::TagConflict {
-                tag: artifact.rsync_relpath(),
-                existing,
-                incoming: artifact.sha256.clone(),
-            });
-        }
+        self.publish(artifact, package, false).await
+    }
 
-        let size = fs::metadata(package)
-            .await
-            .map_err(|source| io_error(package.to_path_buf(), source))?
-            .len();
-
-        let relpath = artifact.rsync_relpath();
-        let directory = directory_of(&relpath);
-        self.prepare_directory(&directory).await?;
-
-        self.upload_file(package, &relpath).await?;
-
-        let metadata_dir = TempDir::create()?;
-        let metadata = metadata_dir.path().join(METADATA_NAME);
-        fs::write(&metadata, artifact.metadata_json.as_bytes())
-            .await
-            .map_err(|source| io_error(metadata.clone(), source))?;
-        self.upload_file(&metadata, &format!("{directory}/{METADATA_NAME}"))
-            .await?;
-
-        // Sidecar last: its presence is the commit marker for the pair above.
-        let sidecar_dir = TempDir::create()?;
-        let sidecar_name = format!("{}{SIDECAR_SUFFIX}", artifact.basename);
-        let sidecar = sidecar_dir.path().join(&sidecar_name);
-        fs::write(&sidecar, format!("{}  {size}\n", artifact.sha256))
-            .await
-            .map_err(|source| io_error(sidecar.clone(), source))?;
-        self.upload_file(&sidecar, &format!("{directory}/{sidecar_name}"))
-            .await?;
-
-        Ok(self.outcome(artifact))
+    async fn republish(
+        &self,
+        artifact: &Artifact,
+        package: &Path,
+    ) -> Result<PutOutcome, TargetError> {
+        // An acknowledged republish always targets the canonical upstream path,
+        // even if the caller still carries the superseded flag from detection.
+        let mut canonical = artifact.clone();
+        canonical.superseded = false;
+        self.publish(&canonical, package, true).await
     }
 
     async fn verify(&self, artifact: &Artifact) -> Result<(), TargetError> {

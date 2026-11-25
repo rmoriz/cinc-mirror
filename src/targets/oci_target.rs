@@ -123,29 +123,19 @@ impl OciTarget {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl Target for OciTarget {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    async fn probe(&self) -> Result<(), TargetError> {
-        self.registry.probe().await?;
-        Ok(())
-    }
-
-    async fn exists(&self, artifact: &Artifact) -> Result<Option<String>, TargetError> {
-        let repo = self.repo(artifact);
-        let reference = self.reference(artifact);
-        Ok(self
-            .registry
-            .package_digest_for_tag(&repo, &reference)
-            .await?)
-    }
-
-    async fn put(&self, artifact: &Artifact, package: &Path) -> Result<PutOutcome, TargetError> {
+    /// Write the manifest for `artifact`.
+    ///
+    /// `allow_replace` is the acknowledged-republish switch: with it the
+    /// manifest overwrites a canonical tag that currently names different
+    /// package bytes. Ordinary [`Target::put`] passes `false`, so a conflict is
+    /// reported before any blob is uploaded.
+    async fn publish(
+        &self,
+        artifact: &Artifact,
+        package: &Path,
+        allow_replace: bool,
+    ) -> Result<PutOutcome, TargetError> {
         let repo = self.repo(artifact);
         let reference = self.reference(artifact);
         let incoming = package_digest(artifact);
@@ -161,11 +151,13 @@ impl Target for OciTarget {
                 let (_, manifest_digest) = self.registry.get_manifest(&repo, &reference).await?;
                 return Ok(self.outcome(&repo, &reference, manifest_digest));
             }
-            return Err(TargetError::TagConflict {
-                tag: reference,
-                existing,
-                incoming,
-            });
+            if !allow_replace {
+                return Err(TargetError::TagConflict {
+                    tag: reference,
+                    existing,
+                    incoming,
+                });
+            }
         }
 
         let size = tokio::fs::metadata(package)
@@ -193,6 +185,43 @@ impl Target for OciTarget {
             .await?;
 
         Ok(self.outcome(&repo, &reference, manifest_digest))
+    }
+}
+
+#[async_trait]
+impl Target for OciTarget {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn probe(&self) -> Result<(), TargetError> {
+        self.registry.probe().await?;
+        Ok(())
+    }
+
+    async fn exists(&self, artifact: &Artifact) -> Result<Option<String>, TargetError> {
+        let repo = self.repo(artifact);
+        let reference = self.reference(artifact);
+        Ok(self
+            .registry
+            .package_digest_for_tag(&repo, &reference)
+            .await?)
+    }
+
+    async fn put(&self, artifact: &Artifact, package: &Path) -> Result<PutOutcome, TargetError> {
+        self.publish(artifact, package, false).await
+    }
+
+    async fn republish(
+        &self,
+        artifact: &Artifact,
+        package: &Path,
+    ) -> Result<PutOutcome, TargetError> {
+        // An acknowledged republish always targets the canonical tag, even if
+        // the caller still carries the superseded flag from the detection run.
+        let mut canonical = artifact.clone();
+        canonical.superseded = false;
+        self.publish(&canonical, package, true).await
     }
 
     async fn verify(&self, artifact: &Artifact) -> Result<(), TargetError> {

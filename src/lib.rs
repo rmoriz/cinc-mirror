@@ -10,6 +10,7 @@ pub mod config;
 pub mod crawl;
 pub mod fsutil;
 pub mod hash;
+pub mod incident;
 pub mod ledger;
 pub mod oci;
 pub mod plan;
@@ -25,8 +26,8 @@ pub use artifact::{
 };
 pub use cli::{Cli, Command};
 pub use config::{
-    Config, ConfigError, LedgerConfig, ProjectPolicy, Selection, TargetAuth, TargetConfig,
-    TargetKind, TransportKind,
+    Config, ConfigError, IncidentConfig, LedgerConfig, ProjectPolicy, Selection, TargetAuth,
+    TargetConfig, TargetKind, TransportKind,
 };
 pub use crawl::{crawl, CrawlError};
 pub use hash::{hash_file, hash_reader, ExpectedHashes, Hasher, Hashes, VerifyOutcome};

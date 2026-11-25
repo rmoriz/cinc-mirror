@@ -79,7 +79,7 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -823,6 +823,20 @@ impl Ledger {
             .map_err(LedgerError::from)
     }
 
+    /// One incident row, if it is known.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] when the query fails.
+    pub fn incident(&self, id: &str) -> Result<Option<Incident>, LedgerError> {
+        let sql = format!("SELECT {INCIDENT_COLUMNS} FROM incidents WHERE id = ?1");
+        let mut statement = self.conn.prepare(&sql)?;
+        statement
+            .query_row(params![id], incident_from_row)
+            .optional()
+            .map_err(LedgerError::from)
+    }
+
     /// One run row, if it is known.
     ///
     /// # Errors
@@ -1150,13 +1164,13 @@ fn reduce_hash_changed(conn: &Connection, event: &Event) -> Result<(), LedgerErr
     }
     let old_key = match detail_str(event, "old_key") {
         Some(key) => key.to_string(),
-        None => derive_superseded_key(&new_key, &old_sha256).ok_or_else(|| {
-            LedgerError::InvalidDetail {
+        None => {
+            superseded_key(&new_key, &old_sha256).ok_or_else(|| LedgerError::InvalidDetail {
                 run_id: event.run_id.clone(),
                 seq: event.seq,
                 reason: format!("cannot derive the superseded key from `{new_key}`"),
-            }
-        })?,
+            })?
+        }
     };
 
     let old_exists: bool = conn.query_row(
@@ -1190,16 +1204,17 @@ fn reduce_hash_changed(conn: &Connection, event: &Event) -> Result<(), LedgerErr
     )?;
 
     let id = incident_id(
-        IncidentKind::HashChanged.as_str(),
+        IncidentKind::HashChanged,
         Some(&new_key),
         Some(&old_sha256),
         Some(&new_sha256),
     );
+    let issue_url = detail_str(event, "issue_url");
     conn.execute(
         "INSERT OR IGNORE INTO incidents
              (id, artifact_key, kind, old_sha256, new_sha256, detected_at,
-              detail_json, state)
-         VALUES (?1, ?2, 'hash_changed', ?3, ?4, ?5, ?6, 'open')",
+              detail_json, state, issue_url)
+         VALUES (?1, ?2, 'hash_changed', ?3, ?4, ?5, ?6, 'open', ?7)",
         params![
             id,
             new_key,
@@ -1207,6 +1222,7 @@ fn reduce_hash_changed(conn: &Connection, event: &Event) -> Result<(), LedgerErr
             new_sha256,
             ts_text(event.ts),
             serde_json::to_string(&event.detail)?,
+            issue_url,
         ],
     )?;
     Ok(())
@@ -1222,7 +1238,7 @@ fn reduce_incident_opened(conn: &Connection, event: &Event) -> Result<(), Ledger
     let id = detail_str(event, "id").map_or_else(
         || {
             incident_id(
-                kind.as_str(),
+                kind,
                 artifact_key.as_deref(),
                 old_sha256.as_deref(),
                 new_sha256.as_deref(),
@@ -1517,7 +1533,21 @@ fn attempt_count(conn: &Connection, key: &str, target: &str) -> Result<u64, Ledg
 }
 
 /// Build the stable incident id for a detection triple.
-fn incident_id(kind: &str, key: Option<&str>, old: Option<&str>, new: Option<&str>) -> String {
+///
+/// Detection and acknowledgement both need the same id, so this is public API
+/// rather than a detail of the reducer. The id is `<kind>-<16 hex>`, derived
+/// from the kind, artifact key and both digests.
+#[must_use]
+pub fn incident_id(
+    kind: IncidentKind,
+    artifact_key: Option<&str>,
+    old_sha256: Option<&str>,
+    new_sha256: Option<&str>,
+) -> String {
+    incident_id_for(kind.as_str(), artifact_key, old_sha256, new_sha256)
+}
+
+fn incident_id_for(kind: &str, key: Option<&str>, old: Option<&str>, new: Option<&str>) -> String {
     let mut hasher = Sha256::new();
     for part in [
         kind,
@@ -1537,9 +1567,32 @@ fn incident_id(kind: &str, key: Option<&str>, old: Option<&str>, new: Option<&st
 }
 
 /// The old key when a hash change names only the replacement key.
-fn derive_superseded_key(new_key: &str, old_sha256: &str) -> Option<String> {
+#[must_use]
+pub fn superseded_key(new_key: &str, old_sha256: &str) -> Option<String> {
     let (prefix, _) = new_key.rsplit_once('/')?;
     Some(format!("{prefix}/{old_sha256}"))
+}
+
+/// The `detail.artifact` object an event carries for `artifact`.
+///
+/// Producers (the incident flow and the runner) use this instead of building
+/// the object by hand so the exact metadata text and raw architecture survive
+/// the ledger round trip.
+#[must_use]
+pub fn artifact_detail(artifact: &Artifact) -> Value {
+    json!({
+        "channel": artifact.channel,
+        "project": artifact.project,
+        "version": artifact.version,
+        "platform": artifact.platform,
+        "platform_version": artifact.platform_version,
+        "arch": artifact.arch,
+        "raw_arch": artifact.raw_arch,
+        "basename": artifact.basename,
+        "sha256": artifact.sha256,
+        "metadata_json": artifact.metadata_json,
+        "iteration": artifact.iteration,
+    })
 }
 
 fn require_key(event: &Event) -> Result<&str, LedgerError> {
