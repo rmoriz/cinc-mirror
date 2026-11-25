@@ -1,0 +1,7 @@
+[advisories]
+# chrono is unmaintained (RUSTSEC-2026-0543) but has no fixed upgrade. It is
+# used only for the ledger's internal RFC-3339 timestamps; migrating to jiff or
+# time touches the on-disk ledger format, so it is a separate change.
+ignore = [
+    "RUSTSEC-2026-0543",
+]

@@ -1166,7 +1166,7 @@ fn reduce_verified(conn: &Connection, event: &Event) -> Result<(), LedgerError> 
         "UPDATE artifacts
          SET local = 1, size = COALESCE(?1, size), last_seen = MAX(last_seen, ?2)
          WHERE key = ?3",
-        params![size, ts_text(event.ts), key],
+        params![sql_opt_u64(size), ts_text(event.ts), key],
     )?;
     Ok(())
 }
@@ -1195,7 +1195,7 @@ fn reduce_publication_started(conn: &Connection, event: &Event) -> Result<(), Le
              attempts = excluded.attempts,
              next_attempt_at = NULL,
              updated_at = excluded.updated_at",
-        params![key, target, attempts, ts_text(event.ts)],
+        params![key, target, sql_u64(attempts), ts_text(event.ts)],
     )?;
     Ok(())
 }
@@ -1225,7 +1225,7 @@ fn reduce_published(conn: &Connection, event: &Event) -> Result<(), LedgerError>
             target,
             remote_ref,
             remote_digest,
-            attempts,
+            sql_u64(attempts),
             ts_text(event.ts),
         ],
     )?;
@@ -1258,7 +1258,7 @@ fn reduce_publication_attempt(
             key,
             target,
             status.as_str(),
-            attempts,
+            sql_u64(attempts),
             next_attempt_at,
             error,
             ts_text(event.ts),
@@ -1495,7 +1495,7 @@ fn reduce_run_started(conn: &Connection, event: &Event) -> Result<(), LedgerErro
             event.run_id,
             serde_json::to_string(&policy)?,
             order,
-            max_bytes,
+            sql_opt_u64(max_bytes),
             serde_json::to_string(&transport_order)?,
             host,
             ts_text(event.ts),
@@ -1608,7 +1608,7 @@ fn reduce_plan_recorded(conn: &Connection, event: &Event) -> Result<(), LedgerEr
             event.run_id,
             serde_json::to_string(&policy)?,
             order,
-            max_bytes,
+            sql_opt_u64(max_bytes),
             serde_json::to_string(&transport_order)?,
             host,
             timestamp,
@@ -1667,7 +1667,7 @@ fn upsert_artifact(
             key,
             upstream_path,
             artifact.sha256,
-            detail.size,
+            sql_opt_u64(detail.size),
             artifact.basename,
             artifact.project,
             artifact.channel,
@@ -1758,6 +1758,14 @@ pub fn artifact_detail(artifact: &Artifact) -> Value {
         "metadata_json": artifact.metadata_json,
         "iteration": artifact.iteration,
     })
+}
+
+fn sql_u64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn sql_opt_u64(value: Option<u64>) -> Option<i64> {
+    value.map(sql_u64)
 }
 
 fn require_key(event: &Event) -> Result<&str, LedgerError> {

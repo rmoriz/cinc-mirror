@@ -33,13 +33,13 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::io::AsyncReadExt as _;
 use rand::Rng as _;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use reqwest::Client;
+use suppaftp::tokio::{AsyncFtpStream, AsyncRustlsConnector, AsyncRustlsFtpStream};
 use suppaftp::types::FileType;
-use suppaftp::{AsyncFtpStream, AsyncRustlsFtpStream, FtpError, Mode};
-use tokio::io::AsyncWriteExt;
+use suppaftp::{FtpError, Mode};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
 use url::Url;
 
 use crate::config::TransportKind;
@@ -781,12 +781,12 @@ async fn connect_secure(
 }
 
 /// A rustls connector trusting the Mozilla root program.
-fn rustls_connector(remote_path: &str) -> Result<suppaftp::AsyncRustlsConnector, TransportError> {
-    let mut roots = futures_rustls::rustls::RootCertStore::empty();
+fn rustls_connector(remote_path: &str) -> Result<AsyncRustlsConnector, TransportError> {
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let provider = Arc::new(futures_rustls::rustls::crypto::ring::default_provider());
-    let config = futures_rustls::rustls::ClientConfig::builder_with_provider(provider)
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|error| {
             TransportError::protocol(remote_path, format!("cannot configure ftps: {error}"))
@@ -794,8 +794,8 @@ fn rustls_connector(remote_path: &str) -> Result<suppaftp::AsyncRustlsConnector,
         .with_root_certificates(roots)
         .with_no_client_auth();
 
-    Ok(suppaftp::AsyncRustlsConnector::from(
-        futures_rustls::TlsConnector::from(Arc::new(config)),
+    Ok(AsyncRustlsConnector::from(
+        tokio_rustls::TlsConnector::from(Arc::new(config)),
     ))
 }
 
@@ -820,7 +820,7 @@ async fn transfer_plain(
     let mut data = ftp_timeout(remote_path, stream.retr_as_stream(path)).await?;
     let mut file = open_dest(dest, false).await?;
     let written = copy_data(&mut data, &mut file, remote_path, dest, rate).await?;
-    ftp_timeout(remote_path, stream.finalize_retr_stream(data)).await?;
+    ftp_timeout(remote_path, data.finish()).await?;
     file.flush()
         .await
         .map_err(|source| TransportError::local(dest, source))?;
@@ -855,7 +855,7 @@ async fn transfer_secure(
     let mut data = ftp_timeout(remote_path, stream.retr_as_stream(path)).await?;
     let mut file = open_dest(dest, false).await?;
     let written = copy_data(&mut data, &mut file, remote_path, dest, rate).await?;
-    ftp_timeout(remote_path, stream.finalize_retr_stream(data)).await?;
+    ftp_timeout(remote_path, data.finish()).await?;
     file.flush()
         .await
         .map_err(|source| TransportError::local(dest, source))?;
@@ -922,7 +922,7 @@ async fn copy_data<R>(
     rate: Option<&RateLimiter>,
 ) -> Result<u64, TransportError>
 where
-    R: futures::io::AsyncRead + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
 {
     let mut buffer = vec![0_u8; DATA_BUFFER_SIZE];
     let mut written = 0_u64;
@@ -1004,6 +1004,9 @@ fn ftp_error(remote_path: &str, error: FtpError) -> TransportError {
         }
         FtpError::InvalidAddress(source) => {
             TransportError::protocol(remote_path, format!("invalid address: {source}"))
+        }
+        FtpError::DataConnectionAlreadyOpen => {
+            TransportError::protocol(remote_path, "data connection is already open")
         }
     }
 }

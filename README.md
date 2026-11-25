@@ -35,7 +35,7 @@ The actual script is at https://github.com/cinc-mirror/cinc-mirror.github.io and
 
 ## Build from source
 
-Requirements: Rust 1.85 or newer. `rsync` is needed only when an rsync target is
+Requirements: Rust 1.89 or newer. `rsync` is needed only when an rsync target is
 configured; OCI-only operation does not use it.
 
 ```bash

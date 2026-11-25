@@ -90,9 +90,10 @@ impl Source {
     }
 
     /// Open and log in to the FTP host anonymously.
-    async fn ftp_connect(&self) -> Result<suppaftp::AsyncFtpStream, suppaftp::FtpError> {
+    async fn ftp_connect(&self) -> Result<suppaftp::tokio::AsyncFtpStream, suppaftp::FtpError> {
         let mut stream =
-            suppaftp::AsyncFtpStream::connect((self.ftp_host.as_str(), self.ftp_port)).await?;
+            suppaftp::tokio::AsyncFtpStream::connect((self.ftp_host.as_str(), self.ftp_port))
+                .await?;
         stream.login("anonymous", "anonymous").await?;
         Ok(stream)
     }

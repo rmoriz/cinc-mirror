@@ -10,8 +10,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use libunftp::auth::DefaultUser;
-use libunftp::storage::{
+use unftp_core::auth::DefaultUser;
+use unftp_core::storage::{
     Error, ErrorKind, Fileinfo, Metadata, Result, StorageBackend, FEATURE_RESTART,
 };
 
