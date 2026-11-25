@@ -531,6 +531,97 @@ async fn crawl_uses_the_metadata_platform_version_for_alias_directories() {
 }
 
 #[tokio::test]
+async fn crawl_keeps_the_directory_when_metadata_platform_version_is_not_a_component() {
+    let mut pages = HashMap::new();
+    pages.insert("files/stable/cinc/".to_string(), listing(&["19.4.46/"]));
+    pages.insert(
+        "files/stable/cinc/19.4.46/".to_string(),
+        listing(&["debian/"]),
+    );
+    pages.insert(
+        "files/stable/cinc/19.4.46/debian/".to_string(),
+        listing(&["13/"]),
+    );
+    pages.insert(
+        "files/stable/cinc/19.4.46/debian/13/".to_string(),
+        listing(&[
+            "cinc_19.4.46-1_amd64.deb",
+            "cinc_19.4.46-1_amd64.deb.metadata.json",
+        ]),
+    );
+    pages.insert(
+        "files/stable/cinc/19.4.46/debian/13/cinc_19.4.46-1_amd64.deb.metadata.json".to_string(),
+        metadata(
+            "cinc_19.4.46-1_amd64.deb",
+            SHA_A,
+            "debian",
+            "trixie/sid",
+            "19.4.46",
+            "x86_64",
+        ),
+    );
+
+    let source = source_over(FakeUpstream::new(pages, HashMap::new()));
+    let config = config(std::path::Path::new("/tmp"), "0");
+
+    let outcome = crawl(&source, &scope(&config).policies[0])
+        .await
+        .expect("an unusable metadata platform_version must not fail the crawl");
+
+    let keys: Vec<String> = outcome
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.key())
+        .collect();
+    assert_eq!(
+        keys,
+        vec![format!("stable/cinc/19.4.46/debian/13/amd64/{SHA_A}")],
+        "the directory stays the identity when the metadata value is not a path component"
+    );
+}
+
+#[tokio::test]
+async fn crawl_skips_metadata_whose_platform_contradicts_the_directory() {
+    let mut pages = HashMap::new();
+    pages.insert("files/stable/cinc/".to_string(), listing(&["19.4.46/"]));
+    pages.insert("files/stable/cinc/19.4.46/".to_string(), listing(&["13/"]));
+    pages.insert(
+        "files/stable/cinc/19.4.46/13/".to_string(),
+        listing(&["sid/"]),
+    );
+    pages.insert(
+        "files/stable/cinc/19.4.46/13/sid/".to_string(),
+        listing(&[
+            "cinc_19.4.46-1_amd64.deb",
+            "cinc_19.4.46-1_amd64.deb.metadata.json",
+        ]),
+    );
+    pages.insert(
+        "files/stable/cinc/19.4.46/13/sid/cinc_19.4.46-1_amd64.deb.metadata.json".to_string(),
+        metadata(
+            "cinc_19.4.46-1_amd64.deb",
+            SHA_A,
+            "debian",
+            "trixie/sid",
+            "19.4.46",
+            "x86_64",
+        ),
+    );
+
+    let source = source_over(FakeUpstream::new(pages, HashMap::new()));
+    let config = config(std::path::Path::new("/tmp"), "0");
+
+    let outcome = crawl(&source, &scope(&config).policies[0])
+        .await
+        .expect("a misplaced artifact must not fail the crawl");
+
+    assert!(
+        outcome.artifacts.is_empty(),
+        "a document under a platform directory that contradicts its platform is skipped"
+    );
+}
+
+#[tokio::test]
 async fn crawl_reports_two_digests_under_one_tag_as_a_collision() {
     let mut pages = HashMap::new();
     let js = |name: &str| format!("files/stable/cinc/19.4.46/debian/13/{name}.metadata.json");

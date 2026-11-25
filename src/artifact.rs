@@ -379,7 +379,7 @@ fn validate_basename(value: &str) -> Result<(), ArtifactError> {
     }
 }
 
-fn is_safe_component(value: &str) -> bool {
+pub(crate) fn is_safe_component(value: &str) -> bool {
     !value.is_empty()
         && value != "."
         && value != ".."

@@ -11,7 +11,11 @@
 //! directories (`windows/10`, `/11`, `/2016`, `/2022`, ...) while the metadata
 //! names one canonical platform version. The metadata is authoritative for the
 //! artifact identity, so those aliases collapse into one artifact instead of
-//! aborting the crawl.
+//! aborting the crawl. Some historical documents name a value that is not a
+//! usable path component (`debian/13` claiming `trixie/sid`); there the
+//! directory value stands. A document that lands under a directory whose
+//! platform or version contradicts it is skipped with a warning, because the
+//! tree cannot be represented faithfully.
 //!
 //! The result is deterministic: versions descending, then platform,
 //! platform_version, architecture and basename ascending. Two different digests
@@ -23,7 +27,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use thiserror::Error;
 
-use crate::artifact::{Artifact, ArtifactContext, ArtifactError};
+use crate::artifact::{is_safe_component, Artifact, ArtifactContext, ArtifactError};
 use crate::scope::ResolvedPolicy;
 use crate::source::{Source, SourceError};
 use crate::version::Version;
@@ -240,17 +244,45 @@ async fn artifacts_in_dir(
                 source,
             })?;
         let artifact = {
+            // Some historical trees are misplaced (for example a stray
+            // `.../3.0.28/13/sid/` whose metadata says `platform: debian`).
+            // Such a document cannot be represented under this layout, so it
+            // is skipped instead of aborting the whole crawl.
+            let platform_contradicts = !metadata.platform.is_empty()
+                && (metadata.platform != context.platform
+                    || !is_safe_component(&metadata.platform));
+            let version_contradicts = !metadata.version.is_empty()
+                && (metadata.version != context.version || !is_safe_component(&metadata.version));
+            if platform_contradicts || version_contradicts {
+                tracing::warn!(
+                    path = %path,
+                    metadata_platform = %metadata.platform,
+                    metadata_version = %metadata.version,
+                    crawl_platform = %context.platform,
+                    crawl_version = %context.version,
+                    "skipping artifact whose metadata does not fit its upstream directory"
+                );
+                continue;
+            }
+
             // The directory only locates this copy; the metadata names the
             // canonical platform version. Building the artifact under the
             // directory name would publish one package once per compatibility
-            // alias, so take the metadata value when it provides one.
+            // alias, so take the metadata value when it provides a usable one.
+            // A value like `trixie/sid` cannot be a path component or tag, so
+            // the directory value stays and the metadata claim is ignored.
             let mut artifact_context = context.clone();
+            let mut input = metadata.to_input();
             if !metadata.platform_version.is_empty() {
-                artifact_context
-                    .platform_version
-                    .clone_from(&metadata.platform_version);
+                if is_safe_component(&metadata.platform_version) {
+                    artifact_context
+                        .platform_version
+                        .clone_from(&metadata.platform_version);
+                } else {
+                    input.platform_version.clear();
+                }
             }
-            Artifact::new(&artifact_context, metadata.to_input())
+            Artifact::new(&artifact_context, input)
                 .map_err(|source| CrawlError::Artifact { path, source })?
         };
         artifacts.push(artifact);
