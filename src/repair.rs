@@ -21,11 +21,20 @@
 //! through the incident flow (`incidents ack --republish`). Repair records the
 //! conflict as skipped with a pointer at the open incident.
 //!
+//! Local health is checked for every artifact the ledger records as present
+//! (`artifacts.local = 1`), independent of the remote probes. A corrupt or
+//! unexpectedly missing blob is refilled even when every target still verifies,
+//! so `verify --deep` followed by `repair` always has a way back to a good local
+//! copy. The corrupt occupant stays on disk until replacement bytes are verified,
+//! and is left untouched when the refill fails, so the operator keeps the
+//! evidence.
+//!
 //! # Limits
 //!
-//! `limit` caps how many broken publications are repaired. The scan stops at an
-//! artifact boundary once the cap is reached; a truncated run exits `2` because
-//! the mirror cannot claim the rest is clean.
+//! `limit` caps the number of broken items repair examines (a publication or the
+//! local blob). The cap is checked before each artifact, so the artifact being
+//! worked on can take the count past it; a truncated run exits `2` because the
+//! mirror cannot claim the rest is clean.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -49,12 +58,16 @@ use crate::source::transport::{DownloadError, TransportError};
 use crate::store::StoreError;
 use crate::targets::{Target, TargetError};
 
+/// Pseudo-target name a [`RepairAction`] carries when it concerns the store
+/// rather than a remote publication.
+pub const LOCAL_STORE: &str = "local-store";
+
 /// What `repair` may do.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepairOpts {
     /// Repair only these targets; `None` repairs every enabled target.
     pub targets: Option<Vec<String>>,
-    /// Repair at most this many broken publications.
+    /// Repair at most this many broken items (publications or local blobs).
     pub limit: Option<usize>,
 }
 
@@ -95,7 +108,7 @@ impl fmt::Display for RepairOutcome {
 pub struct RepairAction {
     /// The artifact the decision concerns.
     pub artifact_key: String,
-    /// The target that is still broken.
+    /// The target that is still broken, or [`LOCAL_STORE`] for the local blob.
     pub target: String,
     /// What repair did.
     pub outcome: RepairOutcome,
@@ -116,7 +129,7 @@ impl fmt::Display for RepairAction {
 /// Counts and decisions of one repair run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepairReport {
-    /// Broken publications examined.
+    /// Broken publications and local blobs examined.
     pub examined: usize,
     /// Publications restored and verified.
     pub repaired: usize,
@@ -222,7 +235,7 @@ impl Seq {
     }
 }
 
-/// Repair every publication verification would report as broken.
+/// Repair every broken publication or local blob verification would report.
 ///
 /// # Errors
 ///
@@ -231,14 +244,15 @@ impl Seq {
 /// Download and target failures are decisions in the report, not errors.
 pub async fn run(ctx: &Ctx, opts: RepairOpts) -> Result<RepairReport, RepairError> {
     let targets = selected_targets(ctx, opts.targets.as_deref())?;
-    let artifacts = {
+    let rows = {
         let ledger = ctx.ledger.lock().await;
-        ledger.all_artifacts()?
+        ledger.artifacts()?
     };
     let seq = Seq::new();
     let mut report = RepairReport::default();
 
-    for artifact in artifacts {
+    for row in rows {
+        let artifact = row.artifact;
         let publications = {
             let ledger = ctx.ledger.lock().await;
             ledger.publications_for(&artifact.key())?
@@ -261,7 +275,24 @@ pub async fn run(ctx: &Ctx, opts: RepairOpts) -> Result<RepairReport, RepairErro
             }
             broken.push(target);
         }
-        if broken.is_empty() {
+
+        // The local copy is checked even when every remote is healthy: a deep
+        // verification finding must be repairable on its own.
+        let check = local_check(ctx, &artifact, row.local)?;
+        let local_repair = if check.problem != LocalProblem::None {
+            check.problem
+        } else if !broken.is_empty() && !check.usable {
+            // A publication the ledger voluntarily gc'd still needs a blob when
+            // a target has to be re-pushed.
+            if ctx.store.has(&artifact.sha256) {
+                LocalProblem::Corrupt
+            } else {
+                LocalProblem::Missing
+            }
+        } else {
+            LocalProblem::None
+        };
+        if broken.is_empty() && local_repair == LocalProblem::None {
             continue;
         }
 
@@ -270,45 +301,70 @@ pub async fn run(ctx: &Ctx, opts: RepairOpts) -> Result<RepairReport, RepairErro
             break;
         }
 
-        match repair_local(ctx, &artifact, &seq).await? {
-            LocalState::Ready => {}
-            LocalState::Unrecoverable { incident, reason } => {
-                for target in broken {
-                    append_event(
-                        ctx,
-                        Event::new(
-                            ctx.run_id.clone(),
-                            seq.next(),
-                            Utc::now(),
-                            EventKind::PublicationUnrecoverable,
-                        )
-                        .with_artifact(artifact.key())
-                        .with_target(target.name())
-                        .with_detail(json!({"error": reason, "incident": incident})),
-                    )
-                    .await?;
-                    report.examined += 1;
-                    report.record(RepairAction {
-                        artifact_key: artifact.key(),
-                        target: target.name().to_string(),
-                        outcome: RepairOutcome::Unrecoverable,
-                        detail: format!("{reason}; incident {incident}"),
-                    });
+        match local_repair {
+            LocalProblem::None => {}
+            LocalProblem::Corrupt | LocalProblem::Missing => {
+                let description = if local_repair == LocalProblem::Corrupt {
+                    "replaced a corrupt local blob"
+                } else {
+                    "refetched a missing local blob"
+                };
+                match repair_local(ctx, &artifact, &seq).await? {
+                    LocalState::Ready => {
+                        report.examined += 1;
+                        report.record(local_action(
+                            &artifact,
+                            RepairOutcome::Repaired,
+                            description,
+                        ));
+                    }
+                    LocalState::Unrecoverable { incident, reason } => {
+                        report.examined += 1;
+                        report.record(local_action(
+                            &artifact,
+                            RepairOutcome::Unrecoverable,
+                            &format!("{reason}; incident {incident}"),
+                        ));
+                        for target in broken {
+                            append_unrecoverable(
+                                ctx,
+                                &artifact,
+                                target.as_ref(),
+                                &reason,
+                                &incident,
+                                &seq,
+                            )
+                            .await?;
+                            report.examined += 1;
+                            report.record(RepairAction {
+                                artifact_key: artifact.key(),
+                                target: target.name().to_string(),
+                                outcome: RepairOutcome::Unrecoverable,
+                                detail: format!("{reason}; incident {incident}"),
+                            });
+                        }
+                        continue;
+                    }
+                    LocalState::Failed { reason } => {
+                        report.examined += 1;
+                        report.record(local_action(&artifact, RepairOutcome::Failed, &reason));
+                        for target in broken {
+                            report.examined += 1;
+                            report.record(RepairAction {
+                                artifact_key: artifact.key(),
+                                target: target.name().to_string(),
+                                outcome: RepairOutcome::Failed,
+                                detail: reason.clone(),
+                            });
+                        }
+                        continue;
+                    }
                 }
-                continue;
             }
-            LocalState::Failed { reason } => {
-                for target in broken {
-                    report.examined += 1;
-                    report.record(RepairAction {
-                        artifact_key: artifact.key(),
-                        target: target.name().to_string(),
-                        outcome: RepairOutcome::Failed,
-                        detail: reason.clone(),
-                    });
-                }
-                continue;
-            }
+        }
+
+        if broken.is_empty() {
+            continue;
         }
 
         let blob = ctx.store.path(&artifact.sha256)?;
@@ -322,9 +378,77 @@ pub async fn run(ctx: &Ctx, opts: RepairOpts) -> Result<RepairReport, RepairErro
     Ok(report)
 }
 
-/// What the local store can offer a repair.
+/// What, if anything, is wrong with the local blob the ledger records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalProblem {
+    /// The blob is present and hashes to its name, or the ledger recorded a
+    /// deliberate `local_gc` and no local copy is expected.
+    None,
+    /// The blob is present but does not hash to its name.
+    Corrupt,
+    /// The ledger records a local blob that the store does not have.
+    Missing,
+}
+
+/// The local copy, as the ledger and the store see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalCheck {
+    /// Whether a blob that hashes to its name is present.
+    usable: bool,
+    /// The problem the ledger's `local` flag promises, if any.
+    problem: LocalProblem,
+}
+
+/// Check the local copy `local` promises.
+fn local_check(ctx: &Ctx, artifact: &Artifact, local: bool) -> Result<LocalCheck, RepairError> {
+    let usable = ctx.store.verify(&artifact.sha256)?;
+    let problem = if !local || usable {
+        LocalProblem::None
+    } else if ctx.store.has(&artifact.sha256) {
+        LocalProblem::Corrupt
+    } else {
+        LocalProblem::Missing
+    };
+    Ok(LocalCheck { usable, problem })
+}
+
+/// A report action scoped to the local store.
+fn local_action(artifact: &Artifact, outcome: RepairOutcome, detail: &str) -> RepairAction {
+    RepairAction {
+        artifact_key: artifact.key(),
+        target: LOCAL_STORE.to_string(),
+        outcome,
+        detail: detail.to_string(),
+    }
+}
+
+/// Record that a publication cannot be restored.
+async fn append_unrecoverable(
+    ctx: &Ctx,
+    artifact: &Artifact,
+    target: &dyn Target,
+    reason: &str,
+    incident: &str,
+    seq: &Seq,
+) -> Result<(), RepairError> {
+    append_event(
+        ctx,
+        Event::new(
+            ctx.run_id.clone(),
+            seq.next(),
+            Utc::now(),
+            EventKind::PublicationUnrecoverable,
+        )
+        .with_artifact(artifact.key())
+        .with_target(target.name())
+        .with_detail(json!({"error": reason, "incident": incident})),
+    )
+    .await
+}
+
+/// What the local refill produced.
 enum LocalState {
-    /// A blob that hashes to its name is present.
+    /// Verified replacement bytes are in the store.
     Ready,
     /// Neither upstream nor the store can produce the bytes.
     Unrecoverable { incident: String, reason: String },
@@ -332,16 +456,14 @@ enum LocalState {
     Failed { reason: String },
 }
 
-/// Make the local blob usable, refilling it from upstream when necessary.
+/// Refill the local blob from upstream.
+///
+/// The caller has already established that the blob is missing or corrupt.
 async fn repair_local(
     ctx: &Ctx,
     artifact: &Artifact,
     seq: &Seq,
 ) -> Result<LocalState, RepairError> {
-    if ctx.store.verify(&artifact.sha256)? {
-        return Ok(LocalState::Ready);
-    }
-
     let partial = ctx.store.partial_path(&artifact.sha256)?;
     let result = ctx
         .source

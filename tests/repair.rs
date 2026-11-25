@@ -17,12 +17,13 @@ use cinc_mirror::artifact::Artifact;
 use cinc_mirror::ledger::{
     Event, EventKind, IncidentFilter, IncidentKind, IncidentState, Ledger, PublicationStatus,
 };
-use cinc_mirror::repair::{self, RepairOpts, RepairOutcome};
+use cinc_mirror::repair::{self, RepairOpts, RepairOutcome, LOCAL_STORE};
 use cinc_mirror::store::Store;
 use cinc_mirror::targets::TargetSet;
+use cinc_mirror::verify::{self, FindingKind, VerifyOpts};
 use common::mirror::{
     context, package_artifact, publish, rsync_target, seed_artifact, seed_published, sha256_hex,
-    source_with, store_blob, FakeTransport,
+    source_with, store_blob, FakeTransport, RecordingTarget,
 };
 use serde_json::json;
 
@@ -65,6 +66,17 @@ async fn record_local_gc(ctx: &cinc_mirror::Ctx, artifact: &Artifact) {
                 .with_detail(json!({"sha256": artifact.sha256})),
         )
         .expect("record local_gc");
+}
+
+/// Overwrite the stored blob with same-length garbage and return the garbage.
+fn corrupt_blob(state: &Path, artifact: &Artifact, bytes: &[u8]) -> Vec<u8> {
+    let blob = Store::open(state)
+        .expect("store")
+        .path(&artifact.sha256)
+        .expect("blob path");
+    let corrupt: Vec<u8> = bytes.iter().map(|byte| byte ^ 0xff).collect();
+    fs::write(&blob, &corrupt).expect("corrupt the blob in place");
+    corrupt
 }
 
 #[tokio::test]
@@ -157,9 +169,12 @@ async fn repair_refetches_when_store_missing() {
         .await
         .expect("repair");
 
-    assert_eq!(report.repaired, 1, "{report}");
+    assert_eq!(report.examined, 2, "{report}");
+    assert_eq!(report.repaired, 2, "{report}");
     assert_eq!(report.exit_code(), 0);
     assert_eq!(transport.calls(), 1, "the missing blob is fetched once");
+    assert_eq!(report.actions[0].target, LOCAL_STORE);
+    assert_eq!(report.actions[1].target, "rsync");
     assert!(
         ctx.store.verify(&artifact.sha256).expect("verify blob"),
         "the fetched bytes are committed under their digest"
@@ -207,20 +222,20 @@ async fn repair_marks_unrecoverable_and_incident_when_upstream_gone() {
         .await
         .expect("repair");
 
-    assert_eq!(report.examined, 1, "{report}");
-    assert_eq!(report.unrecoverable, 1, "{report}");
+    assert_eq!(report.examined, 2, "{report}");
+    assert_eq!(report.unrecoverable, 2, "{report}");
     assert_eq!(report.repaired, 0);
     assert_eq!(
         report.exit_code(),
         2,
         "an unrecoverable publication stays broken"
     );
-    assert!(matches!(
-        report.actions[0].outcome,
-        RepairOutcome::Unrecoverable
-    ));
+    assert_eq!(report.actions[0].target, LOCAL_STORE);
+    assert_eq!(report.actions[0].outcome, RepairOutcome::Unrecoverable);
+    assert_eq!(report.actions[1].target, "rsync");
+    assert_eq!(report.actions[1].outcome, RepairOutcome::Unrecoverable);
     assert!(
-        report.actions[0].detail.contains("incident"),
+        report.actions[1].detail.contains("incident"),
         "the action points at the incident: {report}"
     );
 
@@ -253,7 +268,7 @@ async fn repair_marks_unrecoverable_and_incident_when_upstream_gone() {
     let again = repair::run(&ctx, RepairOpts::default())
         .await
         .expect("second repair");
-    assert_eq!(again.unrecoverable, 1);
+    assert_eq!(again.unrecoverable, 2);
     let incidents = ctx
         .ledger
         .lock()
@@ -331,6 +346,181 @@ async fn repair_skips_a_tag_conflict_and_points_at_the_incident() {
         1,
         "the conflict is an incident, not a retry"
     );
+}
+
+#[tokio::test]
+async fn repair_heals_a_corrupt_local_blob_when_every_remote_is_healthy() {
+    let state = tempfile::tempdir().expect("state dir");
+    let mut ledger = Ledger::open(state.path()).expect("ledger");
+    let root = tempfile::tempdir().expect("rsync root");
+    let recorder = RecordingTarget::new("rsync", root.path());
+    let targets = TargetSet::from_targets(vec![recorder.clone()]);
+
+    let package = b"the only local copy is corrupt".to_vec();
+    let artifact = package_artifact(&package, "19.4.46");
+    publish(targets.all()[0].as_ref(), &artifact, &package).await;
+    local_blob(&mut ledger, state.path(), &artifact, &package);
+    seed_published(&mut ledger, &artifact, "rsync", 1);
+    recorder.clear();
+
+    let corrupt = corrupt_blob(state.path(), &artifact, &package);
+
+    let transport = FakeTransport::serving(package.clone());
+    let ctx = context(
+        state.path(),
+        ledger,
+        targets,
+        source_with(vec![transport.clone()]),
+    );
+
+    // The finding the operator sees first.
+    let findings = verify::run(
+        &ctx,
+        VerifyOpts {
+            deep: true,
+            ..VerifyOpts::default()
+        },
+    )
+    .await
+    .expect("verify");
+    assert_eq!(findings.findings.len(), 1, "{findings}");
+    assert_eq!(findings.findings[0].kind, FindingKind::LocalCorrupt);
+    assert_eq!(findings.exit_code(), 2);
+
+    // Repair must heal it even though no publication is broken.
+    let report = repair::run(&ctx, RepairOpts::default())
+        .await
+        .expect("repair");
+
+    assert_eq!(report.examined, 1, "{report}");
+    assert_eq!(report.repaired, 1, "{report}");
+    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.actions[0].target, LOCAL_STORE);
+    assert_eq!(report.actions[0].outcome, RepairOutcome::Repaired);
+    assert_eq!(transport.calls(), 1, "one refill, no second download");
+    assert!(
+        ctx.store.verify(&artifact.sha256).expect("verify blob"),
+        "the corrupt bytes were replaced by verified bytes"
+    );
+    assert_eq!(
+        fs::read(ctx.store.path(&artifact.sha256).expect("blob path")).expect("blob"),
+        package
+    );
+    assert_ne!(
+        fs::read(ctx.store.path(&artifact.sha256).expect("blob path")).expect("blob"),
+        corrupt,
+        "the corrupt copy is gone"
+    );
+    assert_eq!(recorder.puts(), 0, "a healthy remote is not re-pushed");
+    ctx.targets.all()[0]
+        .verify(&artifact)
+        .await
+        .expect("the remote is still healthy");
+}
+
+#[tokio::test]
+async fn repair_replaces_a_corrupt_blob_and_restores_the_remote() {
+    let state = tempfile::tempdir().expect("state dir");
+    let mut ledger = Ledger::open(state.path()).expect("ledger");
+    let root = tempfile::tempdir().expect("rsync root");
+    let targets = TargetSet::from_targets(vec![Arc::new(rsync_target("rsync", root.path()))]);
+
+    let package = b"corrupt locally and missing remotely".to_vec();
+    let artifact = package_artifact(&package, "19.4.46");
+    publish(targets.all()[0].as_ref(), &artifact, &package).await;
+    local_blob(&mut ledger, state.path(), &artifact, &package);
+    seed_published(&mut ledger, &artifact, "rsync", 1);
+    remove_remote(root.path(), &artifact);
+    corrupt_blob(state.path(), &artifact, &package);
+
+    let transport = FakeTransport::serving(package.clone());
+    let ctx = context(
+        state.path(),
+        ledger,
+        targets,
+        source_with(vec![transport.clone()]),
+    );
+
+    let report = repair::run(&ctx, RepairOpts::default())
+        .await
+        .expect("repair");
+
+    assert_eq!(report.examined, 2, "{report}");
+    assert_eq!(report.repaired, 2, "{report}");
+    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.actions[0].target, LOCAL_STORE);
+    assert_eq!(report.actions[1].target, "rsync");
+    assert_eq!(
+        transport.calls(),
+        1,
+        "the blob is fetched once, not once per broken publication"
+    );
+    assert!(ctx.store.verify(&artifact.sha256).expect("verify blob"));
+    assert_eq!(
+        fs::read(ctx.store.path(&artifact.sha256).expect("blob path")).expect("blob"),
+        package
+    );
+    ctx.targets.all()[0]
+        .verify(&artifact)
+        .await
+        .expect("the remote is restored");
+    assert_eq!(
+        fs::read(root.path().join(artifact.rsync_relpath())).expect("remote package"),
+        package
+    );
+}
+
+#[tokio::test]
+async fn a_failed_refill_keeps_the_corrupt_copy_and_reports_broken() {
+    let state = tempfile::tempdir().expect("state dir");
+    let mut ledger = Ledger::open(state.path()).expect("ledger");
+    let root = tempfile::tempdir().expect("rsync root");
+    let targets = TargetSet::from_targets(vec![Arc::new(rsync_target("rsync", root.path()))]);
+
+    let package = b"corrupt locally with no way to refill".to_vec();
+    let artifact = package_artifact(&package, "19.4.46");
+    publish(targets.all()[0].as_ref(), &artifact, &package).await;
+    local_blob(&mut ledger, state.path(), &artifact, &package);
+    seed_published(&mut ledger, &artifact, "rsync", 1);
+
+    let corrupt = corrupt_blob(state.path(), &artifact, &package);
+    let transport = FakeTransport::failing();
+    let ctx = context(
+        state.path(),
+        ledger,
+        targets,
+        source_with(vec![transport.clone()]),
+    );
+
+    let report = repair::run(&ctx, RepairOpts::default())
+        .await
+        .expect("repair");
+
+    assert_eq!(report.examined, 1, "{report}");
+    assert_eq!(report.failed, 1, "{report}");
+    assert_eq!(report.repaired, 0);
+    assert_eq!(report.exit_code(), 2, "the corrupt copy is still broken");
+    assert_eq!(report.actions[0].target, LOCAL_STORE);
+    assert_eq!(report.actions[0].outcome, RepairOutcome::Failed);
+    assert_eq!(transport.calls(), 1);
+    assert_eq!(
+        fs::read(ctx.store.path(&artifact.sha256).expect("blob path")).expect("blob"),
+        corrupt,
+        "a failed refill must leave the corrupt evidence untouched"
+    );
+
+    // The deep verification finding is still there for the operator.
+    let findings = verify::run(
+        &ctx,
+        VerifyOpts {
+            deep: true,
+            ..VerifyOpts::default()
+        },
+    )
+    .await
+    .expect("verify");
+    assert_eq!(findings.findings.len(), 1, "{findings}");
+    assert_eq!(findings.findings[0].kind, FindingKind::LocalCorrupt);
 }
 
 #[tokio::test]

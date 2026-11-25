@@ -265,6 +265,8 @@ enum TransportMode {
     Serve(Vec<u8>),
     /// Report the object as permanently gone.
     Gone,
+    /// Fail every attempt with a retryable transport error.
+    Failing,
 }
 
 /// An injected payload rung that records how often it was asked for bytes.
@@ -288,6 +290,15 @@ impl FakeTransport {
     pub fn gone() -> Arc<Self> {
         Arc::new(Self {
             mode: TransportMode::Gone,
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    /// A rung that fails every attempt with a retryable error.
+    #[must_use]
+    pub fn failing() -> Arc<Self> {
+        Arc::new(Self {
+            mode: TransportMode::Failing,
             calls: AtomicUsize::new(0),
         })
     }
@@ -335,6 +346,10 @@ impl PayloadTransport for FakeTransport {
             TransportMode::Gone => Err(TransportError::NotFound {
                 path: remote_path.to_string(),
             }),
+            TransportMode::Failing => Err(TransportError::Retryable {
+                path: remote_path.to_string(),
+                reason: "injected transport failure".to_string(),
+            }),
         }
     }
 }
@@ -346,6 +361,7 @@ impl PayloadTransport for FakeTransport {
 pub struct RecordingTarget {
     inner: RsyncTarget,
     verified: Mutex<Vec<String>>,
+    puts: AtomicUsize,
 }
 
 impl RecordingTarget {
@@ -354,6 +370,7 @@ impl RecordingTarget {
         Arc::new(Self {
             inner: rsync_target(name, root),
             verified: Mutex::new(Vec::new()),
+            puts: AtomicUsize::new(0),
         })
     }
 
@@ -363,9 +380,17 @@ impl RecordingTarget {
         self.verified.lock().expect("verified lock").clone()
     }
 
-    /// Forget the recorded verifications.
+    /// How many `put` calls were attempted since the last
+    /// [`RecordingTarget::clear`].
+    #[must_use]
+    pub fn puts(&self) -> usize {
+        self.puts.load(Ordering::SeqCst)
+    }
+
+    /// Forget the recorded verifications and puts.
     pub fn clear(&self) {
         self.verified.lock().expect("verified lock").clear();
+        self.puts.store(0, Ordering::SeqCst);
     }
 }
 
@@ -384,6 +409,7 @@ impl Target for RecordingTarget {
     }
 
     async fn put(&self, artifact: &Artifact, package: &Path) -> Result<PutOutcome, TargetError> {
+        self.puts.fetch_add(1, Ordering::SeqCst);
         self.inner.put(artifact, package).await
     }
 
