@@ -112,10 +112,13 @@ jobs:
         run: cargo fetch --locked
       - name: Run the suite with no route off the machine
         run: |
-          sudo -E unshare -n -- bash -c '
-            ip link set lo up
-            cargo test --all-targets --locked --offline
-          '
+          sudo env "PATH=$PATH" "HOME=$HOME" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            unshare -n -- bash -c '
+              ip link set lo up
+              cargo test --all-targets --locked --offline
+            '
       - name: Document the guarantee
         run: echo "The suite passed without any external network; only loopback mocks were reachable."
 
