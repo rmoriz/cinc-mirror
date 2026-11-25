@@ -1669,6 +1669,7 @@ impl ArtifactDetail {
             basename: self.basename.clone(),
             sha256: self.sha256.clone(),
             iteration: self.iteration,
+            superseded: false,
         }
     }
 }
@@ -1702,6 +1703,7 @@ fn artifact_row_from_row(row: &Row<'_>) -> rusqlite::Result<ArtifactRow> {
             basename: row.get(4)?,
             sha256: row.get(2)?,
             iteration,
+            superseded: false,
         },
         upstream_path: row.get(1)?,
         size: size.map(|value| u64::try_from(value).unwrap_or(0)),

@@ -511,7 +511,29 @@ impl Registry {
                 source,
             })?;
         let size = metadata.len();
-        self.with_retry(|| self.upload_blob_once(repo, path, size, digest))
+        self.with_retry(|| self.upload_file_once(repo, path, size, digest))
+            .await
+    }
+
+    /// Upload `bytes` as a blob in `repo` under `digest`.
+    ///
+    /// Small synthetic blobs (the empty config document) have no file behind
+    /// them; the bytes go in one `PATCH` inside the same upload session, with
+    /// the same digest verification and retry ladder as
+    /// [`Registry::upload_blob`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OciError::DigestMismatch`] when the registry reports a
+    /// different digest for the uploaded bytes, and [`OciError`] for transport
+    /// and status failures.
+    pub async fn upload_bytes(
+        &self,
+        repo: &str,
+        bytes: &[u8],
+        digest: &str,
+    ) -> Result<(), OciError> {
+        self.with_retry(|| self.upload_bytes_once(repo, bytes, digest))
             .await
     }
 
@@ -594,32 +616,16 @@ impl Registry {
         }
     }
 
-    async fn upload_blob_once(
+    async fn upload_file_once(
         &self,
         repo: &str,
         path: &Path,
         size: u64,
         digest: &str,
     ) -> Result<(), OciError> {
-        let start = self.url_for_dir(&["v2", repo, "blobs", "uploads"])?;
-        let response = self
-            .request(Method::POST, &start, repo, &push_scope(repo), &[], None)
-            .await?;
-
-        let reported = digest_header(&response);
-        let status = response.status();
-        if status == StatusCode::CREATED {
-            // Some registries deduplicate and finish the upload immediately.
-            self.drain_body(response, &Method::POST, &start).await?;
-            return check_upload_digest(reported.as_deref(), digest);
-        }
-        let response = self.check_success(response, &Method::POST, &start).await?;
-        let location = location_header(&response).ok_or_else(|| OciError::Protocol {
-            registry: self.registry.clone(),
-            reason: format!("upload start at {start} returned no Location header"),
-        })?;
-        self.drain_body(response, &Method::POST, &start).await?;
-        let mut location = self.location_url(&location)?;
+        let Some(mut location) = self.begin_upload(repo, digest).await? else {
+            return Ok(());
+        };
 
         let mut file = tokio::fs::File::open(path)
             .await
@@ -641,29 +647,9 @@ impl Registry {
                 break;
             }
 
-            let headers = [(
-                "content-range",
-                format!("{}-{}", sent, sent + filled as u64 - 1),
-            )];
-            let response = self
-                .request(
-                    Method::PATCH,
-                    &location,
-                    repo,
-                    &push_scope(repo),
-                    &headers,
-                    Some(("application/octet-stream", &buffer[..filled])),
-                )
+            sent = self
+                .patch_upload(repo, &mut location, sent, &buffer[..filled])
                 .await?;
-            let next = location_header(&response);
-            let response = self
-                .check_success(response, &Method::PATCH, &location)
-                .await?;
-            self.drain_body(response, &Method::PATCH, &location).await?;
-            if let Some(next) = next {
-                location = self.location_url(&next)?;
-            }
-            sent += filled as u64;
         }
 
         if sent != size {
@@ -675,7 +661,92 @@ impl Registry {
             });
         }
 
-        let mut finish = location;
+        self.finish_upload(repo, &location, digest).await
+    }
+
+    async fn upload_bytes_once(
+        &self,
+        repo: &str,
+        bytes: &[u8],
+        digest: &str,
+    ) -> Result<(), OciError> {
+        let Some(mut location) = self.begin_upload(repo, digest).await? else {
+            return Ok(());
+        };
+
+        if !bytes.is_empty() {
+            self.patch_upload(repo, &mut location, 0, bytes).await?;
+        }
+
+        self.finish_upload(repo, &location, digest).await
+    }
+
+    /// Start an upload session and return its location, or `None` when the
+    /// registry deduplicated the blob and finished the upload immediately.
+    async fn begin_upload(&self, repo: &str, digest: &str) -> Result<Option<Url>, OciError> {
+        let start = self.url_for_dir(&["v2", repo, "blobs", "uploads"])?;
+        let response = self
+            .request(Method::POST, &start, repo, &push_scope(repo), &[], None)
+            .await?;
+
+        let reported = digest_header(&response);
+        let status = response.status();
+        if status == StatusCode::CREATED {
+            // Some registries deduplicate and finish the upload immediately.
+            self.drain_body(response, &Method::POST, &start).await?;
+            check_upload_digest(reported.as_deref(), digest)?;
+            return Ok(None);
+        }
+        let response = self.check_success(response, &Method::POST, &start).await?;
+        let location = location_header(&response).ok_or_else(|| OciError::Protocol {
+            registry: self.registry.clone(),
+            reason: format!("upload start at {start} returned no Location header"),
+        })?;
+        self.drain_body(response, &Method::POST, &start).await?;
+        Ok(Some(self.location_url(&location)?))
+    }
+
+    /// Send one `PATCH` chunk and return the offset after it.
+    async fn patch_upload(
+        &self,
+        repo: &str,
+        location: &mut Url,
+        offset: u64,
+        chunk: &[u8],
+    ) -> Result<u64, OciError> {
+        let headers = [(
+            "content-range",
+            format!("{}-{}", offset, offset + chunk.len() as u64 - 1),
+        )];
+        let response = self
+            .request(
+                Method::PATCH,
+                location,
+                repo,
+                &push_scope(repo),
+                &headers,
+                Some(("application/octet-stream", chunk)),
+            )
+            .await?;
+        let next = location_header(&response);
+        let response = self
+            .check_success(response, &Method::PATCH, location)
+            .await?;
+        self.drain_body(response, &Method::PATCH, location).await?;
+        if let Some(next) = next {
+            *location = self.location_url(&next)?;
+        }
+        Ok(offset + chunk.len() as u64)
+    }
+
+    /// Close the upload session with `PUT <location>?digest=<digest>`.
+    async fn finish_upload(
+        &self,
+        repo: &str,
+        location: &Url,
+        digest: &str,
+    ) -> Result<(), OciError> {
+        let mut finish = location.clone();
         finish.query_pairs_mut().append_pair("digest", digest);
         let response = self
             .request(
@@ -1557,7 +1628,13 @@ fn probe_scope(namespace: &str) -> String {
 }
 
 /// Pick the package layer digest out of a manifest.
-fn package_layer_digest(manifest: &Value) -> Option<String> {
+///
+/// The package layer is the first layer whose
+/// `org.opencontainers.image.title` annotation ends in a package suffix; a
+/// manifest without a matching annotation falls back to its first layer, and a
+/// layerless manifest yields `None`.
+#[must_use]
+pub fn package_layer_digest(manifest: &Value) -> Option<String> {
     let layers = manifest.get("layers")?.as_array()?;
     let mut first = None;
 

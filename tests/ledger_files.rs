@@ -131,6 +131,7 @@ fn artifact(version: &str, sha_byte: char) -> Artifact {
         basename: format!("cinc-{version}-debian-13-x86_64.pkg.tar.zst"),
         sha256: sha_byte.to_string().repeat(64),
         iteration: None,
+        superseded: false,
     }
 }
 

@@ -16,6 +16,7 @@ pub mod plan;
 pub mod scope;
 pub mod source;
 pub mod store;
+pub mod targets;
 pub mod version;
 
 pub use artifact::{
@@ -45,4 +46,5 @@ pub use source::transport::{
 };
 pub use source::{Source, SourceConfig, SourceError};
 pub use store::{Store, StoreError};
+pub use targets::{OciTarget, PutOutcome, Target, TargetError, TargetSet};
 pub use version::{Segment, Version, VersionError, VersionGlob, VersionGlobError};

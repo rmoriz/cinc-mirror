@@ -93,6 +93,13 @@ pub struct Artifact {
     pub sha256: String,
     /// Upstream iteration when it is neither absent nor `1`.
     pub iteration: Option<u64>,
+    /// Publish under [`Artifact::superseded_tag`] instead of the descriptive
+    /// tag.
+    ///
+    /// The incident flow sets this when a tag already holds different bytes.
+    /// It is a publication choice, not part of the artifact identity:
+    /// [`Artifact::key`] and [`Artifact::tag`] ignore it.
+    pub superseded: bool,
 }
 
 impl Artifact {
@@ -136,7 +143,15 @@ impl Artifact {
             basename: input.basename,
             sha256,
             iteration: normalize_iteration(input.iteration.as_deref()),
+            superseded: false,
         })
+    }
+
+    /// Publish this artifact under its superseded name.
+    #[must_use]
+    pub fn with_superseded(mut self, superseded: bool) -> Self {
+        self.superseded = superseded;
+        self
     }
 
     /// The canonical artifact key.
