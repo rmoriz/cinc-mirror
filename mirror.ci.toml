@@ -1,0 +1,72 @@
+# Configuration used by .github/workflows/backfill.yml.
+#
+# No credentials live here: the `ghcr` target authenticates with the Docker
+# config the workflow creates from `GITHUB_TOKEN`, and the ledger uses the git
+# authentication configured in the job environment.
+#
+# This file mirrors every project at every version the upstream still serves.
+# The workflow bounds each run with --limit / --limit-bytes; the ledger cursor
+# carries the position into the next scheduled run.
+
+state_dir = "~/.local/state/cinc-mirror"
+concurrency = 4
+upload_concurrency = 2
+
+[[projects]]
+id = "cinc"
+project = "cinc"
+channel = "stable"
+all_versions = true
+platforms = "*"
+arches = "*"
+
+[[projects]]
+id = "cinc-auditor"
+project = "cinc-auditor"
+channel = "stable"
+all_versions = true
+platforms = "*"
+arches = "*"
+
+[[projects]]
+id = "cinc-foundation"
+project = "cinc-foundation"
+channel = "stable"
+all_versions = true
+platforms = "*"
+arches = "*"
+
+[[projects]]
+id = "cinc-server"
+project = "cinc-server"
+channel = "stable"
+all_versions = true
+platforms = "*"
+arches = "*"
+
+[[projects]]
+id = "cinc-workstation"
+project = "cinc-workstation"
+channel = "stable"
+all_versions = true
+platforms = "*"
+arches = "*"
+
+[[projects]]
+id = "omnibus-toolchain"
+project = "omnibus-toolchain"
+channel = "stable"
+all_versions = true
+platforms = "*"
+arches = "*"
+
+[ledger]
+branch = "ledger"
+remote = "origin"
+
+[[targets]]
+name = "ghcr"
+kind = "oci"
+registry = "ghcr.io"
+namespace = "rmoriz/cinc-mirror"
+auth = "docker"

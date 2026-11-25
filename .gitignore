@@ -11,6 +11,13 @@ logs/
 # Configuration with secrets
 config.env
 
+# Rust build output and runtime state
+/target
+mirror.toml
+state/
+plan-*.json
+runs/
+
 # OS files
 .DS_Store
 Thumbs.db

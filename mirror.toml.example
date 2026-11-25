@@ -1,0 +1,59 @@
+# cinc-mirror example configuration.
+#
+# Copy this file to mirror.toml (git-ignored, mode 0600) and adjust it.
+# Credentials are never stored here: each target names an auth mode and the
+# real secret is read from the environment, Docker config or a key file at use
+# time.
+
+state_dir = "~/.local/state/cinc-mirror"
+concurrency = 4
+upload_concurrency = 2
+max_bandwidth = "0"        # global download cap, e.g. "40MiB/s"; 0 = unlimited
+transport = ["ftp", "ftps", "https"]
+metadata_transport = "https"
+min_version = "18"         # default floor for policies without their own floor
+
+[[projects]]
+id = "cinc-stable"
+project = "cinc"
+channel = "stable"
+min_version = "19.0.0"
+platforms = ["debian", "ubuntu", "el"]
+arches = ["amd64", "arm64"]
+
+[projects.platform_versions]
+debian = ["12", "13"]
+
+[[projects]]
+id = "cinc-auditor"
+project = "cinc-auditor"
+channel = "stable"
+min_version = "7.0.0"
+platforms = ["debian", "ubuntu", "el", "windows"]
+arches = ["amd64", "arm64"]
+
+[[projects]]
+id = "omnibus-toolchain"
+project = "omnibus-toolchain"
+channel = "stable"
+all_versions = true
+platforms = "*"
+arches = "*"
+
+[ledger]
+branch = "ledger"
+remote = "origin"
+
+[[targets]]
+name = "ghcr"
+kind = "oci"
+registry = "ghcr.io"
+namespace = "rmoriz/cinc-mirror"
+auth = "docker"
+
+[[targets]]
+name = "rsync"
+kind = "rsync"
+url = "ssh://mirror@backup.example.org/srv/cinc-mirror"
+auth = "ssh-key"
+enabled = false
