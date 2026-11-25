@@ -6,7 +6,7 @@
 
 **Architecture:** One `cinc-mirror` crate with a thin CLI and a library of focused modules. The source layer reads index and metadata over HTTPS and payloads over an FTP/FTPS/HTTPS ladder. A content-addressed store verifies SHA-256 before a `Target` trait fan-out writes to every enabled target. All state is append-only events materialised into SQLite; events are committed as NDJSON on an orphan `ledger` branch.
 
-**Tech Stack:** Rust 2021 (MSRV 1.85), tokio, reqwest (rustls), suppaftp, `oci-client` for auth/manifests with streaming blob uploads, rusqlite, clap, serde, tracing.
+**Tech Stack:** Rust 2021 (MSRV 1.85), tokio, reqwest (rustls), suppaftp, a hand-rolled OCI auth/manifest client with streaming blob uploads, rusqlite, clap, serde, tracing.
 
 **Spec:** `docs/superpowers/specs/2026-11-24-rust-mirror-design.md`
 
