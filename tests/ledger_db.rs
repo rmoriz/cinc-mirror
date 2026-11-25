@@ -931,6 +931,62 @@ fn materialize_rebuilds_derived_state() {
 }
 
 #[test]
+fn materialize_replays_in_append_order_despite_clock_skew() {
+    let (_dir, mut ledger) = open();
+    let artifact = artifact("19.4.46", 'a');
+    let key = artifact.key();
+
+    // A host whose clock is ahead logs `artifact_seen` after `verified` was
+    // already appended with an earlier timestamp. Append order is the live
+    // order; a timestamp-ordered replay would apply `verified` first, match no
+    // artifact row, and silently lose `local = 1`.
+    let mut seen_event = seen("run-1", 1, &artifact, 100);
+    seen_event.ts = ts(3_600);
+    let mut verified_event = event(
+        "run-1",
+        2,
+        EventKind::Verified,
+        Some(&key),
+        None,
+        json!({ "sha256": artifact.sha256, "size": 100 }),
+    );
+    verified_event.ts = ts(1);
+
+    ledger.append(&seen_event).expect("artifact_seen");
+    ledger.append(&verified_event).expect("verified");
+
+    assert!(
+        ledger
+            .artifact(&key)
+            .expect("artifact query")
+            .expect("artifact row")
+            .local,
+        "the live projection is built in append order"
+    );
+
+    ledger.materialize().expect("materialize");
+    assert!(
+        ledger
+            .artifact(&key)
+            .expect("artifact query")
+            .expect("artifact row")
+            .local,
+        "rebuild must keep local = 1 when timestamps are skewed"
+    );
+
+    ledger.materialize().expect("materialize again");
+    assert!(
+        ledger
+            .artifact(&key)
+            .expect("artifact query")
+            .expect("artifact row")
+            .local,
+        "materialize stays idempotent"
+    );
+    assert_eq!(ledger.event_count().expect("event count"), 2);
+}
+
+#[test]
 fn events_round_trip_with_snake_case_kind_and_millisecond_timestamps() {
     let event = event(
         "run-1",

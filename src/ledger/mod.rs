@@ -4,7 +4,7 @@
 //! [`Event`] in the `events` table. `artifacts`, `publications`, `incidents`,
 //! `runs` and `cursors` are derived from that log and can be thrown away: call
 //! [`Ledger::materialize`] to truncate them and replay the events in
-//! `(ts, run_id, seq)` order.
+//! `id` (append) order.
 //!
 //! The database lives at `<state>/ledger.db` in WAL mode. [`Ledger::open`]
 //! creates the directory, the database and the schema, and running it again
@@ -638,8 +638,15 @@ impl Ledger {
     /// Rebuild every derived table from the event log.
     ///
     /// `artifacts`, `publications`, `incidents`, `runs` and `cursors` are
-    /// truncated and replayed in `(ts, run_id, seq)` order. The `events` table
+    /// truncated and replayed in insertion (`id`) order. The `events` table
     /// is never modified.
+    ///
+    /// Replaying in `id` order is deliberate: rows are only ever appended, so
+    /// `id` order is exactly the order the live projection was built in. Event
+    /// timestamps come from different hosts and can be skewed; replaying by
+    /// `ts` could apply a `verified` before its `artifact_seen` (silently
+    /// losing `local = 1`) or a `hash_changed` before the artifact it
+    /// supersedes (failing the whole rebuild).
     ///
     /// # Errors
     ///
@@ -659,7 +666,7 @@ impl Ledger {
         let events = {
             let mut statement = tx.prepare(
                 "SELECT run_id, seq, ts, kind, artifact_key, target, detail_json
-                 FROM events ORDER BY ts, run_id, seq",
+                 FROM events ORDER BY id",
             )?;
             let rows = statement.query_map([], event_from_row)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
