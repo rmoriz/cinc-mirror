@@ -10,6 +10,7 @@ pub mod config;
 pub mod crawl;
 pub mod fsutil;
 pub mod hash;
+pub mod ledger;
 pub mod plan;
 pub mod scope;
 pub mod source;
@@ -27,6 +28,10 @@ pub use config::{
 };
 pub use crawl::{crawl, CrawlError};
 pub use hash::{hash_file, hash_reader, ExpectedHashes, Hasher, Hashes, VerifyOutcome};
+pub use ledger::{
+    ArtifactRow, Cursor, Event, EventKind, Incident, IncidentFilter, IncidentKind, IncidentState,
+    Ledger, LedgerError, Publication, PublicationStatus, Run,
+};
 pub use plan::{build, GroupTotals, Plan, PlanError, SpaceCheck};
 pub use scope::{PlatformVersion, ResolvedPolicy, ResolvedScope, ScopeArgs, ScopeError};
 pub use source::index::{parse_index, IndexEntry};
