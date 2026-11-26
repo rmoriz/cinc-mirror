@@ -29,8 +29,12 @@ curl -sSL https://cinc-mirror.github.io/install.sh | bash
 Windows PowerShell:
 
 ```powershell
-iex (irm 'https://cinc-mirror.github.io/install.ps1'); Install-Project -project cinc -channel stable
+. { iwr -useb https://cinc-mirror.github.io/install.ps1 } | iex; install -project cinc
 ```
+
+`install` is the upstream-compatible alias for `Install-Project` and accepts the
+same flags, e.g. `install -version 19` for the latest 19.x release or
+`install -project cinc-workstation -channel current`.
 
 The actual scripts are at https://github.com/cinc-mirror/cinc-mirror.github.io and should replace https://omnitruck.cinc.sh/install.sh and https://omnitruck.cinc.sh/install.ps1 - metadata is still retrieved from cinc.sh, only packages are retrieved from ghcr.
 
@@ -234,8 +238,11 @@ upstream download URL when the mirror cannot serve it. It verifies the SHA-256
 checksum before running `msiexec`:
 
 ```powershell
-iex (irm 'https://cinc-mirror.github.io/install.ps1'); Install-Project -project cinc -channel stable
+. { iwr -useb https://cinc-mirror.github.io/install.ps1 } | iex; install -project cinc
 ```
+
+Like upstream, `install` accepts `-version`, `-channel`, `-architecture` and the
+other omnitruck flags; `install -version 19` picks the latest 19.x release.
 
 `Get-ProjectMetadata` returns the download URL and SHA-256 checksum the installer
 would use, without installing anything. The mirrored `.msi` packages can also be
