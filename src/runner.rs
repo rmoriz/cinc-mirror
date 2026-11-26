@@ -69,7 +69,7 @@ use crate::ledger::{
 use crate::report::{Summary, EXIT_USAGE};
 use crate::source::metadata::Metadata;
 use crate::store::StoreError;
-use crate::targets::{Target, TargetError};
+use crate::targets::{digest_hex, Target, TargetError};
 
 /// How the queue is ordered after satisfied rows are removed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -495,9 +495,11 @@ impl Job<'_> {
         blob: &std::path::Path,
     ) -> Result<PublishResult, RunError> {
         match target.exists(artifact).await {
-            Ok(Some(existing)) if existing == artifact.sha256 => {
+            Ok(Some(existing)) if digest_hex(&existing) == artifact.sha256 => {
                 // The target already holds these exact bytes; the ledger only
-                // needs the publication row.
+                // needs the publication row. The registry spells the digest
+                // with a `sha256:` prefix, the rsync sidecar without it.
+                let existing = digest_hex(&existing).to_string();
                 tracing::info!(
                     artifact = %artifact.key(),
                     target = target.name(),
@@ -517,6 +519,7 @@ impl Job<'_> {
             Ok(Some(existing)) => {
                 // A different digest under this reference is an incident, never
                 // an overwrite.
+                let existing = digest_hex(&existing).to_string();
                 let new = self
                     .open_incident(artifact, &existing, IncidentKind::TagConflict)
                     .await?;

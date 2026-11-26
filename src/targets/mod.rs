@@ -153,6 +153,10 @@ pub trait Target: Send + Sync {
     async fn probe(&self) -> Result<(), TargetError>;
 
     /// The package digest already published for `artifact`, if any.
+    ///
+    /// The spelling may carry the `sha256:` prefix the registry uses; compare
+    /// with [`digest_hex`] so a reference that holds the same bytes is not
+    /// mistaken for a conflict.
     async fn exists(&self, artifact: &Artifact) -> Result<Option<String>, TargetError>;
 
     /// Publish `package` for `artifact`.
@@ -255,4 +259,14 @@ fn build(config: &Config, target: &TargetConfig) -> Result<Arc<dyn Target>, Targ
         TargetKind::Oci => Ok(Arc::new(OciTarget::from_target(target, config)?)),
         TargetKind::Rsync => Ok(Arc::new(RsyncTarget::from_target(target)?)),
     }
+}
+
+/// The hex value of a digest, with an optional `sha256:` prefix removed.
+///
+/// [`Target::exists`] answers in either spelling: the registry returns an OCI
+/// digest (`sha256:<hex>`), the rsync target reads the bare hex from its
+/// sidecar. Callers compare on the hex value.
+#[must_use]
+pub fn digest_hex(digest: &str) -> &str {
+    digest.strip_prefix("sha256:").unwrap_or(digest)
 }

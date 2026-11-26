@@ -1220,6 +1220,42 @@ async fn a_tag_that_already_holds_other_bytes_opens_a_conflict_incident() {
 }
 
 #[tokio::test]
+async fn a_reference_that_holds_the_same_bytes_under_an_oci_digest_is_no_conflict() {
+    clear_security_env();
+    let dir = TempDir::new().expect("state dir");
+    let package = one_package();
+    let fixture = Fixture::new(dir.path(), std::slice::from_ref(&package), &["t1"], 1, 1);
+    let artifact = artifact_of(&package);
+    // The registry answers `exists` with an OCI digest. A bare comparison with
+    // the artifact's hex used to read the prefix as different bytes, open a
+    // tag_conflict with old == new and fail the run.
+    fixture.targets[0].own(&artifact.tag(), &format!("sha256:{}", artifact.sha256));
+    let target = Arc::clone(&fixture.targets[0]);
+    let ctx = fixture.ctx("run-1");
+
+    let summary = run(&ctx, RunOpts::default()).await.expect("run");
+
+    assert_eq!(summary.incidents_opened, 0, "{summary:?}");
+    assert_eq!(summary.published, 1, "{summary:?}");
+    assert_eq!(summary.exit_code, 0);
+    assert!(
+        target.puts().is_empty(),
+        "the bytes are already there, so nothing is uploaded"
+    );
+    let publications = ctx
+        .ledger
+        .lock()
+        .await
+        .publications_for(&artifact.key())
+        .expect("publications");
+    assert_eq!(publications.len(), 1);
+    assert_eq!(
+        publications[0].status,
+        cinc_mirror::ledger::PublicationStatus::Published
+    );
+}
+
+#[tokio::test]
 async fn an_arch_collision_opens_one_incident_and_the_run_continues() {
     clear_security_env();
     let dir = TempDir::new().expect("state dir");
