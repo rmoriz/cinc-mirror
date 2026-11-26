@@ -319,6 +319,16 @@ impl PayloadTransport for FakePayload {
                 path: dest.display().to_string(),
                 source,
             })?;
+        // `tokio::fs::File` buffers writes and schedules the actual write in the
+        // background, so the final chunk can still sit in memory when the caller
+        // hashes the file right away. The real transports flush for the same
+        // reason; without it a fast fake download reads as an empty file.
+        tokio::io::AsyncWriteExt::flush(&mut file)
+            .await
+            .map_err(|source| TransportError::Local {
+                path: dest.display().to_string(),
+                source,
+            })?;
         Ok((bytes.len() - start) as u64)
     }
 }
