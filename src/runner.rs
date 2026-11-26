@@ -265,6 +265,7 @@ struct ArtifactReport {
     failed: usize,
     unrecoverable: usize,
     incidents: usize,
+    incidents_unrecoverable: usize,
     fully_published: bool,
 }
 
@@ -408,6 +409,7 @@ impl Job<'_> {
                         failed: 0,
                         unrecoverable: 1,
                         incidents: incidents + usize::from(new),
+                        incidents_unrecoverable: usize::from(new),
                         fully_published: false,
                     });
                 }
@@ -427,6 +429,7 @@ impl Job<'_> {
                         failed: 1,
                         unrecoverable: 0,
                         incidents,
+                        incidents_unrecoverable: incidents,
                         fully_published: false,
                     });
                 }
@@ -480,6 +483,7 @@ impl Job<'_> {
             failed,
             unrecoverable: 0,
             incidents,
+            incidents_unrecoverable: 0,
             fully_published: failed == 0 && published_now.len() == self.targets.len(),
         })
     }
@@ -939,6 +943,7 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
         summary.failed += report.failed;
         summary.unrecoverable += report.unrecoverable;
         summary.incidents_opened += report.incidents;
+        summary.incidents_unrecoverable += report.incidents_unrecoverable;
         summary.bytes_downloaded = summary.bytes_downloaded.saturating_add(report.bytes);
     }
     summary.incidents_opened += collision_incidents;

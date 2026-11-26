@@ -238,9 +238,9 @@ formats collide on every crawl.
 
 A payload upstream lists in its metadata but no longer serves (a `404`) is
 recorded as one `unrecoverable` incident. The row stays unsatisfied, so a later
-run retries it, but the download no longer counts as a failure: the first run
-that sees the hole exits `3` for the incident, later runs stay green until
-upstream heals or an operator acknowledges it.
+run retries it, but neither the download nor the incident counts as a failure:
+the issue carries the report, and the run stays green until upstream heals or an
+operator acknowledges it.
 
 ## CI and scheduled backfill
 

@@ -1248,7 +1248,14 @@ async fn a_payload_gone_upstream_opens_one_incident_and_stops_failing_the_run() 
         "a missing payload is not a retry: {summary:?}"
     );
     assert_eq!(summary.incidents_opened, 1, "{summary:?}");
-    assert_eq!(summary.exit_code, 3, "the hole is reported once");
+    assert_eq!(
+        summary.incidents_unrecoverable, 1,
+        "the incident is the informational kind: {summary:?}"
+    );
+    assert_eq!(
+        summary.exit_code, 0,
+        "a lost upstream file does not fail the run"
+    );
     let incidents = ctx
         .ledger
         .lock()

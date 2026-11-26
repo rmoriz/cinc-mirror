@@ -148,6 +148,13 @@ pub struct Summary {
     pub unrecoverable: usize,
     /// Incident rows this run created (deduplicated detections are not counted).
     pub incidents_opened: usize,
+    /// The part of [`Summary::incidents_opened`] that is an `unrecoverable`
+    /// incident.
+    ///
+    /// Such an incident means upstream lost a file; the mirror did everything it
+    /// could, the row stays queued and an issue carries the report. It
+    /// therefore does not fail the run.
+    pub incidents_unrecoverable: usize,
     /// Incidents still open after the run, earlier runs' included.
     ///
     /// Reported for the operator; only newly opened incidents drive the exit
@@ -170,10 +177,11 @@ impl Summary {
     ///
     /// A newly opened incident outranks a partial failure: it means the mirror
     /// saw bytes change behind a published name, which is the more urgent
-    /// condition even when other targets also failed.
+    /// condition even when other targets also failed. An `unrecoverable`
+    /// incident is exempt: upstream served nothing, so nothing was left undone.
     #[must_use]
     pub fn finish(mut self) -> Self {
-        self.exit_code = if self.incidents_opened > 0 {
+        self.exit_code = if self.incidents_opened > self.incidents_unrecoverable {
             EXIT_INCIDENTS
         } else if self.failed > 0 {
             EXIT_PARTIAL
@@ -269,6 +277,28 @@ mod tests {
         assert!(summary.to_json().contains("\"published\": 4"));
         assert!(summary.to_json().contains("\"queued\": 2"));
         assert!(summary.to_json().contains("\"open_incidents\": 1"));
+    }
+
+    #[test]
+    fn an_unrecoverable_incident_does_not_change_the_exit_code() {
+        let summary = Summary {
+            incidents_opened: 2,
+            incidents_unrecoverable: 2,
+            ..Summary::default()
+        }
+        .finish();
+        assert_eq!(summary.exit_code, EXIT_OK);
+
+        let mixed = Summary {
+            incidents_opened: 2,
+            incidents_unrecoverable: 1,
+            ..Summary::default()
+        }
+        .finish();
+        assert_eq!(
+            mixed.exit_code, EXIT_INCIDENTS,
+            "a changed hash still fails"
+        );
     }
 
     #[test]

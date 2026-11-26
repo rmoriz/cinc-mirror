@@ -681,36 +681,79 @@ fn upstream_path(incident: &Incident) -> String {
 }
 
 fn issue_body(incident: &Incident) -> String {
-    let old_sha256 = incident.old_sha256.as_deref().unwrap_or("unknown");
-    let new_sha256 = incident.new_sha256.as_deref().unwrap_or("unknown");
     let detected_at = incident
         .detected_at
         .to_rfc3339_opts(SecondsFormat::Millis, true);
-    format!(
+    let mut body = format!(
         "Incident `{id}` was detected at {detected_at}.\n\n\
          - kind: `{kind}`\n\
          - artifact: `{artifact}`\n\
-         - upstream path: `{upstream}`\n\
-         - old sha256: `{old_sha256}`\n\
-         - new sha256: `{new_sha256}`\n\n\
-         The mirror kept the old bytes. Review the change, then acknowledge it with \
-         `cinc-mirror incidents ack {id}`; add `--republish` to move the canonical \
-         reference to the new digest.",
+         - upstream path: `{upstream}`\n",
         id = incident.id,
         kind = incident.kind,
         artifact = incident.artifact_key.as_deref().unwrap_or("unknown"),
         upstream = upstream_path(incident),
-    )
+    );
+    // An unrecoverable incident names the same digest twice on purpose: it is
+    // about a file that is gone, not about bytes that changed. The other kinds
+    // exist because two digests differ.
+    if incident.old_sha256.is_some() && incident.old_sha256 != incident.new_sha256 {
+        body.push_str(&format!(
+            "- old sha256: `{}`\n- new sha256: `{}`\n",
+            incident.old_sha256.as_deref().unwrap_or("unknown"),
+            incident.new_sha256.as_deref().unwrap_or("unknown"),
+        ));
+    } else if let Some(sha256) = incident.new_sha256.as_deref() {
+        body.push_str(&format!("- sha256: `{sha256}`\n"));
+    }
+    body.push('\n');
+    body.push_str(&match incident.kind {
+        IncidentKind::HashChanged => format!(
+            "The mirror kept the old bytes. Review the change, then acknowledge it with \
+             `cinc-mirror incidents ack {id}`; add `--republish` to move the canonical \
+             reference to the new digest.",
+            id = incident.id,
+        ),
+        IncidentKind::TagConflict => format!(
+            "The reference already held different bytes, so the mirror did not overwrite it. \
+             Compare the two files, then acknowledge with `cinc-mirror incidents ack {id}`; \
+             add `--republish` to move the reference to the incoming digest.",
+            id = incident.id,
+        ),
+        IncidentKind::Unrecoverable => format!(
+            "Upstream no longer serves the payload, so nothing could be published and the \
+             local copy (if any) is the only one left. Every run retries it, so a restored \
+             file heals without help; acknowledge with `cinc-mirror incidents ack {id}` when \
+             the loss is accepted.",
+            id = incident.id,
+        ),
+        IncidentKind::ArchCollision => format!(
+            "Two upstream files map to one descriptive reference. Both are published: the \
+            first under the plain reference, this one under a digest-qualified one. \
+            Acknowledge with `cinc-mirror incidents ack {id}` once the pair is reviewed.",
+            id = incident.id,
+        ),
+    });
+    body
 }
 
 fn announce(incident: &Incident) {
+    // Two identical digests read as noise ("same -> same"); an unrecoverable
+    // incident carries the digest only once.
+    let digests = match (
+        incident.old_sha256.as_deref(),
+        incident.new_sha256.as_deref(),
+    ) {
+        (Some(old), Some(new)) if old != new => format!(" ({old} -> {new})"),
+        (_, Some(new)) => format!(" ({new})"),
+        (Some(old), None) => format!(" ({old})"),
+        (None, None) => String::new(),
+    };
     eprintln!(
-        "SECURITY: {} incident {} for {} ({} -> {})",
+        "SECURITY: {} incident {} for {}{digests}",
         incident.kind,
         incident.id,
         upstream_path(incident),
-        incident.old_sha256.as_deref().unwrap_or("unknown"),
-        incident.new_sha256.as_deref().unwrap_or("unknown"),
     );
 }
 
@@ -761,5 +804,48 @@ fn io_error(path: impl Into<PathBuf>, source: io::Error) -> IncidentError {
     IncidentError::Io {
         path: path.into(),
         source,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ledger::IncidentState;
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    fn incident(kind: IncidentKind) -> Incident {
+        let sha256 = "a".repeat(64);
+        Incident {
+            id: format!("{}-0123456789abcdef", kind.as_str()),
+            artifact_key: Some("stable/cinc/19.4.46/debian/13/amd64/x.deb".to_string()),
+            kind,
+            old_sha256: Some(sha256.clone()),
+            new_sha256: Some(sha256),
+            detected_at: Utc.with_ymd_and_hms(2026, 11, 26, 12, 0, 0).unwrap(),
+            detail: json!({"upstream_path": "stable/cinc/19.4.46/x.deb"}),
+            state: IncidentState::Open,
+            issue_url: None,
+            ack_note: None,
+        }
+    }
+
+    #[test]
+    fn an_unrecoverable_body_names_one_digest_and_explains_the_retry() {
+        let body = issue_body(&incident(IncidentKind::Unrecoverable));
+        assert!(body.contains("- sha256: `"), "{body}");
+        assert!(!body.contains("new sha256"), "{body}");
+        assert!(body.contains("Every run retries it"), "{body}");
+        assert!(!body.contains("--republish"), "{body}");
+    }
+
+    #[test]
+    fn a_changed_hash_body_keeps_the_pair_and_the_republish_hint() {
+        let mut row = incident(IncidentKind::HashChanged);
+        row.new_sha256 = Some("b".repeat(64));
+        let body = issue_body(&row);
+        assert!(body.contains("- old sha256: `"), "{body}");
+        assert!(body.contains("- new sha256: `"), "{body}");
+        assert!(body.contains("--republish"), "{body}");
     }
 }
