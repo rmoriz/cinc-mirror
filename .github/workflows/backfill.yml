@@ -32,6 +32,12 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
+        with:
+          # The ledger step below exports GIT_CONFIG_* for every git subprocess.
+          # A persisted checkout credential would add a second Authorization
+          # header, and GitHub rejects the ledger clone with
+          # `remote: Duplicate header: "Authorization"`.
+          persist-credentials: false
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -42,11 +48,16 @@ jobs:
       - name: Install rsync
         run: command -v rsync >/dev/null || (sudo apt-get update && sudo apt-get install -y rsync)
 
+      # GITHUB_TOKEN may write packages only when the package is linked to this
+      # repository under "Manage Actions access" in the package settings.
+      # Without that link GHCR answers `permission_denied: write_package` even
+      # though this workflow grants `packages: write`. Packages first created by
+      # this workflow are linked automatically.
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # The ledger worktree lives outside the checkout (state_dir/ledger-repo),

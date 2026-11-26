@@ -154,6 +154,12 @@ When adding a new project, the GHCR package is private by default. Make it
 public once under **Package settings → Change package visibility**, e.g.
 https://github.com/users/rmoriz/packages/container/package/cinc-mirror%2Fcinc-workstation
 
+Also link the package to this repository with the **Write** role under
+**Package settings → Manage Actions access**, otherwise the workflow's
+`GITHUB_TOKEN` gets `permission_denied: write_package` even though it has
+`packages: write`. The scheduled workflow links packages it creates itself; a
+package created outside Actions must be linked by hand.
+
 ## Commands
 
 Run `cinc-mirror <command> --help` for the full flag set. Global options are
