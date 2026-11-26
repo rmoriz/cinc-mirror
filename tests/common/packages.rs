@@ -13,8 +13,10 @@
 //!
 //! Switches make the awkward GitHub answers reproducible: [`MockPackages::deny`]
 //! answers `403` everywhere and echoes the received `Authorization` header in
-//! the body (so a client can be checked for leaking its token), and
-//! [`MockPackages::owner_is_org`] marks the named owner as an organisation.
+//! the body (so a client can be checked for leaking its token),
+//! [`MockPackages::fail_deletes_with`] answers the next version `DELETE` with an
+//! arbitrary status, and [`MockPackages::owner_is_org`] marks the named owner as
+//! an organisation.
 //!
 //! Owners are users unless marked otherwise, and the owner routes follow the
 //! real API: a user owner `404`s under `/orgs/`, an organisation `404`s under
@@ -51,6 +53,7 @@ struct MockState {
     deny: AtomicBool,
     omit_links: AtomicBool,
     failure: AtomicU16,
+    delete_failure: AtomicU16,
     next_id: AtomicU64,
     packages: Mutex<BTreeSet<String>>,
     versions: Mutex<BTreeMap<String, Vec<SeededVersion>>>,
@@ -69,6 +72,7 @@ impl MockState {
             deny: AtomicBool::new(false),
             omit_links: AtomicBool::new(false),
             failure: AtomicU16::new(0),
+            delete_failure: AtomicU16::new(0),
             next_id: AtomicU64::new(1),
             packages: Mutex::new(BTreeSet::new()),
             versions: Mutex::new(BTreeMap::new()),
@@ -204,6 +208,9 @@ async fn api(
         },
         (7, Some("versions")) => match method {
             Method::DELETE => {
+                if let Some(status) = take_delete_failure(&state.delete_failure) {
+                    return (status, "injected delete failure").into_response();
+                }
                 let id = parts[6].parse::<u64>().ok();
                 match id {
                     Some(id) => delete(&state, package, id),
@@ -276,6 +283,12 @@ fn versions(state: &Arc<MockState>, package: &str, query: Option<&str>, path: &s
         }
     }
     response
+}
+
+/// Answer a status once if a delete failure is armed, then disarm it.
+fn take_delete_failure(cell: &AtomicU16) -> Option<StatusCode> {
+    let status = cell.swap(0, Ordering::SeqCst);
+    (status != 0).then(|| StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
 }
 
 fn delete(state: &Arc<MockState>, package: &str, id: u64) -> Response {
@@ -375,6 +388,11 @@ impl MockPackages {
     /// Answer every request with `status`.
     pub fn fail_with(&self, status: u16) {
         self.state.failure.store(status, Ordering::SeqCst);
+    }
+
+    /// Answer the next version `DELETE` with `status`, then delete again.
+    pub fn fail_deletes_with(&self, status: u16) {
+        self.state.delete_failure.store(status, Ordering::SeqCst);
     }
 
     /// Register a package without any version.

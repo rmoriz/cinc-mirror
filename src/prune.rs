@@ -37,12 +37,12 @@
 //! that code.
 //!
 //! A single cutoff per target is taken just before the first listing, so a
-//! reference created while the crawl ran is not old enough to be deleted. Every
-//! project is planned against the full remaining budget, the per-project lists
-//! are interleaved round-robin and only then truncated, so one large project
-//! cannot drain the target. Every deletion appends a `pruned` or `prune_failed`
-//! event; the artifact key comes from the target's publication rows and is left
-//! off when the ledger never saw the reference.
+//! reference created while the crawl ran is not old enough to be deleted. The
+//! budget is spent in rounds that hand out one reference per project at a time,
+//! so one large project cannot drain the target and a denial costs at most the
+//! requests already in flight. Every deletion appends a `pruned` or
+//! `prune_failed` event; the artifact key comes from the target's publication
+//! rows and is left off when the ledger never saw the reference.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
@@ -306,7 +306,8 @@ pub struct Pass<'a> {
     pub projects: &'a [&'a str],
     /// What the crawl still wants.
     pub wanted: &'a Wanted,
-    /// Per-project count of crawled artifacts; `0` empties the package.
+    /// Per-project count of crawled artifacts; `0` and an absent entry both
+    /// empty the package.
     pub crawled: &'a BTreeMap<String, usize>,
     /// Projects whose crawl lost a document; they stay untouched.
     pub hold_back: &'a HashSet<String>,
@@ -316,7 +317,8 @@ pub struct Pass<'a> {
     pub sweep_orphans: bool,
     /// Report the deletions without performing them.
     pub dry_run: bool,
-    /// Deletions allowed per target.
+    /// Deletions allowed per target; `0` deletes nothing and leaves the whole
+    /// plan deferred.
     pub budget: usize,
     /// Event sequence of the run; `None` appends nothing.
     pub seq: Option<&'a Seq>,
@@ -327,13 +329,15 @@ pub struct Pass<'a> {
 pub struct PruneReport {
     /// References deleted.
     pub pruned: usize,
-    /// References, projects or targets that failed.
+    /// References or projects that failed; an unsupported target never bumps
+    /// it and only lands in [`PruneReport::targets_skipped`].
     pub failed: usize,
     /// References the budget or a failed listing left for a later run.
     pub deferred: usize,
     /// Targets whose backend cannot delete; they are left alone.
     pub targets_skipped: Vec<String>,
-    /// One `registry/repo:tag` (or `@digest`) line per planned deletion.
+    /// One `registry/repo:tag` (or `@digest`) line per planned deletion; filled
+    /// on a dry run only.
     pub lines: Vec<String>,
     /// Process exit code implied by the counts.
     pub exit_code: i32,
@@ -590,8 +594,9 @@ async fn prune_target(
         }
     }
 
+    let mut seen_projects: BTreeSet<&str> = BTreeSet::new();
     for project in pass.projects.iter().copied() {
-        if pass.hold_back.contains(project) {
+        if pass.hold_back.contains(project) || !seen_projects.insert(project) {
             continue;
         }
         let empty = pass.crawled.get(project).is_none_or(|count| *count == 0);
@@ -616,59 +621,40 @@ async fn prune_target(
         }
     }
 
-    // Plan every project against the full budget; only the merged list is
-    // truncated, so one large project cannot drain the target.
-    let mut grouped: Vec<Vec<Candidate>> = Vec::new();
+    // Plan every project with the whole budget; the rounds below hand it out
+    // one reference per project at a time, so no project can drain the target
+    // and a denial costs at most the requests already in flight.
+    struct Slot {
+        project: String,
+        references: VecDeque<RemoteReference>,
+        dead: bool,
+    }
+    let mut slots: Vec<Slot> = Vec::new();
     for project in &listed {
         let (wanted, protection) = if project.empty {
             (&empty_wanted, &empty_protection)
         } else {
             (pass.wanted, &protection)
         };
-        let planned = plan(wanted, protection, &project.references, cutoff, pass.budget);
+        let planned = plan(wanted, protection, &project.references, cutoff, usize::MAX);
         report.deferred += planned.deferred;
-        if planned.delete.is_empty() {
-            continue;
-        }
-        grouped.push(
-            planned
-                .delete
-                .into_iter()
-                .map(|reference| Candidate {
-                    project: project.project.clone(),
-                    reference,
-                })
-                .collect(),
-        );
-    }
-    let mut merged = interleave(grouped);
-
-    if let Backend::Packages { .. } = backend {
-        let mut seen: BTreeSet<u64> = BTreeSet::new();
-        merged.retain(|candidate| match candidate.reference.version_id {
-            Some(id) => seen.insert(id),
-            None => true,
+        slots.push(Slot {
+            project: project.project.clone(),
+            dead: planned.delete.is_empty(),
+            references: planned.delete.into(),
         });
     }
-    if merged.len() > pass.budget {
-        report.deferred += merged.len() - pass.budget;
-        merged.truncate(pass.budget);
-    }
-
-    if pass.dry_run {
-        for candidate in &merged {
-            report.lines.push(display_reference(
-                &registry,
-                &format!("{namespace}/{}", candidate.project),
-                &candidate.reference,
-            ));
+    if let Backend::Packages { .. } = backend {
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
+        for slot in &mut slots {
+            slot.references
+                .retain(|reference| match reference.version_id {
+                    Some(id) => seen.insert(id),
+                    None => true,
+                });
+            slot.dead = slot.references.is_empty();
         }
-        return;
     }
-    if merged.is_empty() {
-        return;
-    }
-
     let clients: BTreeMap<&str, &PackagesClient> = listed
         .iter()
         .filter_map(|project| {
@@ -678,60 +664,100 @@ async fn prune_target(
                 .map(|client| (project.project.as_str(), client))
         })
         .collect();
-    let outcomes: Vec<(&str, Deleted)> =
-        futures::stream::iter(merged.iter().map(|candidate| async {
-            let repo = format!("{namespace}/{}", candidate.project);
-            let remote_ref = display_reference(&registry, &repo, &candidate.reference);
-            let client = clients.get(candidate.project.as_str()).copied();
-            let outcome = delete_one(backend, client, &repo, candidate).await;
-            record(ctx, pass, target, &repo, &remote_ref, &outcome, &index).await;
-            (candidate.project.as_str(), outcome)
-        }))
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
 
-    let mut denied: BTreeSet<&str> = BTreeSet::new();
-    for (project, outcome) in outcomes {
-        match outcome {
-            Deleted::Missing => {}
-            Deleted::Pruned(_) => report.pruned += 1,
-            Deleted::Unsupported => note_skip(target, report),
-            Deleted::Denied(reason) => {
-                if denied.insert(project) {
+    let mut budget = pass.budget;
+    let mut abandoned = false;
+    while budget > 0 && !abandoned {
+        // One round: at most one reference per live project, and never more
+        // than the budget. A project that fails to list or delete therefore
+        // wastes at most one slot.
+        let mut window: Vec<(usize, Candidate)> = Vec::new();
+        for (index, slot) in slots.iter_mut().enumerate() {
+            if budget == 0 {
+                break;
+            }
+            if slot.dead {
+                continue;
+            }
+            let Some(reference) = slot.references.pop_front() else {
+                continue;
+            };
+            budget -= 1;
+            window.push((
+                index,
+                Candidate {
+                    project: slot.project.clone(),
+                    reference,
+                },
+            ));
+        }
+        if window.is_empty() {
+            break;
+        }
+
+        if pass.dry_run {
+            for (_, candidate) in &window {
+                report.lines.push(display_reference(
+                    &registry,
+                    &format!("{namespace}/{}", candidate.project),
+                    &candidate.reference,
+                ));
+            }
+            continue;
+        }
+
+        let outcomes: Vec<(usize, Deleted)> =
+            futures::stream::iter(window.iter().map(|(slot, candidate)| async {
+                let repo = format!("{namespace}/{}", candidate.project);
+                let remote_ref = display_reference(&registry, &repo, &candidate.reference);
+                let client = clients.get(candidate.project.as_str()).copied();
+                let outcome = delete_one(backend, client, &repo, candidate).await;
+                record(ctx, pass, target, &repo, &remote_ref, &outcome, &index).await;
+                (*slot, outcome)
+            }))
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+        for (index, outcome) in outcomes {
+            match outcome {
+                Deleted::Missing => budget += 1,
+                Deleted::Pruned(_) => report.pruned += 1,
+                Deleted::Unsupported => {
+                    note_skip(target, report);
+                    abandoned = true;
+                    budget += 1;
+                }
+                Deleted::Denied(reason) => {
+                    report.failed += 1;
+                    budget += 1;
                     warn!(
                         target = target.name.as_str(),
-                        project, reason, "packages api denied; abandoning the project"
+                        project = slots[index].project.as_str(),
+                        reason,
+                        "packages api denied; abandoning the project"
                     );
+                    slots[index].dead = true;
+                }
+                Deleted::Failed(_) => {
                     report.failed += 1;
+                    budget += 1;
                 }
             }
-            Deleted::Failed(_) => report.failed += 1,
         }
     }
-    if report.targets_skipped.contains(&target.name) {
+    // Everything still queued was either stopped by the budget or belongs to
+    // a dead project; both wait for the next run.
+    report.deferred += slots
+        .iter()
+        .map(|slot| slot.references.len())
+        .sum::<usize>();
+
+    if !pass.dry_run && report.targets_skipped.contains(&target.name) {
         warn!(
             target = target.name.as_str(),
             "endpoint does not support deletes; skipping the target"
         );
-    }
-}
-
-/// Merge per-project buckets round-robin, the first entry of each first.
-fn interleave(buckets: Vec<Vec<Candidate>>) -> Vec<Candidate> {
-    let mut queues: Vec<VecDeque<Candidate>> = buckets.into_iter().map(VecDeque::from).collect();
-    let mut merged = Vec::new();
-    loop {
-        let mut taken = false;
-        for queue in &mut queues {
-            if let Some(candidate) = queue.pop_front() {
-                merged.push(candidate);
-                taken = true;
-            }
-        }
-        if !taken {
-            return merged;
-        }
     }
 }
 
@@ -758,10 +784,24 @@ async fn protection_and_index(
             Vec::new()
         }
     };
-    let publications = ledger.publications(&target.name).unwrap_or_default();
+    let publications = ledger.publications(&target.name).unwrap_or_else(|error| {
+        warn!(
+            target = target.name.as_str(),
+            error = %redact_secrets(&error.to_string()),
+            "cannot read the publications; the target may be over-pruned"
+        );
+        Vec::new()
+    });
     let incidents = ledger
         .incidents(IncidentFilter::default())
-        .unwrap_or_default();
+        .unwrap_or_else(|error| {
+            warn!(
+                target = target.name.as_str(),
+                error = %redact_secrets(&error.to_string()),
+                "cannot read the incidents; the target may be over-pruned"
+            );
+            Vec::new()
+        });
     drop(ledger);
 
     let mut index = BTreeMap::new();
@@ -770,6 +810,9 @@ async fn protection_and_index(
             continue;
         };
         index.insert(remote_ref.clone(), publication.artifact_key.clone());
+        // The bare key is last-write-wins when two untagged publications share
+        // a package: an event can then only attach one of their keys, but the
+        // rows live under different artifacts anyway.
         if let Some((bare, _)) = remote_ref.rsplit_once('@') {
             index.insert(bare.to_string(), publication.artifact_key.clone());
         }

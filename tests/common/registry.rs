@@ -13,11 +13,13 @@
 //! State lives in a `HashMap`, so a test can assert the exact bytes that
 //! arrived and how they were split. Counters make wire behaviour visible:
 //! number of `PATCH` requests, token requests, upload starts, manifest writes
-//! and manifest deletes. The server binds `127.0.0.1:0`, so tests never leave
-//! the machine.
+//! and manifest deletes. [`MockRegistry::answer_405`] refuses every manifest
+//! delete and [`MockRegistry::fail_deletes_with`] refuses the next one with an
+//! arbitrary status. The server binds `127.0.0.1:0`, so tests never leave the
+//! machine.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -83,6 +85,7 @@ pub struct MockState {
     manifest_put_failures: AtomicUsize,
     manifest_deletes: AtomicUsize,
     answer_405: AtomicUsize,
+    fail_deletes: AtomicU16,
     blob_heads: AtomicUsize,
     stall_patch: AtomicU64,
     stall_patch_body: AtomicU64,
@@ -113,6 +116,7 @@ impl MockState {
             manifest_put_failures: AtomicUsize::new(0),
             manifest_deletes: AtomicUsize::new(0),
             answer_405: AtomicUsize::new(0),
+            fail_deletes: AtomicU16::new(0),
             blob_heads: AtomicUsize::new(0),
             stall_patch: AtomicU64::new(0),
             stall_patch_body: AtomicU64::new(0),
@@ -510,6 +514,9 @@ fn delete_manifest(state: &Arc<MockState>, repo: &str, reference: &str) -> Respo
     if state.answer_405.load(Ordering::SeqCst) != 0 {
         return (StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED").into_response();
     }
+    if let Some(status) = take_delete_failure(&state.fail_deletes) {
+        return (status, "injected delete failure").into_response();
+    }
 
     let mut manifests = lock(&state.manifests);
     let before = manifests.len();
@@ -523,6 +530,12 @@ fn delete_manifest(state: &Arc<MockState>, repo: &str, reference: &str) -> Respo
 
     state.manifest_deletes.fetch_add(1, Ordering::SeqCst);
     StatusCode::ACCEPTED.into_response()
+}
+
+/// Answer a status once if a delete failure is armed, then disarm it.
+fn take_delete_failure(cell: &AtomicU16) -> Option<StatusCode> {
+    let status = cell.swap(0, Ordering::SeqCst);
+    (status != 0).then(|| StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
 }
 
 fn tags_list(state: &Arc<MockState>, repo: &str, query: Option<&str>) -> Response {
@@ -740,6 +753,11 @@ impl MockRegistry {
     /// Answer `405 UNSUPPORTED` to every manifest `DELETE`.
     pub fn answer_405(&self) {
         self.state.answer_405.store(1, Ordering::SeqCst);
+    }
+
+    /// Answer the next manifest `DELETE` with `status`, then accept again.
+    pub fn fail_deletes_with(&self, status: u16) {
+        self.state.fail_deletes.store(status, Ordering::SeqCst);
     }
 
     /// Accept a bearer token the test invents, for a pre-issued token.

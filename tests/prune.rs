@@ -144,12 +144,13 @@ struct Opts {
     configured: HashSet<String>,
     sweep_orphans: bool,
     dry_run: bool,
-    budget: usize,
+    /// `None` leaves the budget wide open; `Some(0)` deletes nothing.
+    budget: Option<usize>,
 }
 
 impl Opts {
     fn budget(mut self, budget: usize) -> Self {
-        self.budget = budget;
+        self.budget = Some(budget);
         self
     }
 
@@ -211,7 +212,7 @@ async fn prune(ctx: &Ctx, projects: &[&str], wanted: &Wanted, opts: Opts) -> Pru
             configured: &configured,
             sweep_orphans: opts.sweep_orphans,
             dry_run: opts.dry_run,
-            budget: if opts.budget == 0 { 1_000 } else { opts.budget },
+            budget: opts.budget.unwrap_or(usize::MAX),
             seq,
         },
     )
@@ -288,6 +289,25 @@ fn seed_publication(ledger: &mut Ledger, artifact: &Artifact, target: &str, remo
         .expect("publication");
 }
 
+/// Seed an open incident on `artifact`, which protects all its publications.
+fn seed_incident(ledger: &mut Ledger, artifact: &Artifact) {
+    ledger
+        .append(
+            &Event::new(
+                format!("seed-incident-{}", artifact.key()),
+                2,
+                Utc::now(),
+                EventKind::IncidentOpened,
+            )
+            .with_artifact(artifact.key())
+            .with_detail(json!({
+                "kind": "hash_changed",
+                "artifact_key": artifact.key(),
+            })),
+        )
+        .expect("incident_opened");
+}
+
 async fn events(ctx: &Ctx) -> Vec<Event> {
     ctx.ledger.lock().await.events().expect("events")
 }
@@ -298,7 +318,7 @@ async fn a_stale_tag_is_deleted_and_a_pruned_event_is_appended() {
     let state = tempfile::tempdir().expect("state dir");
     let mut ledger = Ledger::open(state.path()).expect("ledger");
     let artifact = package_artifact(b"stale bytes", "19.4.46");
-    mock.store_manifest(&repo(PROJECT), &artifact.tag(), b"stale bytes");
+    let digest = mock.store_manifest(&repo(PROJECT), &artifact.tag(), b"stale bytes");
     seed_artifact(&mut ledger, &artifact);
     let remote_ref = format!(
         "{}/{}:{}",
@@ -326,6 +346,7 @@ async fn a_stale_tag_is_deleted_and_a_pruned_event_is_appended() {
     );
     assert_eq!(pruned[0].target.as_deref(), Some("ghcr"));
     assert_eq!(pruned[0].detail["remote_ref"], json!(remote_ref));
+    assert_eq!(pruned[0].detail["remote_digest"], json!(digest));
 }
 
 #[tokio::test]
@@ -380,16 +401,34 @@ async fn a_project_without_crawled_artifacts_is_emptied_and_warned_about_once() 
     let _token = EnvVar::set("GHCR_TOKEN", "test-token");
     let mock = MockPackages::start().await;
     mock.owner_is_org("acme");
-    let first = mock.seed_version("mirror/cinc", &["19.4.46"], Utc::now());
-    let second = mock.seed_version("mirror/cinc", &["19.4.45"], Utc::now());
+    let wanted_version = mock.seed_version("mirror/cinc", &["19.4.46"], Utc::now());
+    let protected = mock.seed_version("mirror/cinc", &["19.4.45"], Utc::now());
     let state = tempfile::tempdir().expect("state dir");
-    let ledger = Ledger::open(state.path()).expect("ledger");
+    let mut ledger = Ledger::open(state.path()).expect("ledger");
+
+    // Both would survive under the normal rules: `19.4.46` is wanted and the
+    // artifact of `19.4.45` has an open incident. Emptying must ignore both.
+    let wanted_artifact = package_artifact(b"wanted bytes", "19.4.46");
+    seed_artifact(&mut ledger, &wanted_artifact);
+    let protected_artifact = package_artifact(b"protected bytes", "19.4.45");
+    seed_artifact(&mut ledger, &protected_artifact);
+    seed_publication(
+        &mut ledger,
+        &protected_artifact,
+        "ghcr",
+        &format!("ghcr.io/acme/mirror/cinc:{}", protected_artifact.tag()),
+    );
+    seed_incident(&mut ledger, &protected_artifact);
+    let wanted = Wanted {
+        tags: ["19.4.46".to_string()].into_iter().collect(),
+        digests: Default::default(),
+    };
 
     let ctx = packages_context(state.path(), ledger, &mock);
     let report = prune(
         &ctx,
         &[PROJECT],
-        &Wanted::default(),
+        &wanted,
         Opts::default().crawled(PROJECT, 0),
     )
     .await;
@@ -397,9 +436,13 @@ async fn a_project_without_crawled_artifacts_is_emptied_and_warned_about_once() 
     assert_eq!(report.pruned, 2, "{report:?}");
     let mut deleted = mock.deleted();
     deleted.sort_unstable();
-    let mut expected = vec![first, second];
+    let mut expected = vec![wanted_version, protected];
     expected.sort_unstable();
-    assert_eq!(deleted, expected);
+    assert_eq!(
+        deleted, expected,
+        "the wanted and the protected version die"
+    );
+    assert!(mock.versions_for("mirror/cinc").is_empty());
     assert_eq!(
         warnings().matches("has no crawled artifacts").count(),
         1,
@@ -486,6 +529,132 @@ async fn a_403_aborts_the_project_and_leaves_the_budget_unspent() {
 }
 
 #[tokio::test]
+async fn a_failed_registry_delete_records_prune_failed_and_carries_on() {
+    let mock = mock_registry().await;
+    let state = tempfile::tempdir().expect("state dir");
+    let ledger = Ledger::open(state.path()).expect("ledger");
+    mock.store_manifest(&repo(PROJECT), "19.4.46-debian-13-amd64", b"first");
+    mock.store_manifest(&repo(PROJECT), "19.4.45-debian-13-amd64", b"second");
+    mock.fail_deletes_with(422);
+
+    let ctx = registry_context(state.path(), ledger, &mock);
+    let report = prune(&ctx, &[PROJECT], &Wanted::default(), Opts::default()).await;
+
+    assert_eq!(report.failed, 1, "{report:?}");
+    assert_eq!(report.pruned, 1, "{report:?}");
+    assert_eq!(report.exit_code, EXIT_PARTIAL);
+    let events = events(&ctx).await;
+    let failed: Vec<&Event> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::PruneFailed)
+        .collect();
+    assert_eq!(failed.len(), 1);
+    let remote_ref = failed[0].detail["remote_ref"].as_str().expect("remote_ref");
+    assert!(
+        remote_ref.starts_with(&format!("{}/{}:", mock.registry_name(), repo(PROJECT))),
+        "{remote_ref}"
+    );
+    assert!(remote_ref.ends_with("-debian-13-amd64"), "{remote_ref}");
+    assert!(
+        failed[0].detail["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()),
+        "{:?}",
+        failed[0].detail
+    );
+    assert_eq!(mock.delete_count(), 1, "the next reference still deleted");
+    let left = ["19.4.46-debian-13-amd64", "19.4.45-debian-13-amd64"]
+        .iter()
+        .filter(|tag| mock.manifest(&repo(PROJECT), tag).is_some())
+        .count();
+    assert_eq!(left, 1, "exactly the failed manifest is left behind");
+}
+
+#[tokio::test]
+async fn a_failed_packages_delete_records_prune_failed_and_carries_on() {
+    let _guard = lock_env().await;
+    let _token = EnvVar::set("GHCR_TOKEN", "test-token");
+    let mock = MockPackages::start().await;
+    mock.owner_is_org("acme");
+    mock.seed_version("mirror/cinc", &["19.4.46"], Utc::now());
+    mock.seed_version("mirror/cinc", &["19.4.45"], Utc::now());
+    mock.fail_deletes_with(422);
+    let state = tempfile::tempdir().expect("state dir");
+    let ledger = Ledger::open(state.path()).expect("ledger");
+
+    let ctx = packages_context(state.path(), ledger, &mock);
+    let report = prune(&ctx, &[PROJECT], &Wanted::default(), Opts::default()).await;
+
+    assert_eq!(report.failed, 1, "{report:?}");
+    assert_eq!(report.pruned, 1, "{report:?}");
+    assert_eq!(report.exit_code, EXIT_PARTIAL);
+    let events = events(&ctx).await;
+    let failed: Vec<&Event> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::PruneFailed)
+        .collect();
+    assert_eq!(failed.len(), 1);
+    let mut remaining = mock.versions_for("mirror/cinc");
+    assert_eq!(remaining.len(), 1, "the next version still deleted");
+    let kept = remaining.pop().expect("one version left");
+    assert_eq!(
+        failed[0].detail["remote_ref"],
+        json!(format!("ghcr.io/acme/mirror/cinc:{kept}"))
+    );
+    assert!(
+        failed[0].detail["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()),
+        "{:?}",
+        failed[0].detail
+    );
+    assert_eq!(mock.deleted().len(), 1);
+}
+
+#[tokio::test]
+async fn a_denied_project_stops_after_one_request_and_frees_its_slot() {
+    let _log = log_guard().await;
+    let _guard = lock_env().await;
+    let _token = EnvVar::set("GHCR_TOKEN", "test-token");
+    let mock = MockPackages::start().await;
+    mock.owner_is_org("acme");
+    mock.seed_version("mirror/cinc", &["19.4.46"], Utc::now());
+    mock.seed_version("mirror/cinc", &["19.4.45"], Utc::now());
+    mock.seed_version("mirror/cinc", &["19.4.44"], Utc::now());
+    mock.seed_version("mirror/cinc-auditor", &["4.18.100"], Utc::now());
+    mock.fail_deletes_with(403);
+    let state = tempfile::tempdir().expect("state dir");
+    let ledger = Ledger::open(state.path()).expect("ledger");
+    let projects = [PROJECT, "cinc-auditor"];
+
+    let ctx = packages_context(state.path(), ledger, &mock);
+    let report = prune(
+        &ctx,
+        &projects,
+        &Wanted::default(),
+        Opts::default().budget(1),
+    )
+    .await;
+
+    assert_eq!(report.failed, 1, "{report:?}");
+    assert_eq!(report.pruned, 1, "the freed slot goes to the other project");
+    assert_eq!(report.deferred, 2, "the denied project's tail waits");
+    assert_eq!(
+        warnings().matches("abandoning the project").count(),
+        1,
+        "{}",
+        warnings()
+    );
+    let deletes = mock
+        .request_log()
+        .iter()
+        .filter(|(method, _)| method == "DELETE")
+        .count();
+    assert_eq!(deletes, 2, "no doomed requests");
+    assert_eq!(mock.versions_for("mirror/cinc").len(), 3);
+}
+
+#[tokio::test]
 async fn the_budget_defers_the_tail() {
     let _guard = lock_env().await;
     let _token = EnvVar::set("GHCR_TOKEN", "test-token");
@@ -507,6 +676,18 @@ async fn the_budget_defers_the_tail() {
     .await;
 
     assert_eq!(report.pruned, 1, "{report:?}");
+    assert_eq!(report.deferred, 1);
+    assert_eq!(mock.deleted().len(), 1);
+
+    // `budget == 0` is literal: nothing is deleted, the whole tail waits.
+    let report = prune(
+        &ctx,
+        &projects,
+        &Wanted::default(),
+        Opts::default().budget(0),
+    )
+    .await;
+    assert_eq!(report.pruned, 0, "{report:?}");
     assert_eq!(report.deferred, 1);
     assert_eq!(mock.deleted().len(), 1);
 }
