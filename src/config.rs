@@ -252,12 +252,31 @@ impl Default for LedgerConfig {
 pub struct IncidentConfig {
     /// API root, e.g. `https://api.github.com`.
     pub api_base: String,
+    /// Projects whose arch collisions are not opened as incidents.
+    ///
+    /// Upstream occasionally publishes two files under one descriptive tag (for
+    /// example a `.msi` and an `.appx`). That is a packaging alias, not a
+    /// tampered download; listing the project here keeps the collision out of
+    /// the ledger, the alerts and the issue tracker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_arch_collisions: Vec<String>,
+}
+
+impl IncidentConfig {
+    /// Whether an arch collision for `project` should not be recorded.
+    #[must_use]
+    pub fn ignores_arch_collision(&self, project: &str) -> bool {
+        self.ignore_arch_collisions
+            .iter()
+            .any(|value| value == project)
+    }
 }
 
 impl Default for IncidentConfig {
     fn default() -> Self {
         Self {
             api_base: "https://api.github.com".to_string(),
+            ignore_arch_collisions: Vec::new(),
         }
     }
 }

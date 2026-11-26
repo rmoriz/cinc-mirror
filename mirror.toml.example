@@ -71,6 +71,12 @@ remote = "origin"
 # `GITHUB_REPOSITORY` inside GitHub Actions.
 # issue_repo = "<owner>/cinc-mirror"
 
+# Two package formats published under one descriptive tag (for example `.msi`
+# and `.appx`) are an upstream alias, not an integrity finding. List the project
+# here to keep those collisions out of the ledger, the alerts and the issues.
+# [incident]
+# ignore_arch_collisions = ["omnibus-toolchain"]
+
 [[targets]]
 name = "ghcr"
 kind = "oci"

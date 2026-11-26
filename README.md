@@ -216,6 +216,12 @@ acknowledges the incident with `cinc-mirror incidents ack <id>`. Adding
 `<basename>.superseded-<sha12>`, in the registry under a superseded tag — and
 then publishes the replacement under the canonical name.
 
+Arch collisions — two upstream files that map to one descriptive tag, such as a
+`.msi` and an `.appx` — are incidents as well. A project can opt out with
+`[incident] ignore_arch_collisions = ["omnibus-toolchain"]`; the first artifact
+is still kept and the other is skipped, without a ledger incident, alert or
+GitHub issue.
+
 ## CI and scheduled backfill
 
 `.github/workflows/ci.yml` runs formatting, clippy, tests on Linux and macOS, the

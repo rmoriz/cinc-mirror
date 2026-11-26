@@ -37,6 +37,22 @@ fn binary() -> Command {
 }
 
 #[test]
+fn parses_projects_whose_arch_collisions_are_ignored() {
+    let config = validated(
+        r#"
+        [incident]
+        ignore_arch_collisions = ["omnibus-toolchain"]
+        "#,
+    )
+    .expect("valid config");
+
+    assert_eq!(
+        config.incident.ignore_arch_collisions,
+        vec!["omnibus-toolchain".to_string()]
+    );
+}
+
+#[test]
 fn rejects_duplicate_policy_ids() {
     let error = validated(
         r#"

@@ -1011,12 +1011,28 @@ async fn open_incident_count(ctx: &Ctx) -> Result<usize, RunError> {
 /// the old value, so a human sees exactly which pair of upstream files maps to
 /// one public reference. The excluded artifact is recorded as seen first — the
 /// incident must name a row the ledger knows. Returns whether the incident was
-/// newly opened; a later run's detection is deduplicated and only reported.
+/// newly opened; a later run's detection is deduplicated and only reported. A
+/// project listed in `incident.ignore_arch_collisions` returns `false` without
+/// recording anything.
 async fn open_collision_incident(
     ctx: &Ctx,
     seq: &Seq,
     collision: &TagCollision,
 ) -> Result<bool, RunError> {
+    if ctx
+        .config
+        .incident
+        .ignores_arch_collision(&collision.conflicting.project)
+    {
+        tracing::info!(
+            tag = %collision.tag,
+            conflicting = %collision.conflicting.key(),
+            kept = %collision.first.key(),
+            "arch collision ignored by configuration; keeping the first artifact"
+        );
+        return Ok(false);
+    }
+
     let mut ledger = ctx.ledger.lock().await;
     let id = ledger::incident_id(
         IncidentKind::ArchCollision,

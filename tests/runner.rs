@@ -570,6 +570,16 @@ impl Fixture {
         }
     }
 
+    fn ignore_arch_collisions(mut self, project: &str) -> Self {
+        let mut config = (*self.config).clone();
+        config
+            .incident
+            .ignore_arch_collisions
+            .push(project.to_string());
+        self.config = Arc::new(config);
+        self
+    }
+
     fn seed_blob(&self, spec: &Spec) -> String {
         let sha256 = sha256_hex(&spec.body);
         let partial = self.store.partial_path(&sha256).expect("partial path");
@@ -1319,6 +1329,61 @@ async fn an_arch_collision_opens_one_incident_and_the_run_continues() {
         "a satisfied queue downloads nothing"
     );
     assert!(repeat_target.puts().is_empty());
+}
+
+#[tokio::test]
+async fn an_arch_collision_for_an_ignored_project_opens_no_incident() {
+    clear_security_env();
+    let dir = TempDir::new().expect("state dir");
+    let kept = Spec::new(
+        "19.4.46",
+        "cinc_19.4.46-1_aarch64.deb",
+        b"the aarch64 build",
+    )
+    .with_raw_arch("aarch64");
+    let conflicting = Spec::new(
+        "19.4.46",
+        "cinc_19.4.46-1_arm64.deb",
+        b"the arm64 build with different bytes",
+    )
+    .with_raw_arch("arm64");
+    let other = Spec::new(
+        "19.3.14",
+        "cinc_19.3.14-1_amd64.deb",
+        b"an unrelated package",
+    );
+
+    let specs = [kept.clone(), conflicting.clone(), other.clone()];
+    let fixture = Fixture::new(dir.path(), &specs, &["t1"], 1, 1).ignore_arch_collisions("cinc");
+    let target = Arc::clone(&fixture.targets[0]);
+    let ctx = fixture.ctx("run-1");
+
+    let summary = run(&ctx, RunOpts::default()).await.expect("run");
+
+    let conflicting_artifact = artifact_of(&conflicting);
+    assert_eq!(summary.incidents_opened, 0, "{summary:?}");
+    assert_eq!(summary.open_incidents, 0, "{summary:?}");
+    assert_eq!(summary.exit_code, 0, "{summary:?}");
+    assert_eq!(summary.skipped, 1, "the conflicting artifact is excluded");
+    assert_eq!(summary.discovered, 2, "{summary:?}");
+    assert_eq!(summary.published, 2, "{summary:?}");
+    assert!(
+        target
+            .puts()
+            .iter()
+            .all(|record| record.sha256 != conflicting_artifact.sha256),
+        "the conflicting artifact is never published: {:?}",
+        target.puts()
+    );
+
+    let ledger = ctx.ledger.lock().await;
+    assert!(
+        ledger
+            .incidents(IncidentFilter::open())
+            .expect("incidents")
+            .is_empty(),
+        "an ignored project opens no incident"
+    );
 }
 
 // Concurrency, pacing and dry runs --------------------------------------------

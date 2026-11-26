@@ -108,6 +108,7 @@ fn config_with(state_dir: &Path, api_base: &str) -> Config {
         state_dir: state_dir.to_path_buf(),
         incident: IncidentConfig {
             api_base: api_base.to_string(),
+            ..IncidentConfig::default()
         },
         ..Config::default()
     }

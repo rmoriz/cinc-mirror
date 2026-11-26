@@ -60,6 +60,12 @@ all_versions = true
 platforms = "*"
 arches = "*"
 
+# Arch collisions are upstream packaging aliases: two formats (for example
+# `.msi` and `.appx`) map to one descriptive tag. Keep them out of the ledger,
+# the alerts and the issue tracker for this project.
+[incident]
+ignore_arch_collisions = ["omnibus-toolchain"]
+
 [ledger]
 branch = "ledger"
 remote = "origin"
