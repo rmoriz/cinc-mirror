@@ -79,6 +79,57 @@ fn corrupt_blob(state: &Path, artifact: &Artifact, bytes: &[u8]) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn repair_can_take_one_project_only() {
+    let state = tempfile::tempdir().expect("state dir");
+    let mut ledger = Ledger::open(state.path()).expect("ledger");
+    let root = tempfile::tempdir().expect("rsync root");
+    let targets = TargetSet::from_targets(vec![Arc::new(rsync_target("rsync", root.path()))]);
+
+    let wanted_bytes = b"the project the operator asked for".to_vec();
+    let wanted = package_artifact(&wanted_bytes, "19.4.46");
+    let other_bytes = b"a project that is only noise today".to_vec();
+    let mut other = package_artifact(&other_bytes, "4.18.100");
+    other.project = "cinc-auditor".to_string();
+    assert_eq!(other.project, "cinc-auditor");
+
+    for (artifact, bytes) in [(&wanted, &wanted_bytes), (&other, &other_bytes)] {
+        publish(targets.all()[0].as_ref(), artifact, bytes).await;
+        local_blob(&mut ledger, state.path(), artifact, bytes);
+        seed_published(&mut ledger, artifact, "rsync", 1);
+        remove_remote(root.path(), artifact);
+    }
+
+    let transport = FakeTransport::serving(b"upstream must not be asked".to_vec());
+    let ctx = context(
+        state.path(),
+        ledger,
+        targets,
+        source_with(vec![transport.clone()]),
+    );
+
+    let report = repair::run(
+        &ctx,
+        RepairOpts {
+            projects: Some(vec![wanted.project.clone()]),
+            ..RepairOpts::default()
+        },
+    )
+    .await
+    .expect("repair");
+
+    assert_eq!(report.examined, 1, "{report}");
+    assert_eq!(report.repaired, 1, "{report}");
+    ctx.targets.all()[0]
+        .verify(&wanted)
+        .await
+        .expect("the named project is restored");
+    assert!(
+        ctx.targets.all()[0].verify(&other).await.is_err(),
+        "the other project is left alone"
+    );
+}
+
+#[tokio::test]
 async fn repair_repushes_from_store_without_download() {
     let state = tempfile::tempdir().expect("state dir");
     let mut ledger = Ledger::open(state.path()).expect("ledger");

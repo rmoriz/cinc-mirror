@@ -34,7 +34,9 @@
 //! `limit` caps the number of broken items repair examines (a publication or the
 //! local blob). The cap is checked before each artifact, so the artifact being
 //! worked on can take the count past it; a truncated run exits `2` because the
-//! mirror cannot claim the rest is clean.
+//! mirror cannot claim the rest is clean. `projects` narrows the walk to the
+//! named upstream projects, which matters because the ledger keeps rows of
+//! projects that left the configuration.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -67,6 +69,12 @@ pub const LOCAL_STORE: &str = "local-store";
 pub struct RepairOpts {
     /// Repair only these targets; `None` repairs every enabled target.
     pub targets: Option<Vec<String>>,
+    /// Repair only these projects; `None` repairs every project in the ledger.
+    ///
+    /// The ledger keeps rows of projects that left the configuration, so a
+    /// repair would otherwise walk and re-fetch those first and bury the
+    /// projects an operator cares about behind its `limit`.
+    pub projects: Option<Vec<String>>,
     /// Repair at most this many broken items (publications or local blobs).
     pub limit: Option<usize>,
 }
@@ -247,7 +255,15 @@ pub async fn run(ctx: &Ctx, opts: RepairOpts) -> Result<RepairReport, RepairErro
     let rows = {
         let ledger = ctx.ledger.lock().await;
         ledger.artifacts()?
-    };
+    }
+    .into_iter()
+    .filter(|row| {
+        opts.projects.as_ref().is_none_or(|projects| {
+            projects
+                .iter()
+                .any(|project| project == &row.artifact.project)
+        })
+    });
     let seq = Seq::new();
     let mut report = RepairReport::default();
 

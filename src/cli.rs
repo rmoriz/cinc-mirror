@@ -297,6 +297,11 @@ pub struct RepairArgs {
     #[arg(long = "target", value_name = "NAME")]
     pub targets: Vec<String>,
 
+    /// Repair only these projects; repeatable (default: every project in the
+    /// ledger)
+    #[arg(long = "project", value_name = "P")]
+    pub projects: Vec<String>,
+
     /// Repair at most this many broken publications
     #[arg(long = "limit", value_name = "N", value_parser = parse_positive)]
     pub limit: Option<usize>,
@@ -312,6 +317,7 @@ impl RepairArgs {
     pub fn to_opts(&self) -> RepairOpts {
         RepairOpts {
             targets: non_empty(&self.targets),
+            projects: non_empty(&self.projects),
             limit: self.limit,
         }
     }
@@ -603,17 +609,40 @@ mod tests {
     }
 
     #[test]
-    fn repair_parses_targets_and_limit() {
-        let cli =
-            Cli::try_parse_from(["cinc-mirror", "repair", "--target", "rsync", "--limit", "4"])
-                .expect("repair arguments");
+    fn repair_parses_targets_projects_and_limit() {
+        let cli = Cli::try_parse_from([
+            "cinc-mirror",
+            "repair",
+            "--target",
+            "rsync",
+            "--project",
+            "cinc",
+            "--project",
+            "omnibus-toolchain",
+            "--limit",
+            "4",
+        ])
+        .expect("repair arguments");
 
         let Command::Repair(args) = cli.cmd else {
             panic!("expected repair");
         };
         let opts = args.to_opts();
         assert_eq!(opts.targets, Some(vec!["rsync".to_string()]));
+        assert_eq!(
+            opts.projects,
+            Some(vec!["cinc".to_string(), "omnibus-toolchain".to_string()])
+        );
         assert_eq!(opts.limit, Some(4));
+    }
+
+    #[test]
+    fn repair_without_project_keeps_every_project() {
+        let cli = Cli::try_parse_from(["cinc-mirror", "repair"]).expect("repair arguments");
+        let Command::Repair(args) = cli.cmd else {
+            panic!("expected repair");
+        };
+        assert_eq!(args.to_opts().projects, None);
     }
 
     #[test]

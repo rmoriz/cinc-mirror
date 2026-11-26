@@ -178,7 +178,8 @@ Run `cinc-mirror <command> --help` for the full flag set. Global options are
   the local store): `cinc-mirror verify --sample 200` or
   `cinc-mirror verify --deep`
 - `repair` — re-publish or re-fetch artifacts that need repair:
-  `cinc-mirror repair --target rsync`
+  `cinc-mirror repair --target rsync`, optionally bounded with `--project`
+  (repeatable) and `--limit`
 - `incidents` — inspect and acknowledge integrity incidents:
   `cinc-mirror incidents list`, `cinc-mirror incidents show <id>`,
   `cinc-mirror incidents ack <id> [--republish]`
