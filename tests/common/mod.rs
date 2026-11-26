@@ -7,4 +7,5 @@
 #![allow(dead_code)]
 
 pub mod mirror;
+pub mod packages;
 pub mod registry;

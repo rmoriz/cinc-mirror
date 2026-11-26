@@ -16,6 +16,7 @@ pub mod incident;
 pub mod ledger;
 pub mod net;
 pub mod oci;
+pub mod packages_api;
 pub mod plan;
 pub mod repair;
 pub mod report;
@@ -47,6 +48,7 @@ pub use ledger::{
 };
 pub use net::RateLimiter;
 pub use oci::{AuthError, HttpFailure, OciAuth, OciConfig, OciError, Registry};
+pub use packages_api::{OwnerKind, PackagesClient, PruneError, RemoteVersion};
 pub use plan::{build, GroupTotals, Plan, PlanError, SpaceCheck};
 pub use repair::{RepairAction, RepairError, RepairOpts, RepairOutcome, RepairReport};
 pub use report::Summary;
