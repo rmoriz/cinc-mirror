@@ -46,7 +46,7 @@ use crate::crawl::{self, CrawlError};
 use crate::ctx::Ctx;
 use crate::incident::{self, IncidentError};
 use crate::ledger::{self, Event, EventKind, IncidentKind, LedgerError, PublicationStatus};
-use crate::targets::{Target, TargetError};
+use crate::targets::{digest_hex, Target, TargetError};
 
 /// Counts of one bootstrap run.
 ///
@@ -183,7 +183,7 @@ pub async fn run(ctx: &Ctx) -> Result<BootstrapReport, BootstrapError> {
                 continue;
             };
 
-            if existing == package_digest(artifact) {
+            if digest_hex(&existing) == artifact.sha256 {
                 import(ctx, artifact, name, &existing, &seq).await?;
                 report.imported += 1;
             } else {
@@ -352,9 +352,4 @@ fn ensure_artifact(
             .unwrap_or(serde_json::Value::Null),
     }));
     ledger.append(&event)
-}
-
-/// `sha256:<hex>` of the artifact's verified package digest.
-fn package_digest(artifact: &Artifact) -> String {
-    format!("sha256:{}", artifact.sha256)
 }
