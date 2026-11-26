@@ -94,12 +94,30 @@ pub fn wanted(artifacts: &[&Artifact]) -> Wanted {
 /// writes `<registry>/<namespace>/<project>:<tag>`, optionally with an
 /// `@<digest>` suffix, while a listing reports only the bare tag from
 /// `tags/list`. The registry and the listing agree on that bare tag and nothing
-/// else, so the plan can only match it. Strip the `@<digest>` suffix first, then
-/// everything up to and including the last `:`.
+/// else, so the plan can only match it.
+///
+/// The reduction happens in three steps. A `://` scheme is dropped first
+/// together with everything through it, so an `rsync://host/module:tag` reduces
+/// on its own colon and not on the one separating the scheme from the host. An
+/// `@<digest>` suffix is only stripped when what follows the last `@` starts
+/// with `sha256:`, because the rsync target writes `<user>@<host>:<path>` and a
+/// bare `@` there would otherwise leave just the SSH user. Only then is
+/// everything up to and including the last `:` dropped.
+///
+/// A reference without any remaining `:` is returned unchanged, and one whose
+/// colon belonged to a port is cut down to the part after it. Both cover shapes
+/// no listing matches: a tagless `ghcr.io/<namespace>/<project>` stays whole and
+/// a ported `host:5000/<repo>` becomes `5000/<repo>`. This is inert but
+/// harmless, since the artifact's own tags still protect it; the reduction never
+/// invents a tag that could falsely protect another one.
 fn bare_tag(remote_ref: &str) -> &str {
     let reference = remote_ref
-        .split_once('@')
-        .map_or(remote_ref, |(reference, _)| reference);
+        .split_once("://")
+        .map_or(remote_ref, |(_, rest)| rest);
+    let reference = match reference.rsplit_once('@') {
+        Some((reference, suffix)) if suffix.starts_with("sha256:") => reference,
+        _ => reference,
+    };
     reference.rsplit_once(':').map_or(reference, |(_, tag)| tag)
 }
 
@@ -498,6 +516,20 @@ mod tests {
             "19.4.46"
         );
         assert_eq!(bare_tag("19.4.46"), "19.4.46");
+        assert_eq!(
+            bare_tag("deploy@mirror.example:/srv/cinc/stable/cinc/19.4.46/x.tar.gz"),
+            "/srv/cinc/stable/cinc/19.4.46/x.tar.gz"
+        );
+        assert_eq!(bare_tag("rsync://host/module/path:19.4.46"), "19.4.46");
+        assert_eq!(
+            bare_tag("ghcr.io/rmoriz/cinc-mirror/cinc@sha256:abc"),
+            "ghcr.io/rmoriz/cinc-mirror/cinc"
+        );
+        assert_eq!(
+            bare_tag("ghcr.io/rmoriz/cinc-mirror/cinc"),
+            "ghcr.io/rmoriz/cinc-mirror/cinc"
+        );
+        assert_eq!(bare_tag("host:5000/repo"), "5000/repo");
     }
 
     #[test]
