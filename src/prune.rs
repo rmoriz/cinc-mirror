@@ -88,13 +88,30 @@ pub fn wanted(artifacts: &[&Artifact]) -> Wanted {
     wanted
 }
 
+/// Reduce a stored `remote_ref` to the bare tag a listing would show.
+///
+/// A publication keeps the reference in the target's own form: the OCI target
+/// writes `<registry>/<namespace>/<project>:<tag>`, optionally with an
+/// `@<digest>` suffix, while a listing reports only the bare tag from
+/// `tags/list`. The registry and the listing agree on that bare tag and nothing
+/// else, so the plan can only match it. Strip the `@<digest>` suffix first, then
+/// everything up to and including the last `:`.
+fn bare_tag(remote_ref: &str) -> &str {
+    let reference = remote_ref
+        .split_once('@')
+        .map_or(remote_ref, |(reference, _)| reference);
+    reference.rsplit_once(':').map_or(reference, |(_, tag)| tag)
+}
+
 /// Build the protection set from the ledger.
 ///
 /// A publication is protected when its artifact was replaced
 /// (`superseded_by`) or when an open incident names its key. Both the
-/// publication's reference and the artifact's two tags are kept; a reference of
-/// the form `<tag>@<digest>` protects the bare tag as well. A key the ledger no
-/// longer knows still protects the reference of an open incident.
+/// publication's reference and the artifact's two tags are kept. The reference
+/// is stored in the target's own form, so it is reduced to its bare tag before
+/// it is kept ([`bare_tag`]): that is all a listing shows and all the plan can
+/// match. A key the ledger no longer knows still protects the reference of an
+/// open incident.
 ///
 /// The `remote_digest` of every publication whose key is wanted also protects
 /// untagged copies of those bytes.
@@ -117,10 +134,7 @@ pub fn protect(
         let archived = artifact.is_some_and(|row| row.superseded_by.is_some());
         if archived || open.contains(publication.artifact_key.as_str()) {
             if let Some(remote_ref) = &publication.remote_ref {
-                protection.tags.insert(remote_ref.clone());
-                if let Some((reference, _)) = remote_ref.rsplit_once('@') {
-                    protection.tags.insert(reference.to_string());
-                }
+                protection.tags.insert(bare_tag(remote_ref).to_string());
             }
             if let Some(row) = artifact {
                 protection.tags.insert(row.artifact.tag());
@@ -371,25 +385,21 @@ mod tests {
     fn an_open_incident_protects_the_reference_and_both_tags() {
         let artifact = artifact("19.4.46", &sha('a'));
         let key = artifact.key();
+        let reference = format!("ghcr.io/rmoriz/cinc-mirror/cinc:{}", artifact.tag());
         let rows = vec![row(artifact.clone(), None)];
         let index = index(&rows);
         let incidents = vec![incident(Some(&key), IncidentState::Open)];
         let publications = vec![
-            publication(&key, Some(&artifact.tag()), Some(&digest('a'))),
-            publication(
-                &key,
-                Some(&format!("{}@{}", artifact.tag(), digest('a'))),
-                None,
-            ),
+            publication(&key, Some(&reference), Some(&digest('a'))),
+            publication(&key, Some(&format!("{reference}@{}", digest('a'))), None),
         ];
 
         let protection = protect(&BTreeSet::new(), &index, &incidents, &publications);
 
-        assert!(protection.tags.contains(&artifact.tag()));
-        assert!(protection.tags.contains(&artifact.superseded_tag()));
-        assert!(protection
-            .tags
-            .contains(&format!("{}@{}", artifact.tag(), digest('a'))));
+        assert_eq!(
+            protection.tags,
+            BTreeSet::from([artifact.tag(), artifact.superseded_tag()])
+        );
         assert!(protection.digests.is_empty());
     }
 
@@ -413,22 +423,29 @@ mod tests {
         let old = artifact("19.4.46", &sha('a'));
         let replacement = artifact("19.4.47", &sha('b'));
         let old_key = old.key();
+        let reference = format!("ghcr.io/rmoriz/cinc-mirror/cinc:{}", old.tag());
         let rows = vec![row(old.clone(), Some(replacement.key()))];
         let index = index(&rows);
         let incidents = vec![incident(Some(&old_key), IncidentState::Acked)];
-        let publications = vec![publication(&old_key, Some(&old.tag()), Some(&digest('a')))];
+        let publications = vec![publication(&old_key, Some(&reference), Some(&digest('a')))];
 
         let protection = protect(&BTreeSet::new(), &index, &incidents, &publications);
 
-        assert!(protection.tags.contains(&old.tag()));
-        assert!(protection.tags.contains(&old.superseded_tag()));
+        assert_eq!(
+            protection.tags,
+            BTreeSet::from([old.tag(), old.superseded_tag()])
+        );
     }
 
     #[test]
     fn an_unknown_key_still_protects_its_reference() {
         let key = "stable/cinc/19.4.46/debian/13/amd64/unknown";
         let incidents = vec![incident(Some(key), IncidentState::Open)];
-        let publications = vec![publication(key, Some("19.4.46-debian-13-amd64"), None)];
+        let publications = vec![publication(
+            key,
+            Some("ghcr.io/rmoriz/cinc-mirror/cinc:19.4.46-debian-13-amd64"),
+            None,
+        )];
 
         let protection = protect(
             &BTreeSet::new(),
@@ -441,6 +458,46 @@ mod tests {
             protection.tags,
             BTreeSet::from(["19.4.46-debian-13-amd64".to_string()])
         );
+    }
+
+    #[test]
+    fn an_unknown_key_with_a_digest_qualified_reference_still_protects_the_bare_tag() {
+        let key = "stable/cinc/19.4.46/debian/13/amd64/unknown";
+        let incidents = vec![incident(Some(key), IncidentState::Open)];
+        let publications = vec![publication(
+            key,
+            Some(&format!(
+                "ghcr.io/rmoriz/cinc-mirror/cinc:19.4.46-debian-13-amd64@{}",
+                digest('a')
+            )),
+            None,
+        )];
+
+        let protection = protect(
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &incidents,
+            &publications,
+        );
+
+        assert_eq!(
+            protection.tags,
+            BTreeSet::from(["19.4.46-debian-13-amd64".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_reference_reduces_to_its_bare_tag() {
+        assert_eq!(
+            bare_tag("ghcr.io/rmoriz/cinc-mirror/cinc:19.4.46"),
+            "19.4.46"
+        );
+        assert_eq!(bare_tag("host:5000/repo:tag"), "tag");
+        assert_eq!(
+            bare_tag("ghcr.io/rmoriz/cinc-mirror/cinc:19.4.46@sha256:abc"),
+            "19.4.46"
+        );
+        assert_eq!(bare_tag("19.4.46"), "19.4.46");
     }
 
     #[test]
