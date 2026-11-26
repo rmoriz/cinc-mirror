@@ -18,20 +18,28 @@ This project is neither affiliated nor approved by Progress Chef and/or the Cinc
 
 ## Usage/Installation
 
-To install the mirrored Cinc packages, run the following command:
+To install the mirrored Cinc packages, run one of the following commands.
+
+POSIX (Linux, macOS):
 
 ```bash
 curl -sSL https://cinc-mirror.github.io/install.sh | bash
 ```
 
-The actual script is at https://github.com/cinc-mirror/cinc-mirror.github.io and should replace https://omnitruck.cinc.sh/install.sh - metadata is still retreived from cinc.sh, only packages are retrieved from ghcr.
+Windows PowerShell:
+
+```powershell
+iex (irm 'https://cinc-mirror.github.io/install.ps1'); Install-Project -project cinc -channel stable
+```
+
+The actual scripts are at https://github.com/cinc-mirror/cinc-mirror.github.io and should replace https://omnitruck.cinc.sh/install.sh and https://omnitruck.cinc.sh/install.ps1 - metadata is still retrieved from cinc.sh, only packages are retrieved from ghcr.
 
 **Requirements:**
-- curl must be installed
+- `curl` must be installed for the POSIX installer
 - Only supports Cinc 18+
-- The installer is POSIX-only; Windows has no installer here. The mirrored
-  `.msi` packages can be downloaded and installed directly (see
-  [Windows](#windows)).
+- The PowerShell installer needs an elevated shell because it installs the
+  `.msi` via `msiexec`. The mirrored `.msi` packages can also be downloaded and
+  installed directly (see [Windows](#windows)).
 
 ## Build from source
 
@@ -219,9 +227,19 @@ mid-publication.
 
 ## Windows
 
-Windows packages (`.msi`) are mirrored like every other platform. This
-repository does not provide a Windows installer; the POSIX installer remains
-POSIX-only. Use the mirrored `.msi` directly.
+Windows packages (`.msi`) are mirrored like every other platform. The PowerShell
+installer at https://cinc-mirror.github.io/install.ps1 resolves metadata from
+omnitruck.cinc.sh, fetches the package blob from GHCR first and falls back to the
+upstream download URL when the mirror cannot serve it. It verifies the SHA-256
+checksum before running `msiexec`:
+
+```powershell
+iex (irm 'https://cinc-mirror.github.io/install.ps1'); Install-Project -project cinc -channel stable
+```
+
+`Get-ProjectMetadata` returns the download URL and SHA-256 checksum the installer
+would use, without installing anything. The mirrored `.msi` packages can also be
+downloaded and installed directly.
 
 ## Why?
 
