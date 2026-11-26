@@ -291,15 +291,15 @@ Tag: `<version>-<platform>-<platform_version>-<mapped_arch>`, plus
 `-r<iteration>` when `iteration` is not `1` (upstream publishes e.g.
 `cinc-19.4.46-2-x64.msi` beside `-1` for the same version). Lowercased,
 `+`/`:` → `_`, capped at 128 characters. A superseded artifact is published as
-`<tag>-<shortsha>` (12 characters) and, for rsync,
-`<basename>.superseded-<shortsha>`. Existing iteration-1 tags keep their
-current names, so bootstrap matches them.
+`<tag>-superseded` and, for rsync, `<basename>.superseded-<shortsha>`. Existing
+iteration-1 tags keep their current names, so bootstrap matches them.
 
 Arch mapping keeps the existing public namespace: `x86_64`→`amd64`,
 `aarch64`→`arm64`, `armv7l`/`armv7hl`→`armv7`, `ppc64le`→`ppc64le`,
 `s390x`→`s390x`, `i386`/`i686`→`386`; anything else is sanitised and passed
 through. If two raw values would map to the same tag with different digests,
-that is an incident.
+the first file keeps the tag, the latecomer is published under
+`<tag>-<shortsha>`, and the pair is reported as an incident.
 
 ### Bootstrap
 

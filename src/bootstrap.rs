@@ -5,9 +5,8 @@
 //! registry:
 //!
 //! 1. every selected policy is crawled into the same artifact list the runner
-//!    would build (a tag collision's conflicting artifact is skipped, not
-//!    imported);
-//! 2. for every enabled OCI target the artifact's canonical tag is resolved
+//!    would build (a tag collision's latecomer keeps its digest-qualified tag);
+//! 2. for every enabled OCI target the artifact's reference is resolved
 //!    through [`Target::exists`];
 //! 3. a tag that already holds the artifact's package digest is recorded as an
 //!    `imported` event, which materialises the publication as `published` and
@@ -222,9 +221,9 @@ pub async fn run(ctx: &Ctx) -> Result<BootstrapReport, BootstrapError> {
 
 /// Crawl every selected policy into one artifact list.
 ///
-/// A tag collision's conflicting artifact never reaches this list: the crawl
-/// keeps the first artifact and reports the pair, and bootstrap skips the
-/// excluded one rather than importing a second digest under one tag.
+/// A tag collision's latecomer keeps its digest-qualified tag, so its own
+/// reference is normally missing from the registry and is counted as skipped;
+/// `mirror` creates it later.
 async fn crawl_all(ctx: &Ctx) -> Result<Vec<Artifact>, CrawlError> {
     let mut artifacts = Vec::new();
     let mut keys = HashSet::new();

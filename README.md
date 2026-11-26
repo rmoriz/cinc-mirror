@@ -148,7 +148,10 @@ Variables already present in the environment are not overridden.
 `auths` entry from `GITHUB_TOKEN`.
 
 `mirror.ci.toml` is the committed configuration the scheduled workflow uses; it
-mirrors all six upstream projects at every version.
+mirrors all six upstream projects at every version. `omnibus-toolchain` is the
+build toolchain rather than a Cinc product, and its Windows formats collide
+under one descriptive tag, so it is listed under
+`[incident] ignore_arch_collisions` (see below).
 
 When adding a new project, the GHCR package is private by default. Make it
 public once under **Package settings → Change package visibility**, e.g.
@@ -217,10 +220,17 @@ acknowledges the incident with `cinc-mirror incidents ack <id>`. Adding
 then publishes the replacement under the canonical name.
 
 Arch collisions — two upstream files that map to one descriptive tag, such as a
-`.msi` and an `.appx` — are incidents as well. A project can opt out with
-`[incident] ignore_arch_collisions = ["omnibus-toolchain"]`; the first artifact
-is still kept and the other is skipped, without a ledger incident, alert or
-GitHub issue.
+`.msi` and an `.appx`, or the same package rebuilt under a compatibility
+directory — are incidents, but they no longer cost a file. The first artifact
+keeps the plain tag; every latecomer is published under the same tag plus its
+digest, so both files reach the registry and the reference stays unique. On an
+rsync target the upstream file name is the address, so only files with distinct
+names coexist there; a latecomer with the same name overwrites the path (the
+digest-qualified tag has no rsync equivalent). A project can mute the reports with
+`[incident] ignore_arch_collisions = ["omnibus-toolchain"]`; the ledger
+incident, alert and GitHub issue then stay away while the mirroring behaviour is
+unchanged. `mirror.ci.toml` uses the list for `omnibus-toolchain`, whose Windows
+formats collide on every crawl.
 
 ## CI and scheduled backfill
 

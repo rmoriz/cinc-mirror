@@ -21,8 +21,9 @@
 //! The result is deterministic: versions descending, then platform,
 //! platform_version, architecture and basename ascending. Two different digests
 //! under one descriptive tag are an upstream anomaly, not a failed run: the
-//! crawl keeps the first artifact, reports the pair as a [`TagCollision`] and
-//! leaves the decision to the incident flow.
+//! first artifact keeps the tag, the next one is published under the tag plus
+//! its digest, and the pair is reported as a [`TagCollision`] for the incident
+//! flow.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -39,11 +40,10 @@ const METADATA_SUFFIX: &str = ".metadata.json";
 /// What one crawl produced.
 #[derive(Debug, Clone, Default)]
 pub struct CrawlOutcome {
-    /// Artifacts that may be published, in deterministic order, collisions
-    /// excluded.
+    /// Artifacts that may be published, in deterministic order.
     pub artifacts: Vec<Artifact>,
-    /// Tag collisions found on the way; the conflicting artifact of each is
-    /// not in `artifacts`.
+    /// Tag collisions found on the way. The conflicting artifact is still in
+    /// `artifacts`, published under a digest-qualified tag.
     pub collisions: Vec<TagCollision>,
     /// Metadata documents skipped because their platform or version
     /// contradicts the upstream directory. They cannot be represented
@@ -51,29 +51,33 @@ pub struct CrawlOutcome {
     pub skipped: usize,
 }
 
-/// Two artifacts map to one descriptive tag but do not carry the same bytes.
+/// Two upstream files claim one descriptive tag but do not carry the same
+/// bytes.
 ///
-/// Upstream publishes two raw architectures that map to one public one (or the
-/// same version on two channels); the first artifact is kept and published,
-/// the conflicting one is excluded so the descriptive tag never holds two
-/// digests.
+/// Upstream publishes the same package under several compatibility directories
+/// (`windows/10`, `/11`, `/2016`, ...) and occasionally rebuilds a file in
+/// place; the copies share a descriptive tag even though their bytes differ.
+/// The first artifact keeps the plain tag and the latecomer is qualified with
+/// its digest, so both files are mirrored instead of one being dropped. The
+/// pair is reported so a human sees that upstream splits one reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagCollision {
     /// Upstream path of the conflicting artifact.
     pub upstream_path: String,
     /// The descriptive tag both artifacts map to.
     pub tag: String,
-    /// The artifact the crawl keeps.
+    /// The artifact that keeps the descriptive tag.
     pub first: Artifact,
-    /// The artifact the crawl excludes.
+    /// The artifact published under the digest-qualified tag.
     pub conflicting: Artifact,
 }
 
 /// Crawl every artifact selected by `policy`.
 ///
 /// A tag collision does not fail the crawl: the first artifact (in the
-/// deterministic directory order) is kept, the conflicting one is reported in
-/// [`CrawlOutcome::collisions`] and excluded from [`CrawlOutcome::artifacts`].
+/// deterministic directory order) keeps the descriptive tag, the conflicting
+/// one is published under a digest-qualified tag, and the pair is reported in
+/// [`CrawlOutcome::collisions`].
 ///
 /// # Errors
 ///
@@ -133,10 +137,11 @@ pub async fn crawl(source: &Source, policy: &ResolvedPolicy) -> Result<CrawlOutc
                     if !policy.allows_arch(&artifact.arch) || !keys.insert(artifact.key()) {
                         continue;
                     }
-                    match record_tag(&mut tags, &artifact) {
-                        Some(collision) => outcome.collisions.push(collision),
-                        None => outcome.artifacts.push(artifact),
+                    let mut artifact = artifact;
+                    if let Some(collision) = record_tag(&mut tags, &mut artifact) {
+                        outcome.collisions.push(collision);
                     }
+                    outcome.artifacts.push(artifact);
                 }
             }
         }
@@ -147,12 +152,12 @@ pub async fn crawl(source: &Source, policy: &ResolvedPolicy) -> Result<CrawlOutc
 
 /// Detect tag collisions in a merged candidate list.
 ///
-/// The first artifact in iteration order is kept; every artifact that maps to a
-/// tag already held by different bytes is reported as the conflicting one. The
-/// caller must exclude each `conflicting` artifact from the candidates it
-/// publishes.
+/// Runs over artifacts that were already merged from several policies. Every
+/// artifact that maps to a tag already held by different bytes is reported as
+/// the conflicting one and gets its digest appended to the tag. Callers keep
+/// both artifacts in the queue.
 pub fn collect_tag_collisions<'a>(
-    artifacts: impl IntoIterator<Item = &'a Artifact>,
+    artifacts: impl IntoIterator<Item = &'a mut Artifact>,
 ) -> Vec<TagCollision> {
     let mut tags = BTreeMap::new();
     let mut collisions = Vec::new();
@@ -178,16 +183,23 @@ pub fn dedup_collisions(mut collisions: Vec<TagCollision>) -> Vec<TagCollision> 
 /// Record `artifact`'s claim on its descriptive tag.
 ///
 /// The first artifact to claim a tag owns it; a later artifact with different
-/// bytes under the same tag is reported as a collision and never inserted.
-fn record_tag(tags: &mut BTreeMap<String, Artifact>, artifact: &Artifact) -> Option<TagCollision> {
+/// bytes under the same tag is qualified with its digest, so it still publishes
+/// under a reference of its own, and reported as a collision.
+fn record_tag(
+    tags: &mut BTreeMap<String, Artifact>,
+    artifact: &mut Artifact,
+) -> Option<TagCollision> {
     let tag = artifact.tag();
     match tags.get(&tag) {
-        Some(first) if first.sha256 != artifact.sha256 => Some(TagCollision {
-            upstream_path: artifact.rsync_relpath(),
-            tag,
-            first: first.clone(),
-            conflicting: artifact.clone(),
-        }),
+        Some(first) if first.sha256 != artifact.sha256 => {
+            artifact.qualify_tag_with_digest();
+            Some(TagCollision {
+                upstream_path: artifact.rsync_relpath(),
+                tag,
+                first: first.clone(),
+                conflicting: artifact.clone(),
+            })
+        }
         Some(_) => None,
         None => {
             tags.insert(tag, artifact.clone());

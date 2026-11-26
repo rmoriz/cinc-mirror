@@ -97,12 +97,16 @@ const DB_FILE: &str = "ledger.db";
 /// Append new files here instead of editing a released migration. The schema
 /// itself uses `IF NOT EXISTS`, so a migration that is interrupted between
 /// `execute_batch` and the version insert is safe to run again.
-const MIGRATIONS: &[&str] = &[include_str!("schema.sql"), include_str!("schema_v2.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("schema.sql"),
+    include_str!("schema_v2.sql"),
+    include_str!("schema_v3.sql"),
+];
 
 const ARTIFACT_COLUMNS: &str = "a.key, a.upstream_path, a.sha256, a.size, a.basename, \
      a.project, a.channel, a.version, a.iteration, a.platform, a.platform_version, \
      a.arch, a.metadata_json, a.first_seen, a.last_seen, a.superseded_by, \
-     a.supersedes, a.local, a.raw_arch";
+     a.supersedes, a.local, a.raw_arch, a.tag_override";
 
 const PUBLICATION_COLUMNS: &str = "artifact_key, target, status, remote_ref, remote_digest, \
      attempts, next_attempt_at, last_error, updated_at";
@@ -1641,9 +1645,9 @@ fn upsert_artifact(
         "INSERT INTO artifacts
              (key, upstream_path, sha256, size, basename, project, channel,
               version, iteration, platform, platform_version, arch, metadata_json,
-              first_seen, last_seen, supersedes, local, raw_arch)
+              first_seen, last_seen, supersedes, local, raw_arch, tag_override)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?14, ?15, 0, ?16)
+                 ?14, ?14, ?15, 0, ?16, ?17)
          ON CONFLICT (key) DO UPDATE SET
              upstream_path = excluded.upstream_path,
              sha256 = excluded.sha256,
@@ -1657,6 +1661,7 @@ fn upsert_artifact(
              platform_version = excluded.platform_version,
              arch = excluded.arch,
              raw_arch = excluded.raw_arch,
+             tag_override = COALESCE(excluded.tag_override, artifacts.tag_override),
              metadata_json = CASE
                  WHEN excluded.metadata_json <> 'null' THEN excluded.metadata_json
                  ELSE artifacts.metadata_json
@@ -1680,6 +1685,7 @@ fn upsert_artifact(
             timestamp,
             supersedes,
             artifact.raw_arch,
+            artifact.tag_override,
         ],
     )?;
     Ok(artifact)
@@ -1757,6 +1763,7 @@ pub fn artifact_detail(artifact: &Artifact) -> Value {
         "sha256": artifact.sha256,
         "metadata_json": artifact.metadata_json,
         "iteration": artifact.iteration,
+        "tag_override": artifact.tag_override,
     })
 }
 
@@ -1890,6 +1897,10 @@ struct ArtifactDetail {
     metadata_json: Option<String>,
     #[serde(default)]
     metadata: Value,
+    /// Digest-qualified tag when the artifact lost its descriptive tag to
+    /// another upstream file.
+    #[serde(default)]
+    tag_override: Option<String>,
 }
 
 impl ArtifactDetail {
@@ -1913,6 +1924,7 @@ impl ArtifactDetail {
                 .unwrap_or_else(|| self.metadata.to_string()),
             iteration: self.iteration,
             superseded: false,
+            tag_override: self.tag_override.clone(),
         }
     }
 }
@@ -1954,6 +1966,7 @@ fn artifact_row_from_row(row: &Row<'_>) -> rusqlite::Result<ArtifactRow> {
             metadata_json,
             iteration,
             superseded: false,
+            tag_override: row.get(19)?,
         },
         upstream_path: row.get(1)?,
         size: size.map(|value| u64::try_from(value).unwrap_or(0)),

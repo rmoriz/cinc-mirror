@@ -586,7 +586,7 @@ async fn missing_tag_is_not_an_error() {
 }
 
 #[tokio::test]
-async fn a_crawl_collision_skips_the_conflicting_artifact() {
+async fn a_crawl_collision_leaves_the_latecomer_for_the_next_mirror_run() {
     let _env = ENV_LOCK.lock().await;
     let _github = GithubEnvGuard::clear();
 
@@ -667,15 +667,15 @@ async fn a_crawl_collision_skips_the_conflicting_artifact() {
         report,
         BootstrapReport {
             imported: 1,
-            skipped: 0,
+            skipped: 1,
             conflicts: 0,
         },
-        "the kept artifact is imported and the conflicting one is never resolved"
+        "the kept artifact is imported; the latecomer's own tag does not exist yet"
     );
 
     let ledger = ctx.ledger.lock().await;
     let rows = ledger.artifacts().expect("artifacts");
-    assert_eq!(rows.len(), 1, "only the kept artifact is recorded");
+    assert_eq!(rows.len(), 1, "an unresolvable artifact gets no row");
     assert_eq!(rows[0].artifact.key(), first.key());
     assert!(ledger
         .publications_for(&conflicting.key())

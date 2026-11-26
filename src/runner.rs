@@ -755,9 +755,10 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
 
     let mut queue = Vec::new();
     let mut satisfied = 0;
-    // A collision's conflicting artifact is excluded from the queue before
-    // classification; it is still a deliberate skip the summary must show.
-    let mut skipped = collisions.len();
+    // Collisions are not skips: the conflicting artifact stays in the queue
+    // under its digest-qualified tag. Only genuinely unrepresentable documents
+    // and dry-run hash changes count as skipped.
+    let mut skipped = 0;
     let mut satisfied_gc = Vec::new();
 
     for (policy_index, artifact) in candidates.into_values() {
@@ -988,10 +989,12 @@ async fn crawl_scope(
         }
         collisions.extend(outcome.collisions);
     }
+    // The per-policy crawl already qualified collisions it saw, but two
+    // policies can still hand in artifacts that share a tag; qualify those too
+    // and keep every artifact in the queue.
     for collision in
-        crawl::collect_tag_collisions(candidates.values().map(|(_, artifact)| artifact))
+        crawl::collect_tag_collisions(candidates.values_mut().map(|(_, artifact)| artifact))
     {
-        candidates.remove(&collision.conflicting.key());
         collisions.push(collision);
     }
     Ok((candidates, crawl::dedup_collisions(collisions)))
@@ -1007,49 +1010,28 @@ async fn open_incident_count(ctx: &Ctx) -> Result<usize, RunError> {
 
 /// Open the deduplicated arch-collision incident for one crawl collision.
 ///
-/// The incident names the excluded artifact with the kept artifact's digest as
-/// the old value, so a human sees exactly which pair of upstream files maps to
-/// one public reference. The excluded artifact is recorded as seen first — the
-/// incident must name a row the ledger knows. Returns whether the incident was
-/// newly opened; a later run's detection is deduplicated and only reported. A
-/// project listed in `incident.ignore_arch_collisions` returns `false` without
-/// recording anything.
+/// The incident names the conflicting artifact with the kept artifact's digest
+/// as the old value, so a human sees exactly which pair of upstream files maps
+/// to one public reference. The conflicting artifact is recorded as seen — the
+/// incident must name a row the ledger knows — and is also published, under its
+/// digest-qualified tag. Returns whether the incident was newly opened; a later
+/// run's detection is deduplicated and only reported. A project listed in
+/// `incident.ignore_arch_collisions` returns `false` without opening anything;
+/// its artifact row is still refreshed.
 async fn open_collision_incident(
     ctx: &Ctx,
     seq: &Seq,
     collision: &TagCollision,
 ) -> Result<bool, RunError> {
-    if ctx
-        .config
-        .incident
-        .ignores_arch_collision(&collision.conflicting.project)
-    {
-        tracing::info!(
-            tag = %collision.tag,
-            conflicting = %collision.conflicting.key(),
-            kept = %collision.first.key(),
-            "arch collision ignored by configuration; keeping the first artifact"
-        );
-        return Ok(false);
-    }
-
     let mut ledger = ctx.ledger.lock().await;
-    let id = ledger::incident_id(
-        IncidentKind::ArchCollision,
-        Some(&collision.conflicting.key()),
-        Some(&collision.first.sha256),
-        Some(&collision.conflicting.sha256),
-    );
-    if ledger.incident(&id)?.is_some() {
-        tracing::warn!(
-            tag = %collision.tag,
-            conflicting = %collision.conflicting.key(),
-            "tag collision already has an open incident; keeping the first artifact"
-        );
-        return Ok(false);
-    }
 
-    if ledger.artifact(&collision.conflicting.key())?.is_none() {
+    // The row must carry the digest-qualified tag, otherwise `verify` and
+    // `repair` would address the other file's reference later. A row first
+    // seen by an older run has no override yet, so refresh it.
+    let stale = ledger
+        .artifact(&collision.conflicting.key())?
+        .is_none_or(|row| row.artifact.tag_override != collision.conflicting.tag_override);
+    if stale {
         let event = Event::new(
             ctx.run_id.clone(),
             seq.next(),
@@ -1065,6 +1047,36 @@ async fn open_collision_incident(
         }));
         ledger.append(&event)?;
     }
+
+    if ctx
+        .config
+        .incident
+        .ignores_arch_collision(&collision.conflicting.project)
+    {
+        tracing::info!(
+            tag = %collision.tag,
+            conflicting = %collision.conflicting.key(),
+            kept = %collision.first.key(),
+            "arch collision ignored by configuration; keeping the first artifact"
+        );
+        return Ok(false);
+    }
+
+    let id = ledger::incident_id(
+        IncidentKind::ArchCollision,
+        Some(&collision.conflicting.key()),
+        Some(&collision.first.sha256),
+        Some(&collision.conflicting.sha256),
+    );
+    if ledger.incident(&id)?.is_some() {
+        tracing::warn!(
+            tag = %collision.tag,
+            conflicting = %collision.conflicting.key(),
+            "tag collision already has an open incident; keeping the first artifact"
+        );
+        return Ok(false);
+    }
+
     incident::open(
         &mut ledger,
         ctx.config.as_ref(),

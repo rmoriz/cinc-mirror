@@ -136,6 +136,7 @@ fn artifact(version: &str, sha_byte: char) -> Artifact {
         ),
         iteration: None,
         superseded: false,
+        tag_override: None,
     }
 }
 
@@ -152,6 +153,7 @@ fn artifact_detail(artifact: &Artifact) -> Value {
         "sha256": artifact.sha256,
         "metadata_json": artifact.metadata_json,
         "iteration": artifact.iteration,
+        "tag_override": artifact.tag_override,
     })
 }
 

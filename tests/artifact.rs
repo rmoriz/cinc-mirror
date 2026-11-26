@@ -137,12 +137,30 @@ fn iteration_two_gets_suffix() {
 }
 
 #[test]
-fn superseded_tag_appends_sha12() {
+fn superseded_tag_appends_the_marker() {
     let artifact = debian_artifact(SHA, Some("1"));
     assert_eq!(
         artifact.superseded_tag(),
-        format!("19.4.46-debian-13-amd64-{SHA12}")
+        "19.4.46-debian-13-amd64-superseded"
     );
+}
+
+#[test]
+fn a_digest_qualified_tag_keeps_the_prefix_and_ends_with_the_digest() {
+    let mut artifact = debian_artifact(SHA, Some("1"));
+    artifact.qualify_tag_with_digest();
+
+    assert_eq!(
+        artifact.tag(),
+        format!("19.4.46-debian-13-amd64-{SHA12}"),
+        "the readable prefix stays and the digest follows it"
+    );
+    assert_eq!(
+        artifact.superseded_tag(),
+        format!("19.4.46-debian-13-amd64-{SHA12}-superseded")
+    );
+    // The identity does not change with the publication reference.
+    assert_eq!(artifact.key(), debian_artifact(SHA, Some("1")).key());
 }
 
 #[test]

@@ -60,9 +60,12 @@ all_versions = true
 platforms = "*"
 arches = "*"
 
-# Arch collisions are upstream packaging aliases: two formats (for example
-# `.msi` and `.appx`) map to one descriptive tag. Keep them out of the ledger,
-# the alerts and the issue tracker for this project.
+# `omnibus-toolchain` is the build toolchain rather than a Cinc product. Its
+# Windows formats (`.msi`/`.appx`) and in-place rebuilds share descriptive tags,
+# so every crawl reports collisions. They are mirrored under digest-qualified
+# tags either way; the incident opt-out below keeps the pair reports out of the
+# ledger, the alerts and the issues.
+
 [incident]
 ignore_arch_collisions = ["omnibus-toolchain"]
 

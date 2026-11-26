@@ -5,7 +5,8 @@
 //! than recomputed by the ledger, the OCI target and the rsync target:
 //!
 //! - key: `<channel>/<project>/<version>/<platform>/<platform_version>/<arch>/<sha256>`
-//! - tag: `<version>-<platform>-<platform_version>-<arch>[-r<iteration>]`
+//! - tag: `<version>-<platform>-<platform_version>-<arch>[-r<iteration>]`,
+//!   digest-qualified when another upstream file already claims it
 //! - rsync path: `<channel>/<project>/<version>/<platform>/<platform_version>/<basename>`
 //!
 //! The module performs no I/O. Moving a superseded artifact, uploading a tag or
@@ -109,6 +110,13 @@ pub struct Artifact {
     /// It is a publication choice, not part of the artifact identity:
     /// [`Artifact::key`] and [`Artifact::tag`] ignore it.
     pub superseded: bool,
+    /// Publish under this tag instead of the descriptive one.
+    ///
+    /// The crawl sets it when a second upstream file claims a descriptive tag
+    /// with different bytes: the latecomer is qualified with its digest so both
+    /// files can be published. Like [`Artifact::superseded`] it is a
+    /// publication choice, not part of the identity.
+    pub tag_override: Option<String>,
 }
 
 impl Artifact {
@@ -154,6 +162,7 @@ impl Artifact {
             metadata_json: input.metadata_json,
             iteration: normalize_iteration(input.iteration.as_deref()),
             superseded: false,
+            tag_override: None,
         })
     }
 
@@ -162,6 +171,17 @@ impl Artifact {
     pub fn with_superseded(mut self, superseded: bool) -> Self {
         self.superseded = superseded;
         self
+    }
+
+    /// Qualify this artifact's tag with its digest.
+    ///
+    /// Used when another upstream file already owns the descriptive tag. The
+    /// artifact keeps its readable prefix and becomes addressable under a
+    /// reference that no other file can claim.
+    pub fn qualify_tag_with_digest(&mut self) {
+        if self.tag_override.is_none() {
+            self.tag_override = Some(format!("{}-{}", self.tag(), self.short_sha()));
+        }
     }
 
     /// The canonical artifact key.
@@ -185,9 +205,14 @@ impl Artifact {
     /// The descriptive tag, capped at [`MAX_TAG_LEN`] bytes.
     ///
     /// Iteration `1` keeps the historical name; any other parsed iteration adds
-    /// `-r<iteration>`.
+    /// `-r<iteration>`. An artifact whose descriptive tag is already taken by
+    /// different bytes publishes under a digest-qualified tag instead (see
+    /// [`Artifact::tag_override`]).
     #[must_use]
     pub fn tag(&self) -> String {
+        if let Some(tag_override) = &self.tag_override {
+            return cap_tag(tag_override.clone(), self.short_sha());
+        }
         let mut tag = sanitize_component(&format!(
             "{}-{}-{}-{}",
             self.version, self.platform, self.platform_version, self.arch
@@ -200,12 +225,11 @@ impl Artifact {
 
     /// The tag used to publish a superseded artifact.
     ///
-    /// Equal to [`Artifact::tag`] plus `-<sha12>` and capped like the tag
+    /// Equal to [`Artifact::tag`] plus `-superseded` and capped like the tag
     /// itself.
     #[must_use]
     pub fn superseded_tag(&self) -> String {
-        let short = self.short_sha();
-        cap_tag(format!("{}-{short}", self.tag()), short)
+        cap_tag(format!("{}-superseded", self.tag()), self.short_sha())
     }
 
     /// The artifact's path below an rsync target root, shaped like upstream.
@@ -241,8 +265,8 @@ impl Artifact {
     /// Check that `other` may share this artifact's descriptive tag.
     ///
     /// Two artifacts with the same tag must have identical bytes. A different
-    /// digest under the same tag is the arch or iteration collision that later
-    /// becomes an incident.
+    /// digest under the same tag is a collision: the crawl qualifies the
+    /// latecomer with its digest and reports the pair as an incident.
     ///
     /// # Errors
     ///

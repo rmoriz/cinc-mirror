@@ -39,6 +39,7 @@ fn artifact(version: &str, sha_byte: char) -> Artifact {
         ),
         iteration: None,
         superseded: false,
+        tag_override: None,
     }
 }
 
@@ -55,6 +56,7 @@ fn detail_json(artifact: &Artifact) -> Value {
         "sha256": artifact.sha256,
         "metadata_json": artifact.metadata_json,
         "iteration": artifact.iteration,
+        "tag_override": artifact.tag_override,
     })
 }
 
@@ -772,12 +774,79 @@ fn run_row_stores_effective_policy_json() {
 }
 
 #[test]
+fn tag_override_survives_a_ledger_round_trip() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let mut ledger = Ledger::open(dir.path()).expect("ledger");
+    let mut artifact = artifact("19.4.46", 'a');
+    artifact.qualify_tag_with_digest();
+    let expected_tag = artifact.tag();
+
+    ledger
+        .append(&seen("run-1", 1, &artifact, 10))
+        .expect("artifact_seen");
+
+    let row = ledger
+        .artifact(&artifact.key())
+        .expect("artifact query")
+        .expect("row");
+    assert_eq!(
+        row.artifact.tag(),
+        expected_tag,
+        "the digest-qualified reference must not fall back to the descriptive tag"
+    );
+}
+
+#[test]
+fn schema_v3_upgrades_a_version_2_ledger_in_place() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let db = dir.path().join("ledger.db");
+    {
+        let conn = rusqlite::Connection::open(&db).expect("raw connection");
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER PRIMARY KEY);")
+            .expect("version table");
+        conn.execute_batch(include_str!("../src/ledger/schema.sql"))
+            .expect("schema 1");
+        conn.execute_batch(include_str!("../src/ledger/schema_v2.sql"))
+            .expect("schema 2");
+        conn.execute_batch("INSERT INTO schema_version (version) VALUES (1), (2);")
+            .expect("version rows");
+        conn.execute_batch(
+            "INSERT INTO events (run_id, seq, ts, kind, artifact_key, target, detail_json)
+             VALUES ('run-1', 1, '2026-11-25T12:00:00Z', 'artifact_seen', NULL, NULL, '{}');",
+        )
+        .expect("existing event");
+    }
+
+    let mut ledger = Ledger::open(dir.path()).expect("upgrade");
+
+    assert_eq!(ledger.schema_version().expect("schema version"), 3);
+    assert_eq!(
+        ledger.event_count().expect("event count"),
+        1,
+        "the upgrade keeps earlier events"
+    );
+
+    // The added column is usable right away.
+    let mut artifact = artifact("19.4.46", 'a');
+    artifact.qualify_tag_with_digest();
+    let expected_tag = artifact.tag();
+    ledger
+        .append(&seen("run-1", 2, &artifact, 10))
+        .expect("artifact_seen");
+    let row = ledger
+        .artifact(&artifact.key())
+        .expect("artifact query")
+        .expect("row");
+    assert_eq!(row.artifact.tag(), expected_tag);
+}
+
+#[test]
 fn schema_migrates_from_empty_and_is_rerunnable() {
     let dir = tempfile::tempdir().expect("state dir");
 
     {
         let ledger = Ledger::open(dir.path()).expect("first open");
-        assert_eq!(ledger.schema_version().expect("schema version"), 2);
+        assert_eq!(ledger.schema_version().expect("schema version"), 3);
     }
 
     let artifact = artifact("19.4.46", 'a');
@@ -789,7 +858,7 @@ fn schema_migrates_from_empty_and_is_rerunnable() {
     }
 
     let ledger = Ledger::open(dir.path()).expect("third open");
-    assert_eq!(ledger.schema_version().expect("schema version"), 2);
+    assert_eq!(ledger.schema_version().expect("schema version"), 3);
     assert_eq!(ledger.event_count().expect("event count"), 1);
     assert!(ledger
         .artifact(&artifact.key())

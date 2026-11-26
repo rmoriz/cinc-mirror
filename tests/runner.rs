@@ -1239,7 +1239,10 @@ async fn an_arch_collision_opens_one_incident_and_the_run_continues() {
     );
 
     let specs = [kept.clone(), conflicting.clone(), other.clone()];
-    let fixture = Fixture::new(dir.path(), &specs, &["t1"], 1, 1);
+    let mut fixture = Fixture::new(dir.path(), &specs, &["t1"], 1, 1);
+    // A row from an older run, before artifact rows could carry the qualified
+    // tag. The run must refresh it instead of publishing against the plain tag.
+    fixture.seed_seen(&conflicting, None);
     let target = Arc::clone(&fixture.targets[0]);
     let payload = Arc::clone(&fixture.payload);
     let ctx = fixture.ctx("run-1");
@@ -1249,15 +1252,20 @@ async fn an_arch_collision_opens_one_incident_and_the_run_continues() {
     let kept_artifact = artifact_of(&kept);
     let conflicting_artifact = artifact_of(&conflicting);
     let other_artifact = artifact_of(&other);
+    let conflicting_tag = format!(
+        "{}-{}",
+        conflicting_artifact.tag(),
+        &conflicting_artifact.sha256[..12]
+    );
 
-    // One newly opened incident drives exit code 3; the kept artifact and the
-    // unrelated one are still published.
+    // One newly opened incident drives exit code 3; both colliding artifacts and
+    // the unrelated one are still published.
     assert_eq!(summary.incidents_opened, 1, "{summary:?}");
     assert_eq!(summary.exit_code, 3, "{summary:?}");
-    assert_eq!(summary.skipped, 1, "the conflicting artifact is excluded");
-    assert_eq!(summary.discovered, 2, "{summary:?}");
-    assert_eq!(summary.downloaded, 2, "{summary:?}");
-    assert_eq!(summary.published, 2, "{summary:?}");
+    assert_eq!(summary.skipped, 0, "nothing is skipped: {summary:?}");
+    assert_eq!(summary.discovered, 3, "{summary:?}");
+    assert_eq!(summary.downloaded, 3, "{summary:?}");
+    assert_eq!(summary.published, 3, "{summary:?}");
     assert_eq!(summary.open_incidents, 1, "{summary:?}");
     assert_eq!(
         target.owner(&kept_artifact.tag()),
@@ -1265,22 +1273,23 @@ async fn an_arch_collision_opens_one_incident_and_the_run_continues() {
         "the first artifact owns the descriptive tag"
     );
     assert_eq!(
+        target.owner(&conflicting_tag),
+        Some(conflicting_artifact.sha256.clone()),
+        "the latecomer publishes under a digest-qualified tag"
+    );
+    assert_eq!(
         target.owner(&other_artifact.tag()),
         Some(other_artifact.sha256.clone()),
         "other artifacts are still processed"
     );
     assert!(
-        target
-            .puts()
-            .iter()
-            .all(|record| record.sha256 != conflicting_artifact.sha256),
-        "the conflicting artifact is never published: {:?}",
-        target.puts()
+        conflicting_tag.starts_with(&conflicting_artifact.tag()),
+        "the qualified tag keeps the descriptive prefix: {conflicting_tag}"
     );
     assert_eq!(
         payload.calls(),
-        2,
-        "the conflicting artifact is never downloaded either"
+        3,
+        "the latecomer is downloaded like any other artifact"
     );
 
     {
@@ -1292,7 +1301,7 @@ async fn an_arch_collision_opens_one_incident_and_the_run_continues() {
         assert_eq!(
             incident.artifact_key.as_deref(),
             Some(conflicting_artifact.key().as_str()),
-            "the incident names the excluded artifact"
+            "the incident names the latecomer"
         );
         assert_eq!(
             incident.old_sha256.as_deref(),
@@ -1303,16 +1312,29 @@ async fn an_arch_collision_opens_one_incident_and_the_run_continues() {
             incident.new_sha256.as_deref(),
             Some(conflicting_artifact.sha256.as_str())
         );
-        // The excluded artifact is recorded as seen so the incident can name
-        // it, but it never reaches a publication row.
         assert!(ledger
             .artifact(&conflicting_artifact.key())
             .expect("row")
             .is_some());
-        assert!(ledger
-            .publications_for(&conflicting_artifact.key())
-            .expect("publications")
-            .is_empty());
+        assert_eq!(
+            ledger
+                .publications_for(&conflicting_artifact.key())
+                .expect("publications")
+                .len(),
+            1,
+            "the latecomer is a real publication, not a dropped artifact"
+        );
+        assert_eq!(
+            ledger
+                .artifact(&conflicting_artifact.key())
+                .expect("row")
+                .expect("the seeded row")
+                .artifact
+                .tag_override
+                .as_deref(),
+            Some(conflicting_tag.as_str()),
+            "the stale row is refreshed with the qualified tag"
+        );
     }
 
     // A later run sees the same collision but the incident is deduplicated:
@@ -1327,8 +1349,8 @@ async fn an_arch_collision_opens_one_incident_and_the_run_continues() {
 
     assert_eq!(repeat.incidents_opened, 0, "{repeat:?}");
     assert_eq!(repeat.exit_code, 0, "{repeat:?}");
-    assert_eq!(repeat.satisfied, 2, "{repeat:?}");
-    assert_eq!(repeat.skipped, 1, "{repeat:?}");
+    assert_eq!(repeat.satisfied, 3, "{repeat:?}");
+    assert_eq!(repeat.skipped, 0, "{repeat:?}");
     assert_eq!(
         repeat.open_incidents, 1,
         "the still-open incident stays visible without failing the run"
@@ -1370,20 +1392,32 @@ async fn an_arch_collision_for_an_ignored_project_opens_no_incident() {
 
     let summary = run(&ctx, RunOpts::default()).await.expect("run");
 
+    if summary.failed > 0 {
+        let ledger = ctx.ledger.lock().await;
+        for publication in ledger.publications("t1").expect("publications") {
+            eprintln!(
+                "PUB {} {:?} {:?}",
+                publication.artifact_key, publication.status, publication.last_error
+            );
+        }
+    }
+
     let conflicting_artifact = artifact_of(&conflicting);
+    let conflicting_tag = format!(
+        "{}-{}",
+        conflicting_artifact.tag(),
+        &conflicting_artifact.sha256[..12]
+    );
     assert_eq!(summary.incidents_opened, 0, "{summary:?}");
     assert_eq!(summary.open_incidents, 0, "{summary:?}");
     assert_eq!(summary.exit_code, 0, "{summary:?}");
-    assert_eq!(summary.skipped, 1, "the conflicting artifact is excluded");
-    assert_eq!(summary.discovered, 2, "{summary:?}");
-    assert_eq!(summary.published, 2, "{summary:?}");
-    assert!(
-        target
-            .puts()
-            .iter()
-            .all(|record| record.sha256 != conflicting_artifact.sha256),
-        "the conflicting artifact is never published: {:?}",
-        target.puts()
+    assert_eq!(summary.skipped, 0, "the latecomer is mirrored, not skipped");
+    assert_eq!(summary.discovered, 3, "{summary:?}");
+    assert_eq!(summary.published, 3, "{summary:?}");
+    assert_eq!(
+        target.owner(&conflicting_tag),
+        Some(conflicting_artifact.sha256.clone()),
+        "the ignored project still mirrors the latecomer under its digest tag"
     );
 
     let ledger = ctx.ledger.lock().await;

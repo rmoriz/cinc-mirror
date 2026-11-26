@@ -674,9 +674,19 @@ async fn crawl_reports_two_digests_under_one_tag_as_a_collision() {
         .await
         .expect("a collision is collected, not an error");
 
-    // `cinc-debug_...` sorts before `cinc_...`, so it is the kept artifact.
-    assert_eq!(outcome.artifacts.len(), 1);
+    // `cinc-debug_...` sorts before `cinc_...`, so it keeps the tag.
+    assert_eq!(outcome.artifacts.len(), 2, "both files are mirrored");
     assert_eq!(outcome.artifacts[0].sha256, SHA_B);
+    assert_eq!(outcome.artifacts[0].tag(), "19.4.46-debian-13-amd64");
+    assert_eq!(
+        outcome.artifacts[1].sha256, SHA_A,
+        "the latecomer stays in the queue"
+    );
+    assert_eq!(
+        outcome.artifacts[1].tag(),
+        format!("19.4.46-debian-13-amd64-{}", &SHA_A[..12]),
+        "the latecomer is qualified with its digest"
+    );
     assert_eq!(outcome.collisions.len(), 1);
     let collision = &outcome.collisions[0];
     assert_eq!(collision.first.sha256, SHA_B, "the first artifact is kept");
@@ -689,7 +699,7 @@ async fn crawl_reports_two_digests_under_one_tag_as_a_collision() {
 }
 
 #[tokio::test]
-async fn plan_excludes_colliding_artifacts_and_reports_them() {
+async fn plan_reports_colliding_artifacts_and_keeps_both() {
     let mut pages = HashMap::new();
     let js = |name: &str| format!("files/stable/cinc/19.4.46/debian/13/{name}.metadata.json");
     pages.insert("files/stable/cinc/".to_string(), listing(&["19.4.46/"]));
@@ -773,10 +783,15 @@ async fn plan_excludes_colliding_artifacts_and_reports_them() {
         "stable/cinc/19.4.46/debian/13/cinc_19.4.46-1_arm64.deb"
     );
     assert_eq!(
-        plan.artifacts, 1,
-        "the conflicting artifact is excluded from the totals"
+        collision.published_as,
+        format!("19.4.46-debian-13-arm64-{}", &SHA_C[..12]),
+        "the report shows the reference the latecomer will really use"
     );
-    assert_eq!(plan.total_bytes, 2000, "only the kept artifact is counted");
+    assert_eq!(
+        plan.artifacts, 2,
+        "the latecomer is planned as well, not dropped"
+    );
+    assert_eq!(plan.total_bytes, 5000, "both artifacts are counted");
     assert!(plan.to_json().contains("\"collisions\": 1"));
     assert!(plan.to_json().contains("\"collision_details\""));
 }

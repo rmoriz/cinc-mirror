@@ -57,12 +57,15 @@ pub struct SpaceCheck {
 pub struct CollisionDetail {
     /// Descriptive tag both artifacts claim.
     pub tag: String,
-    /// Canonical key of the artifact the crawl keeps.
+    /// Canonical key of the artifact that keeps the descriptive tag.
     pub kept: String,
-    /// Canonical key of the artifact the crawl excludes.
+    /// Canonical key of the latecomer.
     pub conflicting: String,
-    /// Upstream path of the excluded artifact, which may be an alias path.
+    /// Upstream path of the latecomer, which may be an alias path.
     pub upstream_path: String,
+    /// Reference the latecomer is published under: the descriptive tag plus its
+    /// digest.
+    pub published_as: String,
 }
 
 impl CollisionDetail {
@@ -72,6 +75,7 @@ impl CollisionDetail {
             kept: collision.first.key(),
             conflicting: collision.conflicting.key(),
             upstream_path: collision.upstream_path.clone(),
+            published_as: collision.conflicting.tag(),
         }
     }
 }
@@ -85,8 +89,9 @@ pub struct Plan {
     pub total_bytes: u64,
     /// Bytes of artifacts the caller reported as satisfied.
     pub satisfied_bytes: u64,
-    /// Tag collisions the crawl reported. The conflicting artifacts are
-    /// excluded from every count; `mirror` opens an incident for each.
+    /// Tag collisions the crawl reported. Both artifacts are planned; the
+    /// latecomer under a digest-qualified tag. `mirror` opens an incident for
+    /// each (unless the project mutes them).
     pub collisions: usize,
     /// The collisions behind [`Plan::collisions`], for inspection.
     pub collision_details: Vec<CollisionDetail>,
@@ -170,10 +175,9 @@ pub async fn build(
         collisions.extend(outcome.collisions);
     }
     // The same version number on two channels can produce one descriptive tag
-    // with different bytes; keep the first candidate and report the other like
-    // a crawl collision.
-    for collision in collect_tag_collisions(candidates.values()) {
-        candidates.remove(&collision.conflicting.key());
+    // with different bytes; qualify the later candidate and report the pair like
+    // a crawl collision. Both stay in the plan.
+    for collision in collect_tag_collisions(candidates.values_mut()) {
         collisions.push(collision);
     }
     let collisions = dedup_collisions(collisions);

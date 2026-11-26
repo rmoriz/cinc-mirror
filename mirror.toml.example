@@ -72,8 +72,9 @@ remote = "origin"
 # issue_repo = "<owner>/cinc-mirror"
 
 # Two package formats published under one descriptive tag (for example `.msi`
-# and `.appx`) are an upstream alias, not an integrity finding. List the project
-# here to keep those collisions out of the ledger, the alerts and the issues.
+# and `.appx`) are an upstream alias, not an integrity finding: the latecomer is
+# published under the tag plus its digest either way. List the project here to
+# also keep those collisions out of the ledger, the alerts and the issues.
 # [incident]
 # ignore_arch_collisions = ["omnibus-toolchain"]
 

@@ -256,8 +256,9 @@ pub struct IncidentConfig {
     ///
     /// Upstream occasionally publishes two files under one descriptive tag (for
     /// example a `.msi` and an `.appx`). That is a packaging alias, not a
-    /// tampered download; listing the project here keeps the collision out of
-    /// the ledger, the alerts and the issue tracker.
+    /// tampered download, and the latecomer publishes under a digest-qualified
+    /// tag either way; listing the project here additionally keeps the
+    /// collision out of the ledger, the alerts and the issue tracker.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore_arch_collisions: Vec<String>,
 }
