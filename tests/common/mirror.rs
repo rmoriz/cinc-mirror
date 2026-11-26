@@ -16,7 +16,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use cinc_mirror::artifact::{Artifact, ArtifactContext, ArtifactInput};
-use cinc_mirror::config::{Config, IncidentConfig, TargetAuth, TransportKind};
+use cinc_mirror::config::{
+    Config, IncidentConfig, RetentionConfig, TargetAuth, TargetConfig, TargetKind, TransportKind,
+};
 use cinc_mirror::ctx::Ctx;
 use cinc_mirror::ledger::{Event, EventKind, Ledger};
 use cinc_mirror::net::RateLimiter;
@@ -165,6 +167,55 @@ pub fn config_with(state_dir: &Path, api_base: &str) -> Config {
             ..IncidentConfig::default()
         },
         ..Config::default()
+    }
+}
+
+/// A [`TargetConfig`] for `mock`, pointing at its namespace [`NAMESPACE`].
+pub fn oci_target_config(mock: &MockRegistry, name: &str) -> TargetConfig {
+    TargetConfig {
+        name: name.to_string(),
+        kind: TargetKind::Oci,
+        enabled: true,
+        registry: Some(mock.base_url().to_string()),
+        namespace: Some(NAMESPACE.to_string()),
+        url: None,
+        auth: TargetAuth::Anonymous,
+        max_bandwidth: None,
+        identity_file: None,
+        password_file: None,
+    }
+}
+
+/// A [`TargetConfig`] for the GitHub Packages API on `ghcr.io`.
+///
+/// The registry name is the real GHCR host, so the delete mode resolves to the
+/// packages backend; the API root comes from the test configuration, which
+/// points at the packages mock.
+pub fn packages_target_config(name: &str, namespace: &str) -> TargetConfig {
+    TargetConfig {
+        name: name.to_string(),
+        kind: TargetKind::Oci,
+        enabled: true,
+        registry: Some("ghcr.io".to_string()),
+        namespace: Some(namespace.to_string()),
+        url: None,
+        auth: TargetAuth::Anonymous,
+        max_bandwidth: None,
+        identity_file: None,
+        password_file: None,
+    }
+}
+
+/// Configuration with retention enabled against `api_base` and one target.
+pub fn config_with_retention(state_dir: &Path, api_base: &str, target: TargetConfig) -> Config {
+    Config {
+        targets: vec![target],
+        retention: RetentionConfig {
+            prune: true,
+            api_base: api_base.to_string(),
+            ..RetentionConfig::default()
+        },
+        ..config_with(state_dir, "https://api.github.com")
     }
 }
 

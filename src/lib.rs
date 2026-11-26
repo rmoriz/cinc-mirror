@@ -51,7 +51,10 @@ pub use net::RateLimiter;
 pub use oci::{AuthError, HttpFailure, OciAuth, OciConfig, OciError, Registry};
 pub use packages_api::{OwnerKind, PackagesClient, PruneError, RemoteVersion};
 pub use plan::{build, GroupTotals, Plan, PlanError, SpaceCheck};
-pub use prune::{plan, protect, wanted, Planned, Protection, RemoteReference, Wanted};
+pub use prune::{
+    backend_for, plan, protect, prune_targets, wanted, Backend, Pass, Planned, Protection,
+    PruneReport, RemoteReference, Wanted,
+};
 pub use repair::{RepairAction, RepairError, RepairOpts, RepairOutcome, RepairReport};
 pub use report::Summary;
 pub use runner::{run, Order, RunError, RunOpts};

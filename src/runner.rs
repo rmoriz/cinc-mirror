@@ -179,15 +179,19 @@ impl RunError {
     }
 }
 
-/// Monotonic event sequence for one run.
-struct Seq(AtomicU64);
+/// Monotonic event sequence of one run.
+#[derive(Debug)]
+pub struct Seq(AtomicU64);
 
 impl Seq {
-    fn new(start: u64) -> Self {
+    /// Start at `start`.
+    #[must_use]
+    pub fn new(start: u64) -> Self {
         Self(AtomicU64::new(start))
     }
 
-    fn next(&self) -> u64 {
+    /// Hand out the next sequence number.
+    pub fn next(&self) -> u64 {
         self.0.fetch_add(1, Atomic::SeqCst)
     }
 }

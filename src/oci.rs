@@ -119,7 +119,7 @@ const TITLE_ANNOTATION: &str = "org.opencontainers.image.title";
 const PACKAGE_SUFFIXES: [&str; 6] = [".deb", ".rpm", ".msi", ".pkg", ".dmg", ".tar.gz"];
 
 /// Registry whose CI token overrides the docker config.
-const GHCR_HOST: &str = "ghcr.io";
+pub(crate) const GHCR_HOST: &str = "ghcr.io";
 
 /// GitHub's conventional CI token user.
 const CI_TOKEN_USER: &str = "x-access-token";
@@ -2031,7 +2031,7 @@ fn target_env_prefix(name: &str) -> String {
     format!("CINC_MIRROR_{sanitized}")
 }
 
-fn env_value(name: &str) -> Option<String> {
+pub(crate) fn env_value(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .map(|value| value.trim().to_string())
