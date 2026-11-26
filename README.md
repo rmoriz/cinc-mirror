@@ -254,6 +254,12 @@ cursor applies to `backfill` mode, which this workflow does not use.) The
 concurrency group `cinc-mirror` serialises runs instead of cancelling one
 mid-publication.
 
+Let a container package be created by the workflow the first time. A package
+created by a local PAT is private and not linked to the repository, so the
+`GITHUB_TOKEN` in a later run gets `403 DENIED` on every upload. If a package
+did start locally, link it to `rmoriz/cinc-mirror` in the package settings and
+set its visibility before the next scheduled run.
+
 ## Windows
 
 Windows packages (`.msi`) are mirrored like every other platform. The PowerShell
