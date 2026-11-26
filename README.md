@@ -263,9 +263,13 @@ mid-publication.
 
 Let a container package be created by the workflow the first time. A package
 created by a local PAT is private and not linked to the repository, so the
-`GITHUB_TOKEN` in a later run gets `403 DENIED` on every upload. If a package
-did start locally, link it to `rmoriz/cinc-mirror` in the package settings and
-set its visibility before the next scheduled run.
+`GITHUB_TOKEN` in a later run gets `403 DENIED` on every upload. Every manifest
+carries the `org.opencontainers.image.source` annotation for the repository, so
+GHCR links a freshly pushed package to `rmoriz/cinc-mirror` by itself and the
+package inherits the repository's README, permissions and retention. A push into
+an existing unlinked package re-links it as well. If a package is still
+unlinked, connect it in the package settings and set its visibility before the
+next scheduled run.
 
 ## Windows
 

@@ -89,9 +89,13 @@ fn artifact_for_version(bytes: &[u8], version: &str) -> Artifact {
 }
 
 fn target_for(mock: &MockRegistry) -> OciTarget {
+    target_in(mock, NAMESPACE)
+}
+
+fn target_in(mock: &MockRegistry, namespace: &str) -> OciTarget {
     let registry = Registry::new(OciConfig {
         registry: mock.registry_name(),
-        namespace: NAMESPACE.to_string(),
+        namespace: namespace.to_string(),
         auth: OciAuth::Anonymous,
         insecure_http: true,
         ..OciConfig::default()
@@ -243,11 +247,40 @@ async fn put_writes_expected_manifest_and_annotations() {
         annotations["org.opencontainers.artifact.description.version"],
         json!("19.4.46")
     );
+    assert!(
+        annotations.get("org.opencontainers.image.source").is_none(),
+        "an owner-only namespace names no repository"
+    );
 
     assert_eq!(
         mock.blob(REPO, &sha256_digest(b"{}")),
         Some(b"{}".to_vec()),
         "the empty config blob must exist before the manifest"
+    );
+}
+
+#[tokio::test]
+async fn put_names_the_source_repository_for_a_nested_namespace() {
+    // `ghcr.io/<owner>/<repo>/<project>` names the repository in the namespace;
+    // GHCR links a package to that repository when the manifest says so, which
+    // is what gives the package its README, permissions and retention.
+    let mock = MockRegistry::start(MockAuth::Anonymous).await;
+    let target = target_in(&mock, "octocat/cinc-mirror");
+    let bytes = b"the verified package bytes".as_slice();
+    let artifact = artifact_for(bytes);
+    let (_dir, path) = write_package(bytes);
+
+    target.put(&artifact, &path).await.expect("put");
+
+    // The package nests under the repository, so the repository is part of the
+    // reference, not the bare `REPO` constant.
+    let stored = mock
+        .manifest("octocat/cinc-mirror/cinc", &artifact.tag())
+        .expect("manifest under the nested reference");
+    let manifest: Value = serde_json::from_slice(&stored.bytes).expect("manifest is JSON");
+    assert_eq!(
+        manifest["annotations"]["org.opencontainers.image.source"],
+        json!("https://github.com/octocat/cinc-mirror")
     );
 }
 

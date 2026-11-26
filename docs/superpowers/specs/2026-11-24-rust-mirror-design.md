@@ -411,7 +411,10 @@ then manifest with `artifactType application/vnd.cinc.package.v1+json`, layers
 for package and `metadata.json`, and the existing annotations
 (`org.opencontainers.artifact.title`, `.description.platform`,
 `.description.platform-version`, `.description.machine`,
-`.description.version`). Ref: `<registry>/<namespace>/<repo>/<project>:<version>-<platform>-<platform-version>-<arch>`.
+`.description.version`). When the namespace names a repository
+(`<owner>/<repo>`, as `rmoriz/cinc-mirror` does) the manifest also carries
+`org.opencontainers.image.source` pointing at it, which is how GHCR links the
+package to the repository. Ref: `<registry>/<namespace>/<repo>/<project>:<version>-<platform>-<platform-version>-<arch>`.
 
 `rsync_target`: accepts **both** address forms — `ssh://[user@]host[:port]/path` (SSH transport, `auth = "ssh-key"`, host key checked, `-e "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes"`) and `rsync://host[:port]/module/path` (rsync daemon, `auth = "daemon"` with optional password file, no host key). Layout mirrors upstream (`<channel>/<project>/<version>/<platform>/<platform-version>/<basename>` plus `metadata.json` and a `<basename>.sha256` sidecar), upload to `.tmp/` then `mv`, `--partial-dir`, `--checksum`.
 

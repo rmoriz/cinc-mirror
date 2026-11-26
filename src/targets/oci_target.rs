@@ -49,6 +49,13 @@ const METADATA_NAME: &str = "metadata.json";
 /// Layer title annotation.
 const TITLE_ANNOTATION: &str = "org.opencontainers.image.title";
 
+/// Annotation naming the source repository of the image.
+///
+/// Registry and GitHub use it to link a pushed package to the repository it
+/// belongs to; without it a package stays unlinked, shows up without its
+/// repository and gets no README, permissions or retention from it.
+const SOURCE_ANNOTATION: &str = "org.opencontainers.image.source";
+
 /// One OCI registry target.
 #[derive(Debug)]
 pub struct OciTarget {
@@ -177,8 +184,15 @@ impl OciTarget {
         self.ensure_bytes(&repo, metadata_bytes, &metadata_digest)
             .await?;
 
-        let manifest =
-            manifest_document(artifact, &incoming, size, metadata_bytes, &metadata_digest);
+        let source = source_url(self.registry.namespace());
+        let manifest = manifest_document(
+            artifact,
+            &incoming,
+            size,
+            metadata_bytes,
+            &metadata_digest,
+            source.as_deref(),
+        );
         let manifest_digest = self
             .registry
             .put_manifest(&repo, &reference, &manifest)
@@ -265,6 +279,23 @@ fn package_digest(artifact: &Artifact) -> String {
     format!("sha256:{}", artifact.sha256)
 }
 
+/// The repository URL an `owner/repo` namespace stands for.
+///
+/// GHCR package names nest the project under the repository name
+/// (`<owner>/<repo>/<project>`), so a namespace of exactly two segments names
+/// the GitHub repository the package belongs to. An owner-only namespace says
+/// nothing about a repository, so no source is claimed then.
+#[must_use]
+fn source_url(namespace: &str) -> Option<String> {
+    let mut parts = namespace.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(repo), None) if !owner.is_empty() && !repo.is_empty() => {
+            Some(format!("https://github.com/{owner}/{repo}"))
+        }
+        _ => None,
+    }
+}
+
 /// The OCI image manifest for one artifact.
 fn manifest_document(
     artifact: &Artifact,
@@ -272,7 +303,32 @@ fn manifest_document(
     package_size: u64,
     metadata: &[u8],
     metadata_digest: &str,
+    source: Option<&str>,
 ) -> Value {
+    let mut annotations = serde_json::Map::new();
+    annotations.insert(
+        "org.opencontainers.artifact.title".to_string(),
+        json!(artifact.basename),
+    );
+    annotations.insert(
+        "org.opencontainers.artifact.description.platform".to_string(),
+        json!(artifact.platform),
+    );
+    annotations.insert(
+        "org.opencontainers.artifact.description.platform-version".to_string(),
+        json!(artifact.platform_version),
+    );
+    annotations.insert(
+        "org.opencontainers.artifact.description.machine".to_string(),
+        json!(artifact.arch),
+    );
+    annotations.insert(
+        "org.opencontainers.artifact.description.version".to_string(),
+        json!(artifact.version),
+    );
+    if let Some(source) = source {
+        annotations.insert(SOURCE_ANNOTATION.to_string(), json!(source));
+    }
     json!({
         "schemaVersion": 2,
         "mediaType": MANIFEST_MEDIA_TYPE,
@@ -296,13 +352,7 @@ fn manifest_document(
                 "annotations": {TITLE_ANNOTATION: METADATA_NAME},
             },
         ],
-        "annotations": {
-            "org.opencontainers.artifact.title": artifact.basename,
-            "org.opencontainers.artifact.description.platform": artifact.platform,
-            "org.opencontainers.artifact.description.platform-version": artifact.platform_version,
-            "org.opencontainers.artifact.description.machine": artifact.arch,
-            "org.opencontainers.artifact.description.version": artifact.version,
-        },
+        "annotations": annotations,
     })
 }
 
@@ -331,4 +381,25 @@ fn sha256_digest(bytes: &[u8]) -> String {
         let _ = write!(hex, "{byte:02x}");
     }
     format!("sha256:{hex}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_url;
+
+    #[test]
+    fn a_nested_namespace_names_the_repository() {
+        assert_eq!(
+            source_url("octocat/hello-world").as_deref(),
+            Some("https://github.com/octocat/hello-world")
+        );
+    }
+
+    #[test]
+    fn an_owner_only_or_deeper_namespace_names_no_repository() {
+        assert_eq!(source_url("octocat"), None);
+        assert_eq!(source_url("a/b/c"), None);
+        assert_eq!(source_url("/repo"), None);
+        assert_eq!(source_url("owner/"), None);
+    }
 }
