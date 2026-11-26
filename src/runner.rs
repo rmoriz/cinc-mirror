@@ -811,8 +811,8 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
     }
 
     // A collision is an upstream anomaly, not a reason to stop the run: open
-    // one deduplicated incident per collision and keep the kept artifacts
-    // flowing through the queue.
+    // one deduplicated incident per collision and let both artifacts pass
+    // through the queue, the latecomer under its digest-qualified tag.
     let mut collision_incidents = 0;
     for collision in &collisions {
         if open_collision_incident(ctx, &seq, collision).await? {
