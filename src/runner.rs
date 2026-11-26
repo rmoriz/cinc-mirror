@@ -989,6 +989,23 @@ async fn crawl_scope(
         }
         collisions.extend(outcome.collisions);
     }
+    // A qualified tag is a publication reference the ledger already knows: the
+    // artifact was addressed under it by an earlier run. Keep it, so a change in
+    // crawl order cannot move a published artifact between two references and
+    // `verify` keeps checking the one the mirror actually used.
+    {
+        let ledger = ctx.ledger.lock().await;
+        for (_, artifact) in candidates.values_mut() {
+            if artifact.tag_override.is_some() {
+                continue;
+            }
+            if let Some(row) = ledger.artifact(&artifact.key())? {
+                if let Some(existing) = row.artifact.tag_override {
+                    artifact.tag_override = Some(existing);
+                }
+            }
+        }
+    }
     // The per-policy crawl already qualified collisions it saw, but two
     // policies can still hand in artifacts that share a tag; qualify those too
     // and keep every artifact in the queue.
@@ -1057,7 +1074,8 @@ async fn open_collision_incident(
             tag = %collision.tag,
             conflicting = %collision.conflicting.key(),
             kept = %collision.first.key(),
-            "arch collision ignored by configuration; keeping the first artifact"
+            published_as = %collision.conflicting.tag(),
+            "arch collision ignored by configuration; the first artifact keeps the tag"
         );
         return Ok(false);
     }
@@ -1072,7 +1090,8 @@ async fn open_collision_incident(
         tracing::warn!(
             tag = %collision.tag,
             conflicting = %collision.conflicting.key(),
-            "tag collision already has an open incident; keeping the first artifact"
+            published_as = %collision.conflicting.tag(),
+            "tag collision already has an open incident; the first artifact keeps the tag"
         );
         return Ok(false);
     }

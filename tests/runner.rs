@@ -599,7 +599,12 @@ impl Fixture {
     }
 
     fn seed_seen(&mut self, spec: &Spec, size: Option<u64>) {
-        let artifact = artifact_of(spec);
+        self.seed_seen_with_tag(spec, size, None);
+    }
+
+    fn seed_seen_with_tag(&mut self, spec: &Spec, size: Option<u64>, tag_override: Option<&str>) {
+        let mut artifact = artifact_of(spec);
+        artifact.tag_override = tag_override.map(str::to_string);
         let mut detail = json!({
             "artifact": ledger::artifact_detail(&artifact),
             "upstream_path": artifact.rsync_relpath(),
@@ -1427,6 +1432,61 @@ async fn an_arch_collision_for_an_ignored_project_opens_no_incident() {
             .expect("incidents")
             .is_empty(),
         "an ignored project opens no incident"
+    );
+}
+
+#[tokio::test]
+async fn a_qualified_tag_from_the_ledger_survives_a_changed_crawl_order() {
+    clear_security_env();
+    let dir = TempDir::new().expect("state dir");
+    // The crawl names the aarch64 build as the tag owner and the arm64 build as
+    // the latecomer. Suppose an earlier run decided the other way round, as a
+    // changed listing order can: the stored qualified tag must win, otherwise
+    // the artifact would move to the plain tag `verify` no longer checks.
+    let kept = Spec::new(
+        "19.4.46",
+        "cinc_19.4.46-1_aarch64.deb",
+        b"the aarch64 build",
+    )
+    .with_raw_arch("aarch64");
+    let conflicting = Spec::new(
+        "19.4.46",
+        "cinc_19.4.46-1_arm64.deb",
+        b"the arm64 build with different bytes",
+    )
+    .with_raw_arch("arm64");
+
+    let specs = [kept.clone(), conflicting.clone()];
+    let mut fixture = Fixture::new(dir.path(), &specs, &["t1"], 1, 1);
+    let kept_artifact = artifact_of(&kept);
+    let qualified = format!("{}-{}", kept_artifact.tag(), &kept_artifact.sha256[..12]);
+    fixture.seed_seen_with_tag(&kept, None, Some(&qualified));
+    let target = Arc::clone(&fixture.targets[0]);
+    let ctx = fixture.ctx("run-1");
+
+    let summary = run(&ctx, RunOpts::default()).await.expect("run");
+
+    let conflicting_artifact = artifact_of(&conflicting);
+    let conflicting_tag = format!(
+        "{}-{}",
+        conflicting_artifact.tag(),
+        &conflicting_artifact.sha256[..12]
+    );
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert_eq!(summary.published, 2, "{summary:?}");
+    assert_eq!(
+        target.owner(&qualified),
+        Some(kept_artifact.sha256.clone()),
+        "the stored reference is reused"
+    );
+    assert_eq!(
+        target.owner(&kept_artifact.tag()),
+        None,
+        "the plain tag is not taken a second time"
+    );
+    assert_eq!(
+        target.owner(&conflicting_tag),
+        Some(conflicting_artifact.sha256.clone())
     );
 }
 
