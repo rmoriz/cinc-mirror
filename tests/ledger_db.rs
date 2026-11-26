@@ -635,6 +635,81 @@ fn incident_open_and_ack_update_the_row() {
 }
 
 #[test]
+fn an_unrecoverable_publication_names_its_incident_for_the_replay() {
+    // Repair records the publication outcome, not a fresh incident: the row may
+    // already exist. Replay must still be able to rebuild the incident from
+    // this event, or the next run files the same issue again.
+    let (_dir, mut ledger) = open();
+    let artifact = artifact("19.4.46", 'a');
+    let key = artifact.key();
+    ledger
+        .append(&seen("run-1", 1, &artifact, 10))
+        .expect("artifact_seen");
+
+    ledger
+        .append(&event(
+            "repair-1",
+            1,
+            EventKind::PublicationUnrecoverable,
+            Some(&key),
+            Some("ghcr"),
+            json!({
+                "error": "payload gone upstream",
+                "incident": "unrecoverable-0123456789abcdef",
+            }),
+        ))
+        .expect("publication_unrecoverable");
+
+    let incidents = ledger
+        .incidents(IncidentFilter::default())
+        .expect("incidents");
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].id, "unrecoverable-0123456789abcdef");
+    assert_eq!(incidents[0].kind, IncidentKind::Unrecoverable);
+    assert_eq!(incidents[0].artifact_key.as_deref(), Some(key.as_str()));
+    assert_eq!(incidents[0].state, IncidentState::Open);
+}
+
+#[test]
+fn an_ack_without_an_opened_event_is_kept_as_a_stub() {
+    // Incident event files are incomplete: older incidents exist only in a live
+    // database. Replaying their ack must not fail the whole ledger sync, which
+    // would silently drop every incident filed after it.
+    let (_dir, mut ledger) = open();
+
+    ledger
+        .append(&event(
+            "ack-1",
+            1,
+            EventKind::IncidentAcked,
+            None,
+            None,
+            json!({
+                "id": "tag_conflict-0123456789abcdef",
+                "note": "known before the event files existed",
+                "issue_url": "https://example.invalid/issues/7",
+            }),
+        ))
+        .expect("incident_acked");
+
+    let all = ledger
+        .incidents(IncidentFilter::default())
+        .expect("all incidents");
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].id, "tag_conflict-0123456789abcdef");
+    assert_eq!(all[0].kind, IncidentKind::TagConflict, "kind from the id");
+    assert_eq!(all[0].state, IncidentState::Acked);
+    assert_eq!(
+        all[0].issue_url.as_deref(),
+        Some("https://example.invalid/issues/7")
+    );
+    assert!(ledger
+        .incidents(IncidentFilter::open())
+        .expect("open incidents")
+        .is_empty());
+}
+
+#[test]
 fn imported_creates_artifact_and_published_publication() {
     let (_dir, mut ledger) = open();
     let artifact = artifact("19.4.46", 'a');

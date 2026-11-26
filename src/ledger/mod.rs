@@ -1166,7 +1166,8 @@ fn reduce(conn: &Connection, event: &Event) -> Result<(), LedgerError> {
         }
         EventKind::PublicationSuperseded => reduce_publication_superseded(conn, event),
         EventKind::PublicationUnrecoverable => {
-            reduce_publication_attempt(conn, event, PublicationStatus::Unrecoverable)
+            reduce_publication_attempt(conn, event, PublicationStatus::Unrecoverable)?;
+            reduce_unrecoverable_incident(conn, event)
         }
         EventKind::HashChanged => reduce_hash_changed(conn, event),
         EventKind::IncidentOpened => reduce_incident_opened(conn, event),
@@ -1439,6 +1440,28 @@ fn reduce_incident_opened(conn: &Connection, event: &Event) -> Result<(), Ledger
     Ok(())
 }
 
+/// Make sure the `unrecoverable` incident an event names exists.
+///
+/// [`crate::incident::open`] returns an existing row without writing an event of
+/// its own, so a row from before the event files existed lives only in a
+/// database. Without this stub the replay loses it and the next run files the
+/// same issue a second time.
+fn reduce_unrecoverable_incident(conn: &Connection, event: &Event) -> Result<(), LedgerError> {
+    let Some(id) = detail_str(event, "incident") else {
+        return Ok(());
+    };
+    let Some(artifact_key) = event.artifact_key.as_deref() else {
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT OR IGNORE INTO incidents
+             (id, artifact_key, kind, detected_at, detail_json, state)
+         VALUES (?1, ?2, 'unrecoverable', ?3, 'null', 'open')",
+        params![id, artifact_key, ts_text(event.ts)],
+    )?;
+    Ok(())
+}
+
 fn reduce_incident_acked(conn: &Connection, event: &Event) -> Result<(), LedgerError> {
     let id = require_detail_str(event, "id")?;
     let note = detail_str(event, "note");
@@ -1452,7 +1475,30 @@ fn reduce_incident_acked(conn: &Connection, event: &Event) -> Result<(), LedgerE
         params![note, issue_url, id],
     )?;
     if changed == 0 {
-        return Err(LedgerError::UnknownIncident { id: id.to_string() });
+        // The `incident_opened` event can be absent while the row exists in a
+        // live database: the ledger branch is not a complete record (older
+        // incidents have no event file). Failing here would drop every incident
+        // in the event files sorted after this one, so record a stub instead.
+        // The id prefix names the kind.
+        let kind = id
+            .split_once('-')
+            .map_or(id, |(kind, _)| kind)
+            .parse()
+            .unwrap_or(IncidentKind::Unrecoverable);
+        conn.execute(
+            "INSERT INTO incidents
+                 (id, artifact_key, kind, detected_at, detail_json, state,
+                  ack_note, issue_url)
+             VALUES (?1, ?2, ?3, ?4, 'null', 'acked', ?5, ?6)",
+            params![
+                id,
+                event.artifact_key,
+                kind.as_str(),
+                ts_text(event.ts),
+                note,
+                issue_url,
+            ],
+        )?;
     }
     Ok(())
 }
