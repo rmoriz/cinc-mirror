@@ -12,6 +12,12 @@ former shell + ORAS + curl scripts: the crawl, download, verification,
 publication and repair paths are one program, and every observation is recorded
 in a durable ledger committed back to this repository.
 
+![Workflow: policy-driven crawl, SHA-256 gate, publication, ledger record](docs/cinc-mirror-workflow.png)
+
+*One run end to end, including the branch that matters most: a hash change is
+held as an immutable incident until an operator acknowledges it. The
+[HTML version](docs/cinc-mirror-workflow.html) is the same figure at full size.*
+
 ## Trademark / Remarks
 
 This project is neither affiliated nor approved by Progress Chef and/or the Cinc community project. Use at your own risk. Feel free to open issues but don't expect a SLA. Service may stop/break at any time. Solaris? AIX? 10 year old OS versions? Sorry, won't work.
