@@ -120,7 +120,12 @@ either. A plain mirror does the same for a `404` payload: one deduplicated
 incident, no failed count, the row stays unsatisfied so a later run retries it.
 An `unrecoverable` incident never drives the exit code; the issue it files is
 the report. A fresh clone plus `ledger pull` can rebuild all state except the local
-blob cache.
+blob cache. Replay must therefore be able to follow an event whose opening event
+is absent from the segment files — a database-only incident from before the
+files existed. An acknowledgement records a stub row for an unknown id (taking
+the kind from the id prefix), and `publication_unrecoverable` recreates the
+incident it names; both use `INSERT OR IGNORE`, because replaying a complete
+ledger must stay a no-op.
 
 ### Payload transport
 
