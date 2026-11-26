@@ -401,8 +401,6 @@ async fn a_project_without_crawled_artifacts_is_emptied_and_warned_about_once() 
     let _token = EnvVar::set("GHCR_TOKEN", "test-token");
     let mock = MockPackages::start().await;
     mock.owner_is_org("acme");
-    let wanted_version = mock.seed_version("mirror/cinc", &["19.4.46"], Utc::now());
-    let protected = mock.seed_version("mirror/cinc", &["19.4.45"], Utc::now());
     let state = tempfile::tempdir().expect("state dir");
     let mut ledger = Ledger::open(state.path()).expect("ledger");
 
@@ -419,6 +417,10 @@ async fn a_project_without_crawled_artifacts_is_emptied_and_warned_about_once() 
         &format!("ghcr.io/acme/mirror/cinc:{}", protected_artifact.tag()),
     );
     seed_incident(&mut ledger, &protected_artifact);
+    // The listed tag is the one `protection` derives from the publication, so
+    // the incident alone would protect this version.
+    let wanted_version = mock.seed_version("mirror/cinc", &["19.4.46"], Utc::now());
+    let protected = mock.seed_version("mirror/cinc", &[&protected_artifact.tag()], Utc::now());
     let wanted = Wanted {
         tags: ["19.4.46".to_string()].into_iter().collect(),
         digests: Default::default(),
@@ -525,6 +527,91 @@ async fn a_403_aborts_the_project_and_leaves_the_budget_unspent() {
         1,
         "{}",
         warnings()
+    );
+}
+
+#[tokio::test]
+async fn a_registry_403_abandons_the_project_and_leaves_the_budget_unspent() {
+    let _log = log_guard().await;
+    let mock = mock_registry().await;
+    let state = tempfile::tempdir().expect("state dir");
+    let ledger = Ledger::open(state.path()).expect("ledger");
+    mock.store_manifest(&repo(PROJECT), "19.4.46-debian-13-amd64", b"first");
+    mock.store_manifest(&repo(PROJECT), "19.4.45-debian-13-amd64", b"second");
+    mock.store_manifest(&repo(PROJECT), "19.4.44-debian-13-amd64", b"third");
+    mock.store_manifest(&repo("cinc-auditor"), "4.18.100-debian-13-amd64", b"other");
+    mock.deny_deletes(&repo(PROJECT));
+
+    let ctx = registry_context(state.path(), ledger, &mock);
+    let report = prune(
+        &ctx,
+        &[PROJECT, "cinc-auditor"],
+        &Wanted::default(),
+        Opts::default(),
+    )
+    .await;
+
+    assert_eq!(report.failed, 1, "{report:?}");
+    assert_eq!(report.pruned, 1, "the other project still deletes");
+    assert_eq!(report.exit_code, EXIT_PARTIAL);
+    assert_eq!(mock.delete_count(), 1);
+    assert_eq!(
+        mock.delete_attempts(),
+        2,
+        "one refused request for the denied project, one delete elsewhere"
+    );
+    let denied_prefix = format!("/v2/{}/manifests/", repo(PROJECT));
+    let denied_attempts = mock
+        .request_log()
+        .iter()
+        .filter(|(method, path)| method == "DELETE" && path.starts_with(&denied_prefix))
+        .count();
+    assert_eq!(
+        denied_attempts, 1,
+        "the denied project stops after its first reference"
+    );
+    assert!(
+        mock.manifest(&repo(PROJECT), "19.4.45-debian-13-amd64")
+            .is_some(),
+        "the denied tail is left behind"
+    );
+    assert!(mock
+        .manifest(&repo("cinc-auditor"), "4.18.100-debian-13-amd64")
+        .is_none());
+    assert_eq!(
+        warnings().matches("abandoning the project").count(),
+        1,
+        "{}",
+        warnings()
+    );
+}
+
+#[tokio::test]
+async fn a_failed_delete_spends_its_budget_slot() {
+    let mock = mock_registry().await;
+    let state = tempfile::tempdir().expect("state dir");
+    let ledger = Ledger::open(state.path()).expect("ledger");
+    mock.store_manifest(&repo(PROJECT), "19.4.46-debian-13-amd64", b"first");
+    mock.store_manifest(&repo(PROJECT), "19.4.45-debian-13-amd64", b"second");
+    mock.store_manifest(&repo(PROJECT), "19.4.44-debian-13-amd64", b"third");
+    mock.fail_all_deletes_with(422);
+
+    let ctx = registry_context(state.path(), ledger, &mock);
+    let report = prune(
+        &ctx,
+        &[PROJECT],
+        &Wanted::default(),
+        Opts::default().budget(1),
+    )
+    .await;
+
+    assert_eq!(report.failed, 1, "{report:?}");
+    assert_eq!(report.pruned, 0, "{report:?}");
+    assert_eq!(report.deferred, 2, "the tail of the spent slot waits");
+    assert_eq!(
+        mock.delete_attempts(),
+        1,
+        "the budget caps the attempts, so the failure does not retry"
     );
 }
 

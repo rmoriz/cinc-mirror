@@ -14,9 +14,9 @@
 //! arrived and how they were split. Counters make wire behaviour visible:
 //! number of `PATCH` requests, token requests, upload starts, manifest writes
 //! and manifest deletes. [`MockRegistry::answer_405`] refuses every manifest
-//! delete and [`MockRegistry::fail_deletes_with`] refuses the next one with an
-//! arbitrary status. The server binds `127.0.0.1:0`, so tests never leave the
-//! machine.
+//! delete, [`MockRegistry::deny_deletes`] answers `403` for one repository and
+//! [`MockRegistry::fail_deletes_with`] refuses the next one with an arbitrary
+//! status. The server binds `127.0.0.1:0`, so tests never leave the machine.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
@@ -84,8 +84,11 @@ pub struct MockState {
     manifest_puts: AtomicUsize,
     manifest_put_failures: AtomicUsize,
     manifest_deletes: AtomicUsize,
+    manifest_delete_attempts: AtomicUsize,
     answer_405: AtomicUsize,
     fail_deletes: AtomicU16,
+    fail_all_deletes: AtomicU16,
+    denied_repos: Mutex<HashSet<String>>,
     blob_heads: AtomicUsize,
     stall_patch: AtomicU64,
     stall_patch_body: AtomicU64,
@@ -115,8 +118,11 @@ impl MockState {
             manifest_puts: AtomicUsize::new(0),
             manifest_put_failures: AtomicUsize::new(0),
             manifest_deletes: AtomicUsize::new(0),
+            manifest_delete_attempts: AtomicUsize::new(0),
             answer_405: AtomicUsize::new(0),
             fail_deletes: AtomicU16::new(0),
+            fail_all_deletes: AtomicU16::new(0),
+            denied_repos: Mutex::new(HashSet::new()),
             blob_heads: AtomicUsize::new(0),
             stall_patch: AtomicU64::new(0),
             stall_patch_body: AtomicU64::new(0),
@@ -511,10 +517,21 @@ fn manifest_response(
 }
 
 fn delete_manifest(state: &Arc<MockState>, repo: &str, reference: &str) -> Response {
+    state
+        .manifest_delete_attempts
+        .fetch_add(1, Ordering::SeqCst);
     if state.answer_405.load(Ordering::SeqCst) != 0 {
         return (StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED").into_response();
     }
+    if lock(&state.denied_repos).contains(repo) {
+        return (StatusCode::FORBIDDEN, "denied").into_response();
+    }
     if let Some(status) = take_delete_failure(&state.fail_deletes) {
+        return (status, "injected delete failure").into_response();
+    }
+    let always = state.fail_all_deletes.load(Ordering::SeqCst);
+    if always != 0 {
+        let status = StatusCode::from_u16(always).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         return (status, "injected delete failure").into_response();
     }
 
@@ -758,6 +775,21 @@ impl MockRegistry {
     /// Answer the next manifest `DELETE` with `status`, then accept again.
     pub fn fail_deletes_with(&self, status: u16) {
         self.state.fail_deletes.store(status, Ordering::SeqCst);
+    }
+
+    /// Answer every manifest `DELETE` with `status`.
+    pub fn fail_all_deletes_with(&self, status: u16) {
+        self.state.fail_all_deletes.store(status, Ordering::SeqCst);
+    }
+
+    /// Answer every manifest `DELETE` below `repo` with `403 FORBIDDEN`.
+    pub fn deny_deletes(&self, repo: &str) {
+        lock(&self.state.denied_repos).insert(repo.to_string());
+    }
+
+    /// Number of manifest `DELETE` requests seen, successful or not.
+    pub fn delete_attempts(&self) -> usize {
+        self.state.manifest_delete_attempts.load(Ordering::SeqCst)
     }
 
     /// Accept a bearer token the test invents, for a pre-issued token.

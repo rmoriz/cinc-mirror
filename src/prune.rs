@@ -317,8 +317,9 @@ pub struct Pass<'a> {
     pub sweep_orphans: bool,
     /// Report the deletions without performing them.
     pub dry_run: bool,
-    /// Deletions allowed per target; `0` deletes nothing and leaves the whole
-    /// plan deferred.
+    /// Deletion attempts allowed per target; `0` deletes nothing and leaves the
+    /// whole plan deferred. A refused or already gone reference refunds its
+    /// attempt, a failed one spends it.
     pub budget: usize,
     /// Event sequence of the run; `None` appends nothing.
     pub seq: Option<&'a Seq>,
@@ -332,7 +333,8 @@ pub struct PruneReport {
     /// References or projects that failed; an unsupported target never bumps
     /// it and only lands in [`PruneReport::targets_skipped`].
     pub failed: usize,
-    /// References the budget or a failed listing left for a later run.
+    /// References left for a later run: the budget, a failed listing, a denied
+    /// delete and the tail of an abandoned project.
     pub deferred: usize,
     /// Targets whose backend cannot delete; they are left alone.
     pub targets_skipped: Vec<String>,
@@ -735,13 +737,12 @@ async fn prune_target(
                         target = target.name.as_str(),
                         project = slots[index].project.as_str(),
                         reason,
-                        "packages api denied; abandoning the project"
+                        "delete denied; abandoning the project"
                     );
                     slots[index].dead = true;
                 }
                 Deleted::Failed(_) => {
                     report.failed += 1;
-                    budget += 1;
                 }
             }
         }
@@ -910,19 +911,9 @@ async fn delete_one(
                 Ok(None) => Deleted::Missing,
                 Ok(Some(digest)) => match registry.delete_manifest(repo, &digest).await {
                     Ok(()) => Deleted::Pruned(digest),
-                    Err(error) => match oci_failure(&error) {
-                        ListFailure::Unsupported => Deleted::Unsupported,
-                        ListFailure::Denied(reason) | ListFailure::Failed(reason) => {
-                            Deleted::Failed(reason)
-                        }
-                    },
+                    Err(error) => oci_delete_failure(&error),
                 },
-                Err(error) => match oci_failure(&error) {
-                    ListFailure::Unsupported => Deleted::Unsupported,
-                    ListFailure::Denied(reason) | ListFailure::Failed(reason) => {
-                        Deleted::Failed(reason)
-                    }
-                },
+                Err(error) => oci_delete_failure(&error),
             }
         }
         Backend::Packages { .. } => {
@@ -1003,7 +994,19 @@ fn display_reference(registry: &str, repo: &str, reference: &RemoteReference) ->
 fn oci_failure(error: &OciError) -> ListFailure {
     match error {
         OciError::Status { status: 405, .. } => ListFailure::Unsupported,
+        OciError::Status { status: 403, .. } => {
+            ListFailure::Denied(redact_secrets(&error.to_string()))
+        }
         other => ListFailure::Failed(redact_secrets(&other.to_string())),
+    }
+}
+
+/// Classify a registry error of one delete attempt.
+fn oci_delete_failure(error: &OciError) -> Deleted {
+    match oci_failure(error) {
+        ListFailure::Unsupported => Deleted::Unsupported,
+        ListFailure::Denied(reason) => Deleted::Denied(reason),
+        ListFailure::Failed(reason) => Deleted::Failed(reason),
     }
 }
 
@@ -1035,7 +1038,7 @@ fn note_list_failure(
         ListFailure::Denied(reason) => {
             warn!(
                 target = target.name.as_str(),
-                project, reason, "packages api denied; abandoning the project"
+                project, reason, "list denied; abandoning the project"
             );
             report.failed += 1;
             false
