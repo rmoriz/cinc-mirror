@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>How cinc-mirror ships a verified package</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{--paper:#f5f5f5;--ink:#2d3142;--muted:#4f5d75;--soft:#5a6580;--accent:#bf4520;--accent-tint:rgba(191,69,32,.08);--rule:rgba(45,49,66,.12);--label-rule:rgba(45,49,66,.20);--lane:rgba(45,49,66,.018);--node:#fff;--node-stroke:rgba(45,49,66,.25);--chip:rgba(45,49,66,.12);--dot:rgba(45,49,66,.10);--db:#5e7a9b;--ls:#7c8f6f;--wb:#6e6479;--sans:'Geist',system-ui,sans-serif;--serif:'Instrument Serif',serif;--mono:'Geist Mono',ui-monospace,monospace}
+    body{font-family:var(--sans);background:var(--paper);color:var(--ink);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:3rem 2rem}
+    .frame{max-width:1300px;width:100%}
+    .eyebrow{font:500 .75rem var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--muted);margin-bottom:.6rem}
+    h1{font:400 clamp(1.8rem,2.4vw + 1rem,2.5rem)/1.15 var(--serif);letter-spacing:-.02em;margin-bottom:.75rem}
+    .standfirst{font:400 .95rem/1.55 var(--sans);color:var(--muted);max-width:66ch;margin-bottom:2rem}
+    .diagram-container{width:100%;overflow-x:auto}
+    svg{width:100%;min-width:1220px;display:block}
+    @media print{.diagram-container{overflow-x:visible}svg{min-width:0}}
+    svg text{font-family:var(--sans)}
+    .mono{font-family:var(--mono)}
+    .lane{fill:var(--lane)}
+    .rule{stroke:var(--rule)}
+    .label-rule{stroke:var(--label-rule)}
+    .actor{fill:var(--muted);font:500 11px var(--mono);letter-spacing:.08em}
+    .step-label{fill:var(--muted);font:500 9px var(--mono);letter-spacing:.12em}
+    .step-chip{fill:var(--chip)}
+    .step-num{fill:var(--ink);font:600 10px var(--mono)}
+    .connector{fill:none;stroke:var(--muted);stroke-width:1.2}
+    .connector.focal{stroke:var(--accent);stroke-width:1.6}
+    .connector.trigger{stroke-dasharray:6,5}
+    .node-mask{fill:var(--paper)}
+    .node{fill:var(--node);stroke:var(--node-stroke)}
+    .node.focal{fill:var(--accent-tint);stroke:var(--accent);stroke-width:1.6}
+    .role{fill:rgba(45,49,66,.10)}
+    .role.focal{fill:rgba(191,69,32,.25)}
+    .role-text{fill:var(--ink);font:600 9px var(--mono)}
+    .role-text.focal{fill:var(--accent)}
+    .node-title{fill:var(--ink);font:600 16px var(--sans)}
+    .node-sub{fill:var(--muted);font:11px var(--mono)}
+    .node-tool{fill:var(--soft);font:11px var(--mono)}
+    .data-text{fill:white;font:700 7px var(--mono)}
+    .legend-key{fill:var(--muted);font:500 9px var(--mono);letter-spacing:.12em}
+    .legend-text{fill:var(--muted);font:11px var(--sans)}
+    .arrow-label{fill:var(--soft);font:400 11px var(--mono);letter-spacing:.06em}
+    .colophon{font:400 .78rem var(--mono);color:var(--muted);letter-spacing:.04em;margin-top:1.5rem}
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Process · Diagram Design</p>
+    <h1>How cinc-mirror ships a verified package</h1>
+    <p class="standfirst">GitHub Actions runs the mirror every six hours. Every artifact passes one gate — the published SHA-256 — before any byte reaches GHCR or rsync; the ledger decides what is left to do, and verify, repair and incident acks re-enter at classify.</p>
+
+    <div class="diagram-container">
+      <svg viewBox="0 0 1220 740" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="cinc-mirror-workflow-title cinc-mirror-workflow-desc">
+        <title id="cinc-mirror-workflow-title">How cinc-mirror ships a verified package</title>
+        <desc id="cinc-mirror-workflow-desc">Swimlane process showing upstream metadata crawled under policy, classified against the ledger, downloaded and hash-verified, published to GHCR or rsync, and recorded in the ledger, with hash mismatches branching to an immutable incident until a human acknowledges it.</desc>
+        <defs>
+          <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse"><circle cx="11" cy="11" r="0.8" fill="var(--dot)"/></pattern>
+          <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><polygon points="0 0,10 4,0 8" fill="var(--muted)"/></marker>
+          <marker id="arrow-accent" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><polygon points="0 0,10 4,0 8" fill="var(--accent)"/></marker>
+          <marker id="arrow-sm" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="var(--muted)"/></marker>
+        </defs>
+
+        <rect width="1220" height="740" fill="var(--paper)"/>
+        <rect width="1220" height="740" fill="url(#dots)" opacity=".55"/>
+        <rect class="lane" x="200" y="184" width="1020" height="136"/>
+        <rect class="lane" x="200" y="456" width="1020" height="136"/>
+        <g class="rule" stroke-width=".8"><line x1="0" y1="48" x2="1220" y2="48"/><line x1="0" y1="184" x2="1220" y2="184"/><line x1="0" y1="320" x2="1220" y2="320"/><line x1="0" y1="456" x2="1220" y2="456"/><line x1="0" y1="592" x2="1220" y2="592"/></g>
+        <line class="label-rule" x1="200" y1="48" x2="200" y2="592"/>
+
+        <g class="actor" text-anchor="middle">
+          <text x="100" y="120">UPSTREAM</text>
+          <text x="100" y="249">LOCAL STATE</text><text x="100" y="265">LEDGER</text>
+          <text x="100" y="385">MIRROR</text><text x="100" y="401">RUN</text>
+          <text x="100" y="521">TARGETS</text><text x="100" y="537">PUBLIC</text>
+        </g>
+
+        <g text-anchor="middle">
+          <rect class="step-chip" x="280" y="12" width="20" height="20" rx="10"/><text class="step-num" x="290" y="26">1</text><text class="step-label" x="290" y="40">CRAWL</text>
+          <rect class="step-chip" x="476" y="12" width="20" height="20" rx="10"/><text class="step-num" x="486" y="26">2</text><text class="step-label" x="486" y="40">CLASSIFY</text>
+          <rect x="672" y="12" width="20" height="20" rx="10" fill="rgba(191,69,32,.20)"/><text x="682" y="26" fill="var(--accent)" font-size="10" font-weight="600" class="mono">3</text><text x="682" y="40" fill="var(--accent)" font-size="9" font-weight="500" letter-spacing=".12em" class="mono">VERIFY</text>
+          <rect class="step-chip" x="868" y="12" width="20" height="20" rx="10"/><text class="step-num" x="878" y="26">4</text><text class="step-label" x="878" y="40">PUBLISH</text>
+          <rect class="step-chip" x="1064" y="12" width="20" height="20" rx="10"/><text class="step-num" x="1074" y="26">5</text><text class="step-label" x="1074" y="40">TRACK</text>
+        </g>
+
+        <!-- Connectors: right exit, r=12 orthogonal bend, top/bottom entry; same-column joins run straight. -->
+        <path class="connector" d="M300 176 V336" marker-end="url(#arrow)"/>
+        <line class="connector" x1="390" y1="392" x2="406" y2="392" marker-end="url(#arrow)"/>
+        <line class="connector focal" x1="586" y1="392" x2="602" y2="392" marker-end="url(#arrow-accent)"/>
+        <path class="connector focal" d="M782 256 H846 Q858 256 858 268 V336" marker-end="url(#arrow-accent)"/>
+        <path class="connector focal" d="M692 336 V312" marker-end="url(#arrow-accent)"/>
+        <path class="connector focal" d="M692 448 V472" marker-end="url(#arrow-accent)"/>
+        <path class="connector trigger" d="M782 528 H906 Q918 528 918 516 V448" marker-end="url(#arrow-sm)"/>
+        <path class="connector" d="M978 456 H1042 Q1054 456 1054 468 V472" marker-end="url(#arrow)"/>
+        <path class="connector" d="M978 396 H1042 Q1054 396 1054 384 V312" marker-end="url(#arrow)"/>
+        <path class="connector" d="M1114 472 V312" marker-end="url(#arrow)"/>
+
+        <!-- Arrow label, masked, 8px above its segment -->
+        <rect x="790" y="502" width="92" height="18" rx="2" fill="var(--paper)"/>
+        <text class="arrow-label" x="836" y="515" text-anchor="middle">ACK REPUBLISH</text>
+
+        <g text-anchor="middle">
+          <!-- 1 · upstream -->
+          <g><rect class="node-mask" x="210" y="64" width="180" height="112" rx="8"/><rect class="node" x="210" y="64" width="180" height="112" rx="8"/><rect class="role" x="218" y="72" width="30" height="16" rx="3"/><text class="role-text" x="233" y="83">SRC</text><text class="node-title" x="300" y="112">Upstream listing</text><text class="node-sub" x="300" y="134">metadata → listing</text><text class="node-tool" x="300" y="150">downloads.cinc.sh</text><rect x="218" y="156" width="24" height="12" rx="3" fill="var(--ls)"/><text class="data-text" x="230" y="165">LS</text></g>
+
+          <!-- 2 · crawl under policy -->
+          <g><rect class="node-mask" x="210" y="336" width="180" height="112" rx="8"/><rect class="node" x="210" y="336" width="180" height="112" rx="8"/><rect class="role" x="218" y="344" width="30" height="16" rx="3"/><text class="role-text" x="233" y="355">RUN</text><text class="node-title" x="300" y="384">Crawl + policy</text><text class="node-sub" x="300" y="406">platform · ver · arch</text><text class="node-tool" x="300" y="422">mirror.ci.toml</text><rect x="218" y="428" width="24" height="12" rx="3" fill="var(--ls)"/><text class="data-text" x="230" y="437">LS</text><rect x="348" y="428" width="24" height="12" rx="3" fill="var(--ls)"/><text class="data-text" x="360" y="437">LS</text></g>
+
+          <!-- 3 · classify against the ledger -->
+          <g><rect class="node-mask" x="406" y="336" width="180" height="112" rx="8"/><rect x="406" y="336" width="180" height="112" rx="8" fill="rgba(90,125,154,.06)" stroke="rgba(90,125,154,.35)"/><rect x="414" y="344" width="30" height="16" rx="3" fill="rgba(90,125,154,.18)"/><text class="role-text" x="429" y="355" fill="#5a7d9a">RUN</text><text class="node-title" x="496" y="384" fill="#5a7d9a">Classify queue</text><text class="node-sub" x="496" y="406">new · retry · satisfied</text><text class="node-tool" x="496" y="422">published set</text><rect x="414" y="428" width="24" height="12" rx="3" fill="var(--ls)"/><text class="data-text" x="426" y="437">LS</text><rect x="544" y="428" width="24" height="12" rx="3" fill="var(--ls)"/><text class="data-text" x="556" y="437">LS</text></g>
+
+          <!-- 4 · the gate -->
+          <g><rect class="node-mask" x="602" y="336" width="180" height="112" rx="8"/><rect class="node focal" x="602" y="336" width="180" height="112" rx="8"/><rect class="role focal" x="610" y="344" width="30" height="16" rx="3"/><text class="role-text focal" x="625" y="355">RUN</text><text class="node-title" x="692" y="384">Download + verify</text><text class="node-sub" x="692" y="406">sha256 + size gate</text><text class="node-tool" x="692" y="422">ftp → ftps → https</text><rect x="610" y="428" width="24" height="12" rx="3" fill="var(--ls)"/><text class="data-text" x="622" y="437">LS</text><rect x="740" y="428" width="24" height="12" rx="3" fill="var(--db)"/><text class="data-text" x="752" y="437">DB</text></g>
+
+          <!-- 5 · local blob store -->
+          <g><rect class="node-mask" x="602" y="200" width="180" height="112" rx="8"/><rect class="node" x="602" y="200" width="180" height="112" rx="8"/><rect class="role" x="610" y="208" width="30" height="16" rx="3"/><text class="role-text" x="625" y="219">LED</text><text class="node-title" x="692" y="248">Blob store</text><text class="node-sub" x="692" y="270">sha256-addressed</text><text class="node-tool" x="692" y="286">state_dir/partial</text><rect x="610" y="292" width="24" height="12" rx="3" fill="var(--db)"/><text class="data-text" x="622" y="301">DB</text><rect x="740" y="292" width="24" height="12" rx="3" fill="var(--db)"/><text class="data-text" x="752" y="301">DB</text></g>
+
+          <!-- 6 · publish fan-out -->
+          <g><rect class="node-mask" x="798" y="336" width="180" height="112" rx="8"/><rect x="798" y="336" width="180" height="112" rx="8" fill="rgba(122,140,71,.06)" stroke="rgba(122,140,71,.35)"/><rect x="806" y="344" width="30" height="16" rx="3" fill="rgba(122,140,71,.18)"/><text class="role-text" x="821" y="355" fill="#7a8c47">RUN</text><text class="node-title" x="888" y="384" fill="#7a8c47">Publish fan-out</text><text class="node-sub" x="888" y="406">skip if published</text><text class="node-tool" x="888" y="422">upload semaphore</text><rect x="806" y="428" width="24" height="12" rx="3" fill="var(--db)"/><text class="data-text" x="818" y="437">DB</text><rect x="936" y="428" width="24" height="12" rx="3" fill="var(--wb)"/><text class="data-text" x="948" y="437">WB</text></g>
+
+          <!-- 7 · incident -->
+          <g><rect class="node-mask" x="602" y="472" width="180" height="112" rx="8"/><rect x="602" y="472" width="180" height="112" rx="8" fill="rgba(184,84,80,.06)" stroke="rgba(184,84,80,.35)"/><rect x="610" y="480" width="30" height="16" rx="3" fill="rgba(184,84,80,.18)"/><text class="role-text" x="625" y="491" fill="#b85450">DST</text><text class="node-title" x="692" y="520" fill="#b85450">Incident</text><text class="node-sub" x="692" y="542">old bytes stay</text><text class="node-tool" x="692" y="558">GitHub issue</text><rect x="610" y="564" width="24" height="12" rx="3" fill="var(--wb)"/><text class="data-text" x="622" y="573">WB</text><rect x="740" y="564" width="24" height="12" rx="3" fill="var(--wb)"/><text class="data-text" x="752" y="573">WB</text></g>
+
+          <!-- 8 · registry / rsync -->
+          <g><rect class="node-mask" x="994" y="472" width="180" height="112" rx="8"/><rect class="node" x="994" y="472" width="180" height="112" rx="8"/><rect class="role" x="1002" y="480" width="30" height="16" rx="3"/><text class="role-text" x="1017" y="491">DST</text><text class="node-title" x="1084" y="520">GHCR · rsync</text><text class="node-sub" x="1084" y="542">mirror ref + files</text><text class="node-tool" x="1084" y="558">ghcr.io / ssh</text><rect x="1002" y="564" width="24" height="12" rx="3" fill="var(--wb)"/><text class="data-text" x="1014" y="573">WB</text><rect x="1132" y="564" width="24" height="12" rx="3" fill="var(--wb)"/><text class="data-text" x="1144" y="573">WB</text></g>
+
+          <!-- 9 · ledger record -->
+          <g><rect class="node-mask" x="994" y="200" width="180" height="112" rx="8"/><rect class="node" x="994" y="200" width="180" height="112" rx="8"/><rect class="role" x="1002" y="208" width="30" height="16" rx="3"/><text class="role-text" x="1017" y="219">LED</text><text class="node-title" x="1084" y="248">Ledger run file</text><text class="node-sub" x="1084" y="270">commit · push · verify</text><text class="node-tool" x="1084" y="286">branch: ledger</text><rect x="1002" y="292" width="24" height="12" rx="3" fill="var(--wb)"/><text class="data-text" x="1014" y="301">WB</text></g>
+        </g>
+
+        <!-- Four-row key: steps, payload types, concerns, flow -->
+        <text class="legend-key" x="204" y="616">STEPS</text>
+        <g text-anchor="middle"><rect class="step-chip" x="280" y="604" width="20" height="20" rx="10"/><text class="step-num" x="290" y="618">1</text><text class="legend-text" x="318" y="618" text-anchor="start">CRAWL</text><rect class="step-chip" x="430" y="604" width="20" height="20" rx="10"/><text class="step-num" x="440" y="618">2</text><text class="legend-text" x="468" y="618" text-anchor="start">CLASSIFY</text><rect x="580" y="604" width="20" height="20" rx="10" fill="rgba(191,69,32,.20)"/><text x="590" y="618" fill="var(--accent)" font-size="10" class="mono">3</text><text x="618" y="618" fill="var(--accent)" font-size="11" text-anchor="start">VERIFY</text><rect class="step-chip" x="730" y="604" width="20" height="20" rx="10"/><text class="step-num" x="740" y="618">4</text><text class="legend-text" x="768" y="618" text-anchor="start">PUBLISH</text><rect class="step-chip" x="880" y="604" width="20" height="20" rx="10"/><text class="step-num" x="890" y="618">5</text><text class="legend-text" x="918" y="618" text-anchor="start">TRACK</text></g>
+
+        <text class="legend-key" x="204" y="642">DATA TYPE</text>
+        <rect x="280" y="630" width="24" height="12" rx="3" fill="var(--ls)"/><text class="legend-text" x="316" y="642">LS · listing</text>
+        <rect x="420" y="630" width="24" height="12" rx="3" fill="var(--db)"/><text class="legend-text" x="456" y="642">DB · blob</text>
+        <rect x="560" y="630" width="24" height="12" rx="3" fill="var(--wb)"/><text class="legend-text" x="596" y="642">WB · published ref</text>
+        <text class="legend-key" x="860" y="642">LEFT IN · RIGHT OUT</text>
+
+        <text class="legend-key" x="204" y="668">CONCERN</text>
+        <rect x="280" y="659" width="12" height="12" rx="2" fill="rgba(191,69,32,.25)" stroke="var(--accent)" stroke-width="1"/><text class="legend-text" x="300" y="668">focal · verify gate</text>
+        <rect x="450" y="659" width="12" height="12" rx="2" fill="rgba(90,125,154,.18)" stroke="#5a7d9a" stroke-width="1"/><text class="legend-text" x="470" y="668">quality gate</text>
+        <rect x="580" y="659" width="12" height="12" rx="2" fill="rgba(122,140,71,.18)" stroke="#7a8c47" stroke-width="1"/><text class="legend-text" x="600" y="668">publication</text>
+        <rect x="700" y="659" width="12" height="12" rx="2" fill="rgba(184,84,80,.18)" stroke="#b85450" stroke-width="1"/><text class="legend-text" x="720" y="668">immutability</text>
+
+        <text class="legend-key" x="204" y="694">FLOW</text>
+        <line x1="280" y1="690" x2="328" y2="690" stroke="var(--accent)" stroke-width="1.6" marker-end="url(#arrow-accent)"/><text class="legend-text" x="340" y="694">through the gate</text>
+        <line x1="480" y1="690" x2="528" y2="690" stroke="var(--muted)" stroke-width="1.2" marker-end="url(#arrow)"/><text class="legend-text" x="540" y="694">hand-off</text>
+        <line x1="620" y1="690" x2="668" y2="690" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="6,5" marker-end="url(#arrow-sm)"/><text class="legend-text" x="680" y="694">human ack</text>
+      </svg>
+    </div>
+    <p class="colophon">cinc-mirror · crawl → verify → publish → ledger · exit 3 on a new incident, exit 4 on a held lease</p>
+  </div>
+</body>
+</html>
