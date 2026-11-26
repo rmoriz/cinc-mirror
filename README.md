@@ -24,6 +24,26 @@ This project is neither affiliated nor approved by Progress Chef and/or the Cinc
 
 ## Usage/Installation
 
+### Docker example for the impatient
+
+Try it in a throwaway container — nothing on your host changes, everything dies
+with `--rm`:
+
+```bash
+docker run --rm -it debian bash -lc '
+  set -o pipefail
+  apt-get update &&
+  apt-get install -y curl &&
+  curl -sSL https://cinc-mirror.github.io/install.sh | bash -s -- -P cinc-auditor
+  exec bash
+'
+```
+
+Inside the container you are root, so no `sudo`; `exec bash` keeps the shell open
+after the install so you can run `cinc-auditor version`. Swap `-P cinc-auditor`
+for any other product from the table below. Note that Debian's `bash -lc` starts
+in `/`, so carry on with `cd /root` if you want a writable home.
+
 The installers from https://github.com/cinc-mirror/cinc-mirror.github.io replace
 https://omnitruck.cinc.sh/install.sh and https://omnitruck.cinc.sh/install.ps1:
 metadata still comes from cinc.sh, only the packages come from ghcr.io. In the
