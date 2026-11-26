@@ -78,6 +78,18 @@ remote = "origin"
 # [incident]
 # ignore_arch_collisions = ["omnibus-toolchain"]
 
+# Retention. Off by default; a run only deletes when `prune` is on. Everything
+# the policies still select is kept, everything else in the crawled scope is
+# removed. `delete = "auto"` uses the GitHub Packages API on ghcr.io and the
+# registry API elsewhere; `api_base` is the packages path only and
+# `max_deletions` caps deletions per target and run (the rest waits for the
+# next run).
+# [retention]
+# prune = false
+# delete = "auto"
+# api_base = "https://api.github.com"
+# max_deletions = 2000
+
 [[targets]]
 name = "ghcr"
 kind = "oci"

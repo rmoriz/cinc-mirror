@@ -55,12 +55,14 @@ pub fn redact_secrets(text: &str) -> String {
 
 /// Whether an environment variable's value is a credential.
 ///
-/// The mirror hands `RSYNC_PASSWORD` (the rsync daemon password) and
-/// `CINC_MIRROR_<TARGET>_PASSWORD` (basic-auth registry credentials) to child
-/// processes and libraries, so a diagnostic that quotes one must not echo it
-/// back.
+/// The mirror hands `RSYNC_PASSWORD` (the rsync daemon password),
+/// `CINC_MIRROR_<TARGET>_PASSWORD` (basic-auth registry credentials) and
+/// `CINC_MIRROR_GHCR_API_TOKEN` (the packages delete token) to child processes
+/// and libraries, so a diagnostic that quotes one must not echo it back.
 fn is_secret_env(name: &str) -> bool {
-    TOKEN_ENV.contains(&name) || (name.starts_with("CINC_MIRROR_") && name.ends_with("_PASSWORD"))
+    TOKEN_ENV.contains(&name)
+        || (name.starts_with("CINC_MIRROR_")
+            && (name.ends_with("_PASSWORD") || name.ends_with("_TOKEN")))
 }
 
 /// Replace the value of every `Authorization` header occurrence.
@@ -332,19 +334,22 @@ mod tests {
     }
 
     #[test]
-    fn password_environment_names_are_recognised() {
+    fn credential_environment_names_are_recognised() {
         for name in [
             "GHCR_TOKEN",
             "GITHUB_TOKEN",
             "RSYNC_PASSWORD",
             "CINC_MIRROR_GHCR_PASSWORD",
+            "CINC_MIRROR_GHCR_TOKEN",
+            "CINC_MIRROR_GHCR_API_TOKEN",
+            "CINC_MIRROR_TOKEN",
             "CINC_MIRROR_BACKUP_RSYNC_PASSWORD",
         ] {
             assert!(super::is_secret_env(name), "`{name}` must be redacted");
         }
         for name in [
             "CINC_MIRROR_GHCR_USER",
-            "CINC_MIRROR_GHCR_TOKEN",
+            "CINC_MIRROR_GHCR_API_BASE",
             "XRSYNC_PASSWORD",
             "HOME",
         ] {

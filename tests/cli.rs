@@ -14,7 +14,9 @@ use std::time::Duration;
 use assert_cmd::Command;
 use chrono::Utc;
 use cinc_mirror::artifact::Artifact;
+use cinc_mirror::cli::Cli;
 use cinc_mirror::ledger::{Event, EventKind, Lease, Ledger, LedgerStore};
+use clap::Parser;
 use common::mirror::package_artifact;
 use predicates::prelude::*;
 use serde_json::json;
@@ -210,6 +212,11 @@ fn zero_byte_limit_is_a_usage_error() {
         .assert()
         .code(64)
         .stderr(predicate::str::contains("greater than zero"));
+}
+
+#[test]
+fn mirror_accepts_prune() {
+    assert!(Cli::try_parse_from(["cinc-mirror", "mirror", "--prune"]).is_ok());
 }
 
 #[test]

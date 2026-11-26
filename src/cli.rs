@@ -226,6 +226,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub gc_after: bool,
 
+    /// Prune every publication the policy no longer selects (default: `[retention] prune`)
+    #[arg(long)]
+    pub prune: bool,
+
     /// Report what would happen without downloading or publishing
     #[arg(long)]
     pub dry_run: bool,

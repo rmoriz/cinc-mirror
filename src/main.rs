@@ -625,6 +625,10 @@ fn print_config(path: Option<&Path>, config: &Config) {
     );
     println!("metadata_transport: {}", config.metadata_transport);
     println!(
+        "retention: prune {}, delete {}, max_deletions {}",
+        config.retention.prune, config.retention.delete, config.retention.max_deletions
+    );
+    println!(
         "ledger: {} branch {}",
         redact_url(&config.ledger.remote),
         config.ledger.branch

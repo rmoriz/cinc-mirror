@@ -334,6 +334,24 @@ run retries it, but neither the download nor the incident counts as a failure:
 the issue carries the report, and the run stays green until upstream heals or an
 operator acknowledges it.
 
+## Retention
+
+`[retention]` decides whether a run deletes publications the policies no longer
+select. It is off by default; `mirror --prune` turns it on for one run. The
+fields are not reachable through `--set`.
+
+```toml
+[retention]
+prune = false                       # the CI workflow sets true
+delete = "auto"                     # auto | registry | packages-api
+api_base = "https://api.github.com" # packages path only
+max_deletions = 2000                # per target and run; the rest waits
+```
+
+`auto` resolves to the GitHub Packages API on `ghcr.io`, which rejects deletes on
+the distribution API with `405`, and to the registry API elsewhere.
+`CINC_MIRROR_GHCR_API_TOKEN` authorizes the packages path.
+
 ## CI and scheduled backfill
 
 `.github/workflows/ci.yml` runs formatting, clippy, tests on Linux and macOS, the

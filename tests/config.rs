@@ -5,7 +5,8 @@ use std::path::Path;
 
 use assert_cmd::Command;
 use cinc_mirror::config::{
-    Config, ConfigError, ProjectPolicy, Selection, TargetAuth, TargetKind, TransportKind,
+    Config, ConfigError, DeleteMode, ProjectPolicy, Selection, TargetAuth, TargetKind,
+    TransportKind,
 };
 use predicates::prelude::*;
 
@@ -387,7 +388,7 @@ fn rejects_zero_concurrency() {
     assert!(
         matches!(
             error,
-            ConfigError::ZeroConcurrency {
+            ConfigError::ZeroValue {
                 field: "concurrency"
             }
         ),
@@ -681,6 +682,47 @@ fn unknown_toml_key_is_an_error() {
 }
 
 #[test]
+fn retention_defaults_are_off_and_automatic() {
+    let config = Config::default();
+    assert!(!config.retention.prune);
+    assert_eq!(config.retention.delete, DeleteMode::Auto);
+    assert_eq!(config.retention.max_deletions, 2000);
+    assert_eq!(config.retention.api_base, "https://api.github.com");
+}
+
+#[test]
+fn retention_delete_modes_parse_and_serialise() {
+    for (text, mode) in [
+        ("auto", DeleteMode::Auto),
+        ("registry", DeleteMode::Registry),
+        ("packages-api", DeleteMode::PackagesApi),
+    ] {
+        let config = validated(&format!("[retention]\ndelete = \"{text}\"\n"))
+            .expect("the delete mode must parse");
+        assert_eq!(config.retention.delete, mode);
+        assert_eq!(mode.to_string(), text);
+        let serialised = serde_json::to_value(&config.retention).expect("retention must serialise");
+        assert_eq!(serialised["delete"], text);
+    }
+}
+
+#[test]
+fn retention_rejects_an_unknown_delete_mode_and_a_zero_budget() {
+    for body in [
+        "[retention]\ndelete = \"s3\"\n",
+        "[retention]\nkeep_days = 3\n",
+    ] {
+        assert!(load_str(body).is_err(), "`{body}` must be rejected");
+    }
+    for body in [
+        "[retention]\nmax_deletions = 0\n",
+        "[retention]\napi_base = \" \"\n",
+    ] {
+        assert!(validated(body).is_err(), "`{body}` must be rejected");
+    }
+}
+
+#[test]
 fn missing_config_file_is_a_read_error() {
     let error = Config::load(Some(Path::new("definitely-not-a-config.toml")))
         .expect_err("an explicit config path must exist");
@@ -757,6 +799,9 @@ fn config_check_prints_policies_without_secrets() {
         .success()
         .stdout(predicate::str::contains("cinc-stable"))
         .stdout(predicate::str::contains("ghcr"))
+        .stdout(predicate::str::contains(
+            "retention: prune false, delete auto, max_deletions 2000",
+        ))
         .stdout(predicate::str::contains("password").not())
         .stdout(predicate::str::contains("token").not());
 }
