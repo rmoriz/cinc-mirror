@@ -18,7 +18,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # Tests must never reach the CINC upstream or a registry. Any opt-in live
+  # Tests must never reach the Cinc upstream or a registry. Any opt-in live
   # test is gated on this being explicitly unset.
   CINC_MIRROR_NO_LIVE: "1"
 

@@ -1,4 +1,4 @@
-//! CINC package mirror.
+//! Cinc package mirror.
 //!
 //! The crate is split into a library so the crawling, verification and
 //! publication logic stays testable without a process boundary. The binary is

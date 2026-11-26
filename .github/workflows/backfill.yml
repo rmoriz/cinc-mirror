@@ -1,6 +1,6 @@
 name: backfill
 
-# The only workflow that talks to the live CINC upstream and GHCR. It runs a
+# The only workflow that talks to the live Cinc upstream and GHCR. It runs a
 # bounded slice of `mirror` every six hours. `mirror` resumes through the
 # ledger: artifacts whose rows are already published everywhere are classified
 # as satisfied, so the next scheduled run simply continues with what is left.

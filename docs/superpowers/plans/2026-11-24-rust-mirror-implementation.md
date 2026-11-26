@@ -1,8 +1,8 @@
-# CINC Mirror Rust Rewrite — Implementation Plan
+# Cinc Mirror Rust Rewrite — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a single Rust binary that crawls the CINC download tree, verifies every artifact, keeps an append-only hash ledger in git, and fans the bytes out to OCI and rsync targets with resume, repair, backfill and an estimate mode.
+**Goal:** Build a single Rust binary that crawls the Cinc download tree, verifies every artifact, keeps an append-only hash ledger in git, and fans the bytes out to OCI and rsync targets with resume, repair, backfill and an estimate mode.
 
 **Architecture:** One `cinc-mirror` crate with a thin CLI and a library of focused modules. The source layer reads index and metadata over HTTPS and payloads over an FTP/FTPS/HTTPS ladder. A content-addressed store verifies SHA-256 before a `Target` trait fan-out writes to every enabled target. All state is append-only events materialised into SQLite; events are committed as NDJSON on an orphan `ledger` branch.
 

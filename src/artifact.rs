@@ -15,7 +15,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-/// Manifest `artifactType` for a mirrored CINC package.
+/// Manifest `artifactType` for a mirrored Cinc package.
 pub const ARTIFACT_TYPE: &str = "application/vnd.cinc.package.v1+json";
 
 /// Maximum tag length accepted by the published namespace.

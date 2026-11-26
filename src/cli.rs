@@ -28,7 +28,7 @@ pub enum LogFormat {
 #[command(
     name = "cinc-mirror",
     version,
-    about = "Mirror CINC packages to OCI registries and rsync targets"
+    about = "Mirror Cinc packages to OCI registries and rsync targets"
 )]
 pub struct Cli {
     #[command(subcommand)]

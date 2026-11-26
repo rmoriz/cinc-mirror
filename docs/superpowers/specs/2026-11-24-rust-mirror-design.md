@@ -1,4 +1,4 @@
-# CINC Mirror — Rust rewrite
+# Cinc Mirror — Rust rewrite
 
 Status: design for review
 Branch: `rust`
@@ -8,7 +8,7 @@ Plan: [2026-11-24-rust-mirror-implementation.md](../plans/2026-11-24-rust-mirror
 ## Intent
 
 Replace the shell + `oras` + `curl` mirror with one Rust binary that crawls the
-CINC download tree, verifies every artifact against its published hash, stores
+Cinc download tree, verifies every artifact against its published hash, stores
 it, and publishes it to one or more targets. The mirror must be able to do a
 complete first pass, recover from interruption, and backfill newly published
 packages incrementally, while treating "same path, different hash" as a

@@ -1,6 +1,6 @@
 //! Version parsing, ordering and segment glob matching.
 //!
-//! CINC versions are dot-separated numeric segments such as `19.4.46`.
+//! Cinc versions are dot-separated numeric segments such as `19.4.46`.
 //! Ordering is numeric per segment, so `19.10.0` sorts above `19.4.46`, and
 //! missing trailing segments compare as zero, so `19.4` equals `19.4.0`.
 //!

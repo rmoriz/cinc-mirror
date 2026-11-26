@@ -3,7 +3,7 @@ name = "cinc-mirror"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
-description = "Mirror CINC packages from upstream to OCI registries and rsync targets"
+description = "Mirror Cinc packages from upstream to OCI registries and rsync targets"
 license = "Apache-2.0"
 
 [dependencies]

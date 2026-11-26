@@ -1,8 +1,8 @@
-# CINC Mirror
+# Cinc Mirror
 
-![CINC Mirror Logo](cinc-mirror.jpeg)
+![Cinc Mirror Logo](cinc-mirror.jpeg)
 
-This repository mirrors CINC packages. Metadata is read from downloads.cinc.sh /
+This repository mirrors Cinc packages. Metadata is read from downloads.cinc.sh /
 ftp.osuosl.org; every package is verified against its published hash and then
 published to GHCR as OCI artifacts, and optionally to an rsync target — roughly
 what Homebrew does for bottles.
@@ -18,7 +18,7 @@ This project is neither affiliated nor approved by Progress Chef and/or the Cinc
 
 ## Usage/Installation
 
-To install the mirrored CINC packages, run the following command:
+To install the mirrored Cinc packages, run the following command:
 
 ```bash
 curl -sSL https://cinc-mirror.github.io/install.sh | bash
@@ -28,7 +28,7 @@ The actual script is at https://github.com/cinc-mirror/cinc-mirror.github.io and
 
 **Requirements:**
 - curl must be installed
-- Only supports CINC 18+
+- Only supports Cinc 18+
 - The installer is POSIX-only; Windows has no installer here. The mirrored
   `.msi` packages can be downloaded and installed directly (see
   [Windows](#windows)).
@@ -208,7 +208,7 @@ publishes them, plus `SHA256SUMS`, on the rolling `latest` GitHub Release,
 replacing the previous build so only the current commit's binaries remain.
 
 `.github/workflows/backfill.yml` is the only workflow that talks to the live
-CINC upstream and GHCR. It runs every six hours, and can also be started with
+Cinc upstream and GHCR. It runs every six hours, and can also be started with
 `workflow_dispatch` or a `backfill` `repository_dispatch`. Each run is bounded
 (`--limit 50 --limit-bytes 8GiB`); `mirror` resumes through the ledger — the
 next run classifies already-published artifacts as satisfied and continues
