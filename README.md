@@ -75,7 +75,8 @@ A commented, ready-to-edit example that publishes to GHCR is in
 
 Every project is an explicit policy. Version bounds, globs, platforms, platform
 versions and architectures narrow what is crawled; `all_versions` and `"*"`
-widen it.
+widen it. A single major glob such as `versions = ["19.*"]` follows the current
+major line only and is what every policy in `mirror.ci.toml` uses.
 
 ```toml
 state_dir = "~/.local/state/cinc-mirror"
