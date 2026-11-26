@@ -434,7 +434,7 @@ async fn crawl_orders_versions_platforms_arches_and_basenames() {
     let source = source_over(fixture());
     let config = config(std::path::Path::new("/tmp"), "0");
 
-    let outcome = crawl(&source, &scope(&config).policies[0])
+    let outcome = crawl(&source, &scope(&config).policies[0], &HashMap::new())
         .await
         .expect("crawl");
 
@@ -509,7 +509,7 @@ async fn crawl_uses_the_metadata_platform_version_for_alias_directories() {
     let source = source_over(FakeUpstream::new(pages, HashMap::new()));
     let config = config(std::path::Path::new("/tmp"), "0");
 
-    let outcome = crawl(&source, &scope(&config).policies[0])
+    let outcome = crawl(&source, &scope(&config).policies[0], &HashMap::new())
         .await
         .expect("alias directories must not fail the crawl");
 
@@ -565,7 +565,7 @@ async fn crawl_keeps_the_directory_when_metadata_platform_version_is_not_a_compo
     let source = source_over(FakeUpstream::new(pages, HashMap::new()));
     let config = config(std::path::Path::new("/tmp"), "0");
 
-    let outcome = crawl(&source, &scope(&config).policies[0])
+    let outcome = crawl(&source, &scope(&config).policies[0], &HashMap::new())
         .await
         .expect("an unusable metadata platform_version must not fail the crawl");
 
@@ -612,7 +612,7 @@ async fn crawl_skips_metadata_whose_platform_contradicts_the_directory() {
     let source = source_over(FakeUpstream::new(pages, HashMap::new()));
     let config = config(std::path::Path::new("/tmp"), "0");
 
-    let outcome = crawl(&source, &scope(&config).policies[0])
+    let outcome = crawl(&source, &scope(&config).policies[0], &HashMap::new())
         .await
         .expect("a misplaced artifact must not fail the crawl");
 
@@ -670,7 +670,7 @@ async fn crawl_reports_two_digests_under_one_tag_as_a_collision() {
 
     let source = source_over(FakeUpstream::new(pages, HashMap::new()));
     let config = config(std::path::Path::new("/tmp"), "0");
-    let outcome = crawl(&source, &scope(&config).policies[0])
+    let outcome = crawl(&source, &scope(&config).policies[0], &HashMap::new())
         .await
         .expect("a collision is collected, not an error");
 
@@ -761,6 +761,7 @@ async fn plan_reports_colliding_artifacts_and_keeps_both() {
         &config,
         &scope(&config),
         &HashSet::new(),
+        &HashMap::new(),
     )
     .await
     .expect("a collision does not fail the plan");
@@ -796,6 +797,80 @@ async fn plan_reports_colliding_artifacts_and_keeps_both() {
     assert!(plan.to_json().contains("\"collision_details\""));
 }
 
+#[tokio::test]
+async fn plan_reuses_a_tag_the_ledger_already_qualified() {
+    // The crawl ranks the aarch64 build as the tag owner, but the ledger says an
+    // earlier run had moved the arm64 build to a qualified tag. Reapplying the
+    // stored reference leaves the tags distinct, so the pair needs no new
+    // collision report while both builds stay in the plan.
+    let mut pages = HashMap::new();
+    let js = |name: &str| format!("files/stable/cinc/19.4.46/debian/13/{name}.metadata.json");
+    pages.insert("files/stable/cinc/".to_string(), listing(&["19.4.46/"]));
+    pages.insert(
+        "files/stable/cinc/19.4.46/".to_string(),
+        listing(&["debian/"]),
+    );
+    pages.insert(
+        "files/stable/cinc/19.4.46/debian/".to_string(),
+        listing(&["13/"]),
+    );
+    pages.insert(
+        "files/stable/cinc/19.4.46/debian/13/".to_string(),
+        listing(&[
+            "cinc_19.4.46-1_aarch64.deb",
+            "cinc_19.4.46-1_aarch64.deb.metadata.json",
+            "cinc_19.4.46-1_arm64.deb",
+            "cinc_19.4.46-1_arm64.deb.metadata.json",
+        ]),
+    );
+    pages.insert(
+        js("cinc_19.4.46-1_aarch64.deb"),
+        metadata(
+            "cinc_19.4.46-1_aarch64.deb",
+            SHA_B,
+            "debian",
+            "13",
+            "19.4.46",
+            "aarch64",
+        ),
+    );
+    pages.insert(
+        js("cinc_19.4.46-1_arm64.deb"),
+        metadata(
+            "cinc_19.4.46-1_arm64.deb",
+            SHA_C,
+            "debian",
+            "13",
+            "19.4.46",
+            "arm64",
+        ),
+    );
+
+    let state_dir = tempfile::tempdir().expect("temp dir");
+    let config = config(state_dir.path(), "0");
+    let overrides = HashMap::from([(
+        format!("stable/cinc/19.4.46/debian/13/arm64/{SHA_C}"),
+        format!("19.4.46-debian-13-arm64-{}", &SHA_C[..12]),
+    )]);
+
+    let plan = build(
+        &source_over(FakeUpstream::new(pages, HashMap::new())),
+        &config,
+        &scope(&config),
+        &HashSet::new(),
+        &overrides,
+    )
+    .await
+    .expect("plan");
+
+    assert_eq!(plan.artifacts, 2, "both builds stay in the plan");
+    assert_eq!(plan.skipped, 0);
+    assert_eq!(
+        plan.collisions, 0,
+        "the stored reference already separates the pair, so no new report"
+    );
+}
+
 // Plan totals and grouping ---------------------------------------------------
 
 #[tokio::test]
@@ -805,9 +880,15 @@ async fn totals_group_by_project_platform_arch_and_target() {
     let source = source_over(fixture());
     let satisfied = HashSet::new();
 
-    let plan = build(&source, &config, &scope(&config), &satisfied)
-        .await
-        .expect("plan");
+    let plan = build(
+        &source,
+        &config,
+        &scope(&config),
+        &satisfied,
+        &HashMap::new(),
+    )
+    .await
+    .expect("plan");
 
     assert_eq!(plan.artifacts, 4);
     assert_eq!(plan.total_bytes, 10_000);
@@ -866,9 +947,15 @@ async fn satisfied_artifacts_count_separately() {
     let satisfied: HashSet<String> =
         HashSet::from([format!("stable/cinc/19.3.14/debian/12/amd64/{SHA_C}")]);
 
-    let plan = build(&source, &config, &scope(&config), &satisfied)
-        .await
-        .expect("plan");
+    let plan = build(
+        &source,
+        &config,
+        &scope(&config),
+        &satisfied,
+        &HashMap::new(),
+    )
+    .await
+    .expect("plan");
 
     assert_eq!(plan.artifacts, 4);
     assert_eq!(plan.total_bytes, 10_000);
@@ -891,9 +978,15 @@ async fn reports_whether_the_state_dir_has_room_without_failing() {
     let config = config(state_dir.path(), "0");
     let source = source_over(fixture());
 
-    let plan = build(&source, &config, &scope(&config), &HashSet::new())
-        .await
-        .expect("plan");
+    let plan = build(
+        &source,
+        &config,
+        &scope(&config),
+        &HashSet::new(),
+        &HashMap::new(),
+    )
+    .await
+    .expect("plan");
 
     assert_eq!(plan.space.required_bytes, 10_000);
     assert!(
@@ -908,6 +1001,7 @@ async fn reports_whether_the_state_dir_has_room_without_failing() {
         &config,
         &scope(&config),
         &HashSet::new(),
+        &HashMap::new(),
     )
     .await
     .expect("a plan larger than the disk still succeeds");
@@ -923,9 +1017,15 @@ async fn projected_duration_uses_max_bandwidth() {
     let limited = config(state_dir.path(), "10MiB/s");
     let source = source_over(single_artifact(100 * 1024 * 1024));
 
-    let plan = build(&source, &limited, &scope(&limited), &HashSet::new())
-        .await
-        .expect("plan");
+    let plan = build(
+        &source,
+        &limited,
+        &scope(&limited),
+        &HashSet::new(),
+        &HashMap::new(),
+    )
+    .await
+    .expect("plan");
 
     assert_eq!(plan.total_bytes, 104_857_600);
     assert_eq!(plan.projected_seconds, Some(10), "100 MiB at 10 MiB/s");
@@ -936,6 +1036,7 @@ async fn projected_duration_uses_max_bandwidth() {
         &unlimited,
         &scope(&unlimited),
         &HashSet::new(),
+        &HashMap::new(),
     )
     .await
     .expect("plan");
@@ -950,9 +1051,15 @@ async fn json_embeds_effective_policy_and_is_stable() {
     let config = config(state_dir.path(), "0");
     let source = source_over(fixture());
 
-    let plan = build(&source, &config, &scope(&config), &HashSet::new())
-        .await
-        .expect("plan");
+    let plan = build(
+        &source,
+        &config,
+        &scope(&config),
+        &HashSet::new(),
+        &HashMap::new(),
+    )
+    .await
+    .expect("plan");
 
     let json = plan.to_json();
     assert_eq!(json, plan.to_json(), "serialisation must be repeatable");
@@ -1009,6 +1116,7 @@ async fn writes_the_plan_json_to_a_file() {
         &config,
         &scope(&config),
         &HashSet::new(),
+        &HashMap::new(),
     )
     .await
     .expect("plan");

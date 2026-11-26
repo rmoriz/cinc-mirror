@@ -978,10 +978,19 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
 async fn crawl_scope(
     ctx: &Ctx,
 ) -> Result<(BTreeMap<String, (usize, Artifact)>, Vec<TagCollision>), RunError> {
+    // A qualified tag is a publication reference the ledger already knows: the
+    // artifact was addressed under it by an earlier run. Handing the map to the
+    // crawl keeps a published artifact where it is instead of moving it onto the
+    // other member's bytes, and `verify` keeps checking the reference the mirror
+    // used.
+    let overrides = {
+        let ledger = ctx.ledger.lock().await;
+        ledger.tag_overrides()?
+    };
     let mut candidates = BTreeMap::new();
     let mut collisions = Vec::new();
     for (index, policy) in ctx.scope.policies.iter().enumerate() {
-        let outcome = crawl::crawl(&ctx.source, policy).await?;
+        let outcome = crawl::crawl(&ctx.source, policy, &overrides).await?;
         for artifact in outcome.artifacts {
             candidates
                 .entry(artifact.key())
@@ -989,29 +998,13 @@ async fn crawl_scope(
         }
         collisions.extend(outcome.collisions);
     }
-    // A qualified tag is a publication reference the ledger already knows: the
-    // artifact was addressed under it by an earlier run. Keep it, so a change in
-    // crawl order cannot move a published artifact between two references and
-    // `verify` keeps checking the one the mirror actually used.
-    {
-        let ledger = ctx.ledger.lock().await;
-        for (_, artifact) in candidates.values_mut() {
-            if artifact.tag_override.is_some() {
-                continue;
-            }
-            if let Some(row) = ledger.artifact(&artifact.key())? {
-                if let Some(existing) = row.artifact.tag_override {
-                    artifact.tag_override = Some(existing);
-                }
-            }
-        }
-    }
     // The per-policy crawl already qualified collisions it saw, but two
     // policies can still hand in artifacts that share a tag; qualify those too
     // and keep every artifact in the queue.
-    for collision in
-        crawl::collect_tag_collisions(candidates.values_mut().map(|(_, artifact)| artifact))
-    {
+    for collision in crawl::collect_tag_collisions(
+        candidates.values_mut().map(|(_, artifact)| artifact),
+        &overrides,
+    ) {
         collisions.push(collision);
     }
     Ok((candidates, crawl::dedup_collisions(collisions)))

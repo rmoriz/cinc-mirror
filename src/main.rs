@@ -989,11 +989,11 @@ async fn plan_command(base: &Config, args: PlanArgs, allow_unleased: bool) -> an
     let mut env = open_ledger(&config, allow_unleased)?;
     let source_config = SourceConfig::from_config(&config)?;
     let source = Source::new(&source_config)?;
-    let satisfied = {
+    let (satisfied, overrides) = {
         let ledger = env.ledger()?;
-        satisfied_keys(ledger, &config)?
+        (satisfied_keys(ledger, &config)?, ledger.tag_overrides()?)
     };
-    let estimate = plan::build(&source, &config, &scope, &satisfied).await?;
+    let estimate = plan::build(&source, &config, &scope, &satisfied, &overrides).await?;
 
     let run_id = new_run_id();
     let out = args

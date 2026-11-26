@@ -70,7 +70,7 @@ pub mod git;
 pub use files::{LedgerFilesError, LedgerStore, RUNS_DIR};
 pub use git::{Lease, LeaseError, LeaseHolder, LedgerGitError, LEASE_REF};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -749,7 +749,7 @@ impl Ledger {
         Ok(artifacts)
     }
 
-    /// Every artifact row, ordered by key.
+    /// Every artifact, ordered by key.
     ///
     /// # Errors
     ///
@@ -776,8 +776,28 @@ impl Ledger {
             .map_err(LedgerError::from)
     }
 
-    /// Every artifact, including rows superseded by a hash change, ordered by
-    /// key.
+    /// The digest-qualified tag of every artifact that has one, by key.
+    ///
+    /// A qualified tag is a publication reference the mirror already used; a
+    /// crawl keeps it instead of reintroducing the descriptive tag it was moved
+    /// away from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] when the query fails.
+    pub fn tag_overrides(&self) -> Result<HashMap<String, String>, LedgerError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT key, tag_override FROM artifacts WHERE tag_override IS NOT NULL")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+            .map_err(LedgerError::from)
+    }
+
+    /// Every artifact row, including rows superseded by a hash change, ordered
+    /// by key.
     ///
     /// Verification and repair work from the complete ledger, not from the
     /// policies of the current run: an artifact that today's policy no longer

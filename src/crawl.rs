@@ -25,7 +25,7 @@
 //! its digest, and the pair is reported as a [`TagCollision`] for the incident
 //! flow.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use thiserror::Error;
 
@@ -79,13 +79,21 @@ pub struct TagCollision {
 /// one is published under a digest-qualified tag, and the pair is reported in
 /// [`CrawlOutcome::collisions`].
 ///
+/// `overrides` holds the qualified tags the ledger already knows. They win over
+/// the crawl order, so a known pair cannot swap references just because the
+/// upstream listing ranks it differently today.
+///
 /// # Errors
 ///
 /// Returns [`CrawlError::List`] when a directory cannot be listed,
 /// [`CrawlError::Metadata`] when a metadata document cannot be fetched or
 /// parsed, and [`CrawlError::Artifact`] when the metadata contradicts the
 /// crawl context.
-pub async fn crawl(source: &Source, policy: &ResolvedPolicy) -> Result<CrawlOutcome, CrawlError> {
+pub async fn crawl(
+    source: &Source,
+    policy: &ResolvedPolicy,
+    overrides: &HashMap<String, String>,
+) -> Result<CrawlOutcome, CrawlError> {
     let mut outcome = CrawlOutcome::default();
     let mut keys = HashSet::new();
     let mut tags = BTreeMap::new();
@@ -138,6 +146,11 @@ pub async fn crawl(source: &Source, policy: &ResolvedPolicy) -> Result<CrawlOutc
                         continue;
                     }
                     let mut artifact = artifact;
+                    if artifact.tag_override.is_none() {
+                        if let Some(known) = overrides.get(&artifact.key()) {
+                            artifact.tag_override = Some(known.clone());
+                        }
+                    }
                     if let Some(collision) = record_tag(&mut tags, &mut artifact) {
                         outcome.collisions.push(collision);
                     }
@@ -156,12 +169,23 @@ pub async fn crawl(source: &Source, policy: &ResolvedPolicy) -> Result<CrawlOutc
 /// artifact that maps to a tag already held by different bytes is reported as
 /// the conflicting one and gets its digest appended to the tag. Callers keep
 /// both artifacts in the queue.
+///
+/// `overrides` holds the qualified tags the ledger already knows. A crawl can
+/// order a known pair the other way round; reusing the stored reference keeps
+/// the artifact where the mirror published it instead of moving it to the plain
+/// tag (and onto the other member's bytes) a second time.
 pub fn collect_tag_collisions<'a>(
     artifacts: impl IntoIterator<Item = &'a mut Artifact>,
+    overrides: &HashMap<String, String>,
 ) -> Vec<TagCollision> {
     let mut tags = BTreeMap::new();
     let mut collisions = Vec::new();
     for artifact in artifacts {
+        if artifact.tag_override.is_none() {
+            if let Some(known) = overrides.get(&artifact.key()) {
+                artifact.tag_override = Some(known.clone());
+            }
+        }
         if let Some(collision) = record_tag(&mut tags, artifact) {
             collisions.push(collision);
         }

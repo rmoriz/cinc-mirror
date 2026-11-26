@@ -162,12 +162,13 @@ pub async fn build(
     config: &Config,
     scope: &ResolvedScope,
     satisfied: &HashSet<String>,
+    overrides: &HashMap<String, String>,
 ) -> Result<Plan, PlanError> {
     let mut candidates: BTreeMap<String, Artifact> = BTreeMap::new();
     let mut collisions: Vec<TagCollision> = Vec::new();
     let mut skipped = 0;
     for policy in &scope.policies {
-        let outcome = crawl(source, policy).await?;
+        let outcome = crawl(source, policy, overrides).await?;
         skipped += outcome.skipped;
         for artifact in outcome.artifacts {
             candidates.entry(artifact.key()).or_insert(artifact);
@@ -176,8 +177,9 @@ pub async fn build(
     }
     // The same version number on two channels can produce one descriptive tag
     // with different bytes; qualify the later candidate and report the pair like
-    // a crawl collision. Both stay in the plan.
-    for collision in collect_tag_collisions(candidates.values_mut()) {
+    // a crawl collision. Both stay in the plan. Tags the ledger already
+    // qualified are reused, so the plan names the reference the run will use.
+    for collision in collect_tag_collisions(candidates.values_mut(), overrides) {
         collisions.push(collision);
     }
     let collisions = dedup_collisions(collisions);

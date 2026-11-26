@@ -1467,13 +1467,12 @@ async fn a_qualified_tag_from_the_ledger_survives_a_changed_crawl_order() {
     let summary = run(&ctx, RunOpts::default()).await.expect("run");
 
     let conflicting_artifact = artifact_of(&conflicting);
-    let conflicting_tag = format!(
-        "{}-{}",
-        conflicting_artifact.tag(),
-        &conflicting_artifact.sha256[..12]
-    );
     assert_eq!(summary.skipped, 0, "{summary:?}");
     assert_eq!(summary.published, 2, "{summary:?}");
+    assert_eq!(
+        summary.incidents_opened, 0,
+        "the pair is already separated: {summary:?}"
+    );
     assert_eq!(
         target.owner(&qualified),
         Some(kept_artifact.sha256.clone()),
@@ -1481,12 +1480,8 @@ async fn a_qualified_tag_from_the_ledger_survives_a_changed_crawl_order() {
     );
     assert_eq!(
         target.owner(&kept_artifact.tag()),
-        None,
-        "the plain tag is not taken a second time"
-    );
-    assert_eq!(
-        target.owner(&conflicting_tag),
-        Some(conflicting_artifact.sha256.clone())
+        Some(conflicting_artifact.sha256.clone()),
+        "the plain tag goes to the other build instead of a second copy"
     );
 }
 

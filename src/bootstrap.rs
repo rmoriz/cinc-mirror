@@ -224,11 +224,15 @@ pub async fn run(ctx: &Ctx) -> Result<BootstrapReport, BootstrapError> {
 /// A tag collision's latecomer keeps its digest-qualified tag, so its own
 /// reference is normally missing from the registry and is counted as skipped;
 /// `mirror` creates it later.
-async fn crawl_all(ctx: &Ctx) -> Result<Vec<Artifact>, CrawlError> {
+async fn crawl_all(ctx: &Ctx) -> Result<Vec<Artifact>, BootstrapError> {
+    let overrides = {
+        let ledger = ctx.ledger.lock().await;
+        ledger.tag_overrides()?
+    };
     let mut artifacts = Vec::new();
     let mut keys = HashSet::new();
     for policy in &ctx.scope.policies {
-        let outcome = crawl::crawl(&ctx.source, policy).await?;
+        let outcome = crawl::crawl(&ctx.source, policy, &overrides).await?;
         for artifact in outcome.artifacts {
             if keys.insert(artifact.key()) {
                 artifacts.push(artifact);
