@@ -1,0 +1,1 @@
+{"run_id":"ack-1795702597597523000-0","seq":1,"ts":"2026-11-26T14:16:37.597Z","kind":"incident_acked","detail":{"id":"tag_conflict-1c4a7b6ed6a393bd","note":"old and new digest are the same bytes; the first spelling carried the sha256: prefix and minted a false conflict. Issues were deleted in bulk, so the reference is gone; no republish needed."}}
