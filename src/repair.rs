@@ -7,7 +7,8 @@
 //! 1. every selected target is probed with [`Target::verify`]; only failing
 //!    publications take part in the repair, and a publication the ledger marks
 //!    `superseded` is skipped because its canonical reference was retired
-//!    deliberately;
+//!    deliberately; a `pruned` publication is skipped too, because the prune
+//!    deleted it on purpose, unless `--include-pruned` asks for it back;
 //! 2. the local blob is re-hashed. A corrupt blob is replaced; a missing blob
 //!    is refilled from upstream into the store's partial file and committed;
 //! 3. the verified bytes are re-published with [`Target::put`] to every failing
@@ -77,6 +78,9 @@ pub struct RepairOpts {
     pub projects: Option<Vec<String>>,
     /// Repair at most this many broken items (publications or local blobs).
     pub limit: Option<usize>,
+    /// Also restore publications a prune deleted (re-downloads and re-publishes
+    /// them).
+    pub include_pruned: bool,
 }
 
 /// What happened to one broken publication.
@@ -278,6 +282,11 @@ pub async fn run(ctx: &Ctx, opts: RepairOpts) -> Result<RepairReport, RepairErro
             .filter(|publication| publication.status == PublicationStatus::Superseded)
             .map(|publication| publication.target.as_str())
             .collect();
+        let pruned: HashSet<&str> = publications
+            .iter()
+            .filter(|publication| publication.status == PublicationStatus::Pruned)
+            .map(|publication| publication.target.as_str())
+            .collect();
 
         let mut broken: Vec<&Arc<dyn Target>> = Vec::new();
         for target in &targets {
@@ -287,6 +296,12 @@ pub async fn run(ctx: &Ctx, opts: RepairOpts) -> Result<RepairReport, RepairErro
             if superseded.contains(target.name()) {
                 // The canonical reference was retired by an acknowledged hash
                 // change; it is not broken, so it is neither reported nor fixed.
+                continue;
+            }
+            if !opts.include_pruned && pruned.contains(target.name()) {
+                // A prune deleted the reference on purpose, so it is not broken
+                // either; re-publishing it would undo the retention. The flag is
+                // the deliberate way back.
                 continue;
             }
             broken.push(target);

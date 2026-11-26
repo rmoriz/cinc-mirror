@@ -313,6 +313,11 @@ pub struct RepairArgs {
     #[arg(long = "limit", value_name = "N", value_parser = parse_positive)]
     pub limit: Option<usize>,
 
+    /// Also restore publications a prune deleted (re-downloads and re-publishes
+    /// them)
+    #[arg(long)]
+    pub include_pruned: bool,
+
     /// Print the report as JSON
     #[arg(long)]
     pub json: bool,
@@ -326,6 +331,7 @@ impl RepairArgs {
             targets: non_empty(&self.targets),
             projects: non_empty(&self.projects),
             limit: self.limit,
+            include_pruned: self.include_pruned,
         }
     }
 }

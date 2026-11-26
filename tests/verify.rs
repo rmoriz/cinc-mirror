@@ -220,6 +220,61 @@ async fn a_pending_artifact_is_not_a_remote_finding() {
 }
 
 #[tokio::test]
+async fn a_pruned_publication_is_not_a_verify_finding() {
+    let state = tempfile::tempdir().expect("state dir");
+    let mut ledger = Ledger::open(state.path()).expect("ledger");
+    let root = tempfile::tempdir().expect("rsync root");
+    let targets = TargetSet::from_targets(vec![Arc::new(rsync_target("rsync", root.path()))]);
+
+    let package = b"a package the retention prune deleted".to_vec();
+    let artifact = package_artifact(&package, "19.4.46");
+    publish(targets.all()[0].as_ref(), &artifact, &package).await;
+    seed_artifact(&mut ledger, &artifact, Some(package.len() as u64));
+    seed_published(&mut ledger, &artifact, "rsync", 1);
+
+    // The prune deleted the published files on the target.
+    let relpath = artifact.rsync_relpath();
+    std::fs::remove_file(root.path().join(&relpath)).expect("remove the package");
+    std::fs::remove_file(root.path().join(format!("{relpath}.sha256"))).expect("remove sidecar");
+    std::fs::remove_file(root.path().join(format!("{relpath}.metadata.json")))
+        .expect("remove metadata");
+
+    let ctx = context(state.path(), ledger, targets, source_with(Vec::new()));
+    ctx.ledger
+        .lock()
+        .await
+        .append(
+            &Event::new("prune-run".to_string(), 1, Utc::now(), EventKind::Pruned)
+                .with_artifact(artifact.key())
+                .with_target("rsync")
+                .with_detail(json!({
+                    "remote_ref": format!("rsync:{}", artifact.tag()),
+                    "remote_digest": artifact.sha256,
+                })),
+        )
+        .expect("record the prune");
+    let publication = ctx
+        .ledger
+        .lock()
+        .await
+        .publication(&artifact.key(), "rsync")
+        .expect("publication")
+        .expect("row");
+    assert_eq!(publication.status, PublicationStatus::Pruned);
+
+    let report = verify::run(&ctx, VerifyOpts::default())
+        .await
+        .expect("verify");
+
+    assert!(
+        report.is_clean(),
+        "a deliberately deleted reference is not a finding: {report}"
+    );
+    assert_eq!(report.publications_checked, 0, "{report}");
+    assert_eq!(report.exit_code(), 0);
+}
+
+#[tokio::test]
 async fn verify_ignores_current_policy_narrowing() {
     let state = tempfile::tempdir().expect("state dir");
     let mut ledger = Ledger::open(state.path()).expect("ledger");

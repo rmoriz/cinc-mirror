@@ -22,8 +22,9 @@ use cinc_mirror::store::Store;
 use cinc_mirror::targets::TargetSet;
 use cinc_mirror::verify::{self, FindingKind, VerifyOpts};
 use common::mirror::{
-    context, package_artifact, publish, rsync_target, seed_artifact, seed_published, sha256_hex,
-    source_with, store_blob, FakeTransport, RecordingTarget,
+    context, mock_registry, oci_target, package_artifact, publish, rsync_target, seed_artifact,
+    seed_published, sha256_hex, source_with, store_blob, FakeTransport, RecordingTarget, NAMESPACE,
+    PROJECT,
 };
 use serde_json::json;
 
@@ -65,6 +66,23 @@ async fn record_local_gc(ctx: &cinc_mirror::Ctx, artifact: &Artifact) {
                 .with_detail(json!({"sha256": artifact.sha256})),
         )
         .expect("record local_gc");
+}
+
+/// Record a prune that deleted the publication of `artifact` on `target`.
+async fn record_pruned(ctx: &cinc_mirror::Ctx, artifact: &Artifact, target: &str) {
+    ctx.ledger
+        .lock()
+        .await
+        .append(
+            &Event::new("prune-run".to_string(), 1, Utc::now(), EventKind::Pruned)
+                .with_artifact(artifact.key())
+                .with_target(target)
+                .with_detail(json!({
+                    "remote_ref": format!("{target}:{}", artifact.tag()),
+                    "remote_digest": artifact.sha256,
+                })),
+        )
+        .expect("record the prune");
 }
 
 /// Overwrite the stored blob with same-length garbage and return the garbage.
@@ -625,6 +643,86 @@ async fn repair_limit_stops_and_still_exits_two() {
         "exactly one artifact was re-published before the cap"
     );
     assert_eq!(transport.calls(), 0);
+}
+
+#[tokio::test]
+async fn repair_leaves_a_pruned_publication_alone() {
+    let state = tempfile::tempdir().expect("state dir");
+    let mut ledger = Ledger::open(state.path()).expect("ledger");
+    let mock = mock_registry().await;
+    let targets = TargetSet::from_targets(vec![Arc::new(oci_target(&mock, "oci"))]);
+
+    // The tag was published once, then deleted by a prune; the registry
+    // answers 404 for it now.
+    let package = b"a package the retention prune deleted".to_vec();
+    let artifact = package_artifact(&package, "19.4.46");
+    local_blob(&mut ledger, state.path(), &artifact, &package);
+    seed_published(&mut ledger, &artifact, "oci", 1);
+
+    let ctx = context(state.path(), ledger, targets, source_with(Vec::new()));
+    record_pruned(&ctx, &artifact, "oci").await;
+    assert!(
+        ctx.targets.all()[0].verify(&artifact).await.is_err(),
+        "the deleted tag does not verify"
+    );
+
+    let report = repair::run(&ctx, RepairOpts::default())
+        .await
+        .expect("repair");
+
+    assert_eq!(report.examined, 0, "{report}");
+    assert!(report.is_clean(), "{report}");
+    assert_eq!(report.exit_code(), 0);
+    assert_eq!(mock.manifest_put_count(), 0, "the tag is not re-published");
+    assert!(ctx.targets.all()[0].verify(&artifact).await.is_err());
+}
+
+#[tokio::test]
+async fn repair_republishes_a_pruned_publication_with_include_pruned() {
+    let state = tempfile::tempdir().expect("state dir");
+    let mut ledger = Ledger::open(state.path()).expect("ledger");
+    let mock = mock_registry().await;
+    let targets = TargetSet::from_targets(vec![Arc::new(oci_target(&mock, "oci"))]);
+    let repo = format!("{NAMESPACE}/{PROJECT}");
+
+    let package = b"a pruned package an operator asked back".to_vec();
+    let artifact = package_artifact(&package, "19.4.46");
+    local_blob(&mut ledger, state.path(), &artifact, &package);
+    seed_published(&mut ledger, &artifact, "oci", 1);
+
+    let ctx = context(state.path(), ledger, targets, source_with(Vec::new()));
+    record_pruned(&ctx, &artifact, "oci").await;
+    assert!(mock.manifest(&repo, &artifact.tag()).is_none());
+
+    let report = repair::run(
+        &ctx,
+        RepairOpts {
+            include_pruned: true,
+            ..RepairOpts::default()
+        },
+    )
+    .await
+    .expect("repair");
+
+    assert_eq!(report.examined, 1, "{report}");
+    assert_eq!(report.repaired, 1, "{report}");
+    assert_eq!(report.exit_code(), 0);
+    assert!(
+        mock.manifest(&repo, &artifact.tag()).is_some(),
+        "the deleted tag is published again"
+    );
+    ctx.targets.all()[0]
+        .verify(&artifact)
+        .await
+        .expect("the restored publication verifies");
+    let publication = ctx
+        .ledger
+        .lock()
+        .await
+        .publication(&artifact.key(), "oci")
+        .expect("publication")
+        .expect("row");
+    assert_eq!(publication.status, PublicationStatus::Published);
 }
 
 #[test]
