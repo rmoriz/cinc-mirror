@@ -239,9 +239,13 @@ configured bandwidth. `--limit-bytes` caps **download** bytes and uploads are ne
 that crosses the cap is finished, so overshoot is at most one artifact. The
 queue is ordered deterministically (`version` descending, then project, platform,
 arch) and satisfied/terminal rows are dropped before ordering, so a capped run
-always makes progress and the next run's prefix shrinks. `--order
-smallest-first|largest-first` changes this for size-driven passes. The chosen
-order and the cap are recorded in the run row.
+always makes progress and the next run's prefix shrinks. The ordered queue is
+then round-robined over the projects, one artifact per project per pass, so a
+run advances every project and a fresh release cannot wait behind the whole
+history of a project whose version numbers are higher; the order inside each
+project is untouched. `--order smallest-first|largest-first` changes the
+per-project order for size-driven passes. The chosen order and the cap are
+recorded in the run row.
 
 Plan always writes `plan-<run_id>.json` to the state dir (or `--out`), and
 `--record` also appends a plan event; the file embeds the resolved policy, so a

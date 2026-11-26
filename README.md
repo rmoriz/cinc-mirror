@@ -270,6 +270,11 @@ Because the ledger also persists the backfill cursor, an interrupted or bounded
 `backfill` run continues where it stopped on the next invocation; a plain
 `mirror` needs no cursor, because its rows already tell it what is satisfied.
 
+The queue is newest-version-first but round-robins the projects, so every run
+advances every project and a new release appears within the next run or two
+instead of waiting behind the complete history of a product with higher version
+numbers.
+
 ## Immutability policy
 
 A publication is immutable. If the same upstream path later presents a different

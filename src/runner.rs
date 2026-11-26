@@ -47,7 +47,7 @@
 //! writes nothing at all.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering as Atomic};
 use std::sync::Arc;
 
@@ -857,6 +857,7 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
     }
 
     queue.sort_by(|left, right| compare(left, right, opts.order));
+    let mut queue = interleave_projects(queue);
     if let Some(after) = opts.start_after.as_deref() {
         if let Some(index) = queue.iter().position(|item| item.artifact.key() == *after) {
             if index + 1 < queue.len() {
@@ -1171,6 +1172,44 @@ fn classify(snapshot: &Snapshot, artifact: &Artifact, targets: &[String]) -> Cla
     }
 }
 
+/// Spread the queue over the projects instead of draining one project's whole
+/// history before the next one starts.
+///
+/// Within a project the chosen order is untouched, so versions still run newest
+/// first; across projects the queue round-robins, one artifact per project per
+/// pass. A fresh release therefore appears within the next run or two instead of
+/// waiting behind every older artifact of a project with a higher version
+/// number. Buckets follow first appearance, which keeps the queue deterministic
+/// for a given candidate set.
+fn interleave_projects(queue: Vec<Queued>) -> Vec<Queued> {
+    let mut buckets: Vec<VecDeque<Queued>> = Vec::new();
+    for item in queue {
+        let project = item.artifact.project.as_str();
+        match buckets.iter_mut().find(|bucket| {
+            bucket
+                .front()
+                .is_some_and(|head| head.artifact.project == project)
+        }) {
+            Some(bucket) => bucket.push_back(item),
+            None => buckets.push(VecDeque::from([item])),
+        }
+    }
+
+    let mut interleaved = Vec::with_capacity(buckets.len() * 4);
+    loop {
+        let mut taken = false;
+        for bucket in &mut buckets {
+            if let Some(item) = bucket.pop_front() {
+                interleaved.push(item);
+                taken = true;
+            }
+        }
+        if !taken {
+            return interleaved;
+        }
+    }
+}
+
 fn compare(left: &Queued, right: &Queued, order: Order) -> Ordering {
     let by_size = match order {
         Order::VersionDesc => Ordering::Equal,
@@ -1411,6 +1450,26 @@ mod tests {
         }
     }
 
+    fn item_in(project: &str, version: &str, policy_index: usize) -> Queued {
+        let mut queued = item(version, None);
+        queued.artifact.project = project.to_string();
+        queued.policy_index = policy_index;
+        queued
+    }
+
+    fn sorted(queue: Vec<Queued>, order: Order) -> Vec<Queued> {
+        let mut queue = queue;
+        queue.sort_by(|left, right| compare(left, right, order));
+        queue
+    }
+
+    fn labels(queue: &[Queued]) -> Vec<String> {
+        queue
+            .iter()
+            .map(|queued| format!("{}/{}", queued.artifact.project, queued.artifact.version))
+            .collect()
+    }
+
     #[test]
     fn version_order_is_numeric_and_descending() {
         let mut queue = [
@@ -1424,6 +1483,62 @@ mod tests {
             .map(|queued| queued.artifact.version.as_str())
             .collect();
         assert_eq!(versions, vec!["19.10.0", "19.4.46", "19.3.14"]);
+    }
+
+    #[test]
+    fn projects_take_turns_and_each_stays_version_descending() {
+        // Without the round-robin, the whole 19.x line of `cinc` drains before
+        // the newest `cinc-auditor` is reached, so a fresh auditor release waits
+        // for hundreds of unrelated artifacts.
+        let queue = sorted(
+            vec![
+                item_in("cinc", "19.4.46", 0),
+                item_in("cinc", "19.3.14", 0),
+                item_in("cinc-auditor", "7.3.4", 1),
+                item_in("cinc-auditor", "7.0.95", 1),
+            ],
+            Order::VersionDesc,
+        );
+
+        assert_eq!(
+            labels(&interleave_projects(queue)),
+            vec![
+                "cinc/19.4.46",
+                "cinc-auditor/7.3.4",
+                "cinc/19.3.14",
+                "cinc-auditor/7.0.95",
+            ]
+        );
+    }
+
+    #[test]
+    fn interleaving_keeps_a_short_project_going_until_it_is_done() {
+        let queue = sorted(
+            vec![
+                item_in("cinc", "19.4.46", 0),
+                item_in("cinc", "19.3.14", 0),
+                item_in("omnibus-toolchain", "26.1.2", 2),
+            ],
+            Order::VersionDesc,
+        );
+
+        assert_eq!(
+            labels(&interleave_projects(queue)),
+            vec!["omnibus-toolchain/26.1.2", "cinc/19.4.46", "cinc/19.3.14",]
+        );
+    }
+
+    #[test]
+    fn a_single_project_keeps_its_order() {
+        let queue = sorted(
+            vec![item("19.4.46", None), item("19.3.14", None)],
+            Order::VersionDesc,
+        );
+
+        assert_eq!(
+            labels(&interleave_projects(queue)),
+            vec!["cinc/19.4.46", "cinc/19.3.14"]
+        );
     }
 
     #[test]
