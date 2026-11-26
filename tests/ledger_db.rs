@@ -314,6 +314,116 @@ fn pending_excludes_satisfied_and_superseded_rows() {
 }
 
 #[test]
+fn a_pruned_event_marks_an_existing_publication() {
+    let (_dir, mut ledger) = open();
+    let artifact = artifact("19.4.46", 'a');
+    let key = artifact.key();
+
+    ledger
+        .append(&seen("run-1", 1, &artifact, 1234))
+        .expect("artifact_seen");
+    ledger
+        .append(&published("run-1", 2, &artifact, "ghcr"))
+        .expect("published");
+    let before = ledger
+        .publication(&key, "ghcr")
+        .expect("publication query")
+        .expect("publication row");
+    assert!(before.remote_ref.is_some(), "the publish recorded a ref");
+
+    ledger
+        .append(&event(
+            "run-1",
+            3,
+            EventKind::Pruned,
+            Some(&key),
+            Some("ghcr"),
+            json!({
+                "remote_ref": format!("registry.example/{key}:tag"),
+                "remote_digest": artifact.sha256,
+            }),
+        ))
+        .expect("pruned");
+
+    let after = ledger
+        .publication(&key, "ghcr")
+        .expect("publication query")
+        .expect("publication row");
+    assert_eq!(after.status, PublicationStatus::Pruned);
+    assert_eq!(after.remote_ref, before.remote_ref, "the ref is kept");
+    assert_eq!(after.remote_digest, before.remote_digest);
+    assert_eq!(after.attempts, before.attempts);
+}
+
+#[test]
+fn a_pruned_event_for_an_unknown_artifact_changes_nothing() {
+    let (_dir, mut ledger) = open();
+
+    // A hand-created tag has no artifact row, so an upsert would trip the
+    // foreign key. Both the missing key and the unknown key must be no-ops.
+    ledger
+        .apply(&event(
+            "run-1",
+            1,
+            EventKind::Pruned,
+            None,
+            Some("ghcr"),
+            json!({
+                "remote_ref": "registry.example/hand-made:tag",
+                "remote_digest": null,
+            }),
+        ))
+        .expect("pruned without an artifact key");
+    ledger
+        .apply(&event(
+            "run-1",
+            2,
+            EventKind::Pruned,
+            Some("no/such/artifact"),
+            Some("ghcr"),
+            json!({
+                "remote_ref": "registry.example/gone:tag",
+                "remote_digest": null,
+            }),
+        ))
+        .expect("pruned for an unknown artifact");
+
+    assert!(ledger
+        .publications("ghcr")
+        .expect("publications")
+        .is_empty());
+}
+
+#[test]
+fn a_prune_failed_event_is_recorded_without_touching_a_row() {
+    let (_dir, mut ledger) = open();
+    let artifact = artifact("19.4.46", 'a');
+
+    ledger
+        .append(&seen("run-1", 1, &artifact, 1234))
+        .expect("artifact_seen");
+    ledger
+        .append(&event(
+            "run-1",
+            2,
+            EventKind::PruneFailed,
+            Some(&artifact.key()),
+            Some("ghcr"),
+            json!({
+                "remote_ref": format!("registry.example/{}:tag", artifact.key()),
+                "error": "denied",
+            }),
+        ))
+        .expect("prune_failed");
+
+    assert!(ledger
+        .publications("ghcr")
+        .expect("publications")
+        .is_empty());
+    assert_eq!(ledger.event_count().expect("event count"), 2);
+}
+
+#[test]
 fn hash_change_opens_single_incident_per_hash_pair() {
     let (_dir, mut ledger) = open();
     let old = artifact("19.4.46", 'a');
@@ -1176,6 +1286,8 @@ fn events_round_trip_with_snake_case_kind_and_millisecond_timestamps() {
         (EventKind::PublicationFailed, "publication_failed"),
         (EventKind::PublicationInterrupted, "publication_interrupted"),
         (EventKind::PublicationSuperseded, "publication_superseded"),
+        (EventKind::Pruned, "pruned"),
+        (EventKind::PruneFailed, "prune_failed"),
         (EventKind::HashChanged, "hash_changed"),
         (EventKind::IncidentOpened, "incident_opened"),
         (EventKind::IncidentAcked, "incident_acked"),

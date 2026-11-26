@@ -46,9 +46,14 @@
 //!   `cursor` object (`fingerprint`, `last_version`, `last_artifact_key`).
 //! - `plan_recorded`: as `run_started`, plus `summary`; the plan appears as a
 //!   run whose outcome is `planned`.
+//! - `pruned`: `remote_ref` and `remote_digest` (which may be null) of the
+//!   deleted copy. It only updates a publication row that already exists; for a
+//!   tag the ledger never recorded, or an event without an artifact key, it is
+//!   recorded but changes nothing.
+//! - `prune_failed`: `remote_ref` and `error`; the event itself is the record.
 //!
-//! `download_started` and `lease_taken_over` are audit events only.
-//! `publication_started` marks a target's publication as `uploading`; an
+//! `download_started`, `prune_failed` and `lease_taken_over` are audit events
+//! only. `publication_started` marks a target's publication as `uploading`; an
 //! `publication_interrupted` event makes the row pending again.
 //!
 //! # Local presence
@@ -146,6 +151,10 @@ pub enum EventKind {
     /// A publication this mirror cannot restore: the local blob is gone and
     /// upstream no longer serves it.
     PublicationUnrecoverable,
+    /// A target's copy was deleted because the policy no longer selects it.
+    Pruned,
+    /// Deleting a pruned copy from the target failed; the event is the record.
+    PruneFailed,
     /// The bytes behind a published artifact changed upstream.
     HashChanged,
     /// An incident was opened.
@@ -178,6 +187,8 @@ impl EventKind {
             Self::PublicationInterrupted => "publication_interrupted",
             Self::PublicationSuperseded => "publication_superseded",
             Self::PublicationUnrecoverable => "publication_unrecoverable",
+            Self::Pruned => "pruned",
+            Self::PruneFailed => "prune_failed",
             Self::HashChanged => "hash_changed",
             Self::IncidentOpened => "incident_opened",
             Self::IncidentAcked => "incident_acked",
@@ -211,6 +222,8 @@ impl FromStr for EventKind {
             "publication_interrupted" => Self::PublicationInterrupted,
             "publication_superseded" => Self::PublicationSuperseded,
             "publication_unrecoverable" => Self::PublicationUnrecoverable,
+            "pruned" => Self::Pruned,
+            "prune_failed" => Self::PruneFailed,
             "hash_changed" => Self::HashChanged,
             "incident_opened" => Self::IncidentOpened,
             "incident_acked" => Self::IncidentAcked,
@@ -251,6 +264,8 @@ pub enum PublicationStatus {
     /// The publication cannot be restored: the local blob is gone and upstream
     /// no longer serves the bytes. An incident records it for a human.
     Unrecoverable,
+    /// The publication was deleted because the policy no longer selects it.
+    Pruned,
 }
 
 impl PublicationStatus {
@@ -266,6 +281,7 @@ impl PublicationStatus {
             Self::Published => "published",
             Self::Superseded => "superseded",
             Self::Unrecoverable => "unrecoverable",
+            Self::Pruned => "pruned",
         }
     }
 }
@@ -289,6 +305,7 @@ impl FromStr for PublicationStatus {
             "published" => Self::Published,
             "superseded" => Self::Superseded,
             "unrecoverable" => Self::Unrecoverable,
+            "pruned" => Self::Pruned,
             other => {
                 return Err(LedgerError::PublicationStatus {
                     value: other.to_string(),
@@ -1169,6 +1186,8 @@ fn reduce(conn: &Connection, event: &Event) -> Result<(), LedgerError> {
             reduce_publication_attempt(conn, event, PublicationStatus::Unrecoverable)?;
             reduce_unrecoverable_incident(conn, event)
         }
+        EventKind::Pruned => reduce_pruned(conn, event),
+        EventKind::PruneFailed => reduce_prune_failed(event),
         EventKind::HashChanged => reduce_hash_changed(conn, event),
         EventKind::IncidentOpened => reduce_incident_opened(conn, event),
         EventKind::IncidentAcked => reduce_incident_acked(conn, event),
@@ -1312,6 +1331,32 @@ fn reduce_publication_superseded(conn: &Connection, event: &Event) -> Result<(),
          WHERE artifact_key = ?2 AND target = ?3",
         params![ts_text(event.ts), key, target],
     )?;
+    Ok(())
+}
+
+/// Mark the publication of an artifact to a target as pruned.
+///
+/// The event only updates a row that already exists. A pruned tag can predate
+/// the ledger or be created by hand, so the artifact row may be missing; an
+/// upsert would trip the `publications.artifact_key` foreign key and abort the
+/// whole replay. `remote_ref`, `remote_digest` and `attempts` stay as the last
+/// attempt left them.
+fn reduce_pruned(conn: &Connection, event: &Event) -> Result<(), LedgerError> {
+    let Some(key) = event.artifact_key.as_deref() else {
+        return Ok(());
+    };
+    let target = require_target(event)?;
+    conn.execute(
+        "UPDATE publications
+         SET status = 'pruned', updated_at = ?1
+         WHERE artifact_key = ?2 AND target = ?3",
+        params![ts_text(event.ts), key, target],
+    )?;
+    Ok(())
+}
+
+/// `prune_failed` is an audit event: it writes no row, the event is the record.
+fn reduce_prune_failed(_event: &Event) -> Result<(), LedgerError> {
     Ok(())
 }
 
