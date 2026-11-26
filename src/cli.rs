@@ -183,6 +183,9 @@ pub enum PlanGrouping {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum OrderChoice {
     /// Version descending, then the policy and path components.
+    ///
+    /// Projects are interleaved, so a run advances every project instead of
+    /// draining one project's whole history first.
     #[default]
     VersionDesc,
     /// Smallest known size first.
