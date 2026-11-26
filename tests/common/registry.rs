@@ -7,12 +7,14 @@
 //! - `HEAD`/`GET /v2/<name>/blobs/<digest>`,
 //! - `POST /v2/<name>/blobs/uploads/` plus `PATCH` chunks and a final `PUT`
 //!   with `?digest=`,
-//! - `PUT`/`GET`/`HEAD /v2/<name>/manifests/<reference>`.
+//! - `PUT`/`GET`/`HEAD`/`DELETE /v2/<name>/manifests/<reference>`,
+//! - `GET /v2/<name>/tags/list` with `n`/`last` paging.
 //!
 //! State lives in a `HashMap`, so a test can assert the exact bytes that
 //! arrived and how they were split. Counters make wire behaviour visible:
-//! number of `PATCH` requests, token requests, upload starts and manifest
-//! writes. The server binds `127.0.0.1:0`, so tests never leave the machine.
+//! number of `PATCH` requests, token requests, upload starts, manifest writes
+//! and manifest deletes. The server binds `127.0.0.1:0`, so tests never leave
+//! the machine.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -79,6 +81,8 @@ pub struct MockState {
     token_basic_headers: Mutex<Vec<Option<String>>>,
     manifest_puts: AtomicUsize,
     manifest_put_failures: AtomicUsize,
+    manifest_deletes: AtomicUsize,
+    answer_405: AtomicUsize,
     blob_heads: AtomicUsize,
     stall_patch: AtomicU64,
     stall_patch_body: AtomicU64,
@@ -107,6 +111,8 @@ impl MockState {
             token_basic_headers: Mutex::new(Vec::new()),
             manifest_puts: AtomicUsize::new(0),
             manifest_put_failures: AtomicUsize::new(0),
+            manifest_deletes: AtomicUsize::new(0),
+            answer_405: AtomicUsize::new(0),
             blob_heads: AtomicUsize::new(0),
             stall_patch: AtomicU64::new(0),
             stall_patch_body: AtomicU64::new(0),
@@ -273,6 +279,16 @@ async fn v2(
         return blob_response(&state, repo, digest, &method);
     }
 
+    if let Some(repo) = rest.strip_suffix("/tags/list") {
+        if method != Method::GET {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        if let Err(response) = authorize(&state, &headers, repo, "pull") {
+            return response;
+        }
+        return tags_list(&state, repo, uri.query());
+    }
+
     if let Some((repo, reference)) = rest.rsplit_once("/manifests/") {
         if let Err(response) = authorize(&state, &headers, repo, "pull,push") {
             return response;
@@ -281,6 +297,7 @@ async fn v2(
             Method::PUT => put_manifest(&state, repo, reference, &body),
             Method::GET => manifest_response(&state, repo, reference, false),
             Method::HEAD => manifest_response(&state, repo, reference, true),
+            Method::DELETE => delete_manifest(&state, repo, reference),
             _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
         };
     }
@@ -461,7 +478,15 @@ fn manifest_response(
     head_only: bool,
 ) -> Response {
     let manifests = lock(&state.manifests);
-    let Some(manifest) = manifests.get(&(repo.to_string(), reference.to_string())) else {
+    let manifest = manifests
+        .get(&(repo.to_string(), reference.to_string()))
+        .or_else(|| {
+            manifests
+                .iter()
+                .find(|((name, _), manifest)| name == repo && manifest.digest == reference)
+                .map(|(_, manifest)| manifest)
+        });
+    let Some(manifest) = manifest else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -479,6 +504,58 @@ fn manifest_response(
     }
 
     (StatusCode::OK, headers, manifest.bytes.clone()).into_response()
+}
+
+fn delete_manifest(state: &Arc<MockState>, repo: &str, reference: &str) -> Response {
+    if state.answer_405.load(Ordering::SeqCst) != 0 {
+        return (StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED").into_response();
+    }
+
+    let mut manifests = lock(&state.manifests);
+    let before = manifests.len();
+    manifests.retain(|(name, key), manifest| {
+        !(name == repo && (key == reference || manifest.digest == reference))
+    });
+    if manifests.len() == before {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    drop(manifests);
+
+    state.manifest_deletes.fetch_add(1, Ordering::SeqCst);
+    StatusCode::ACCEPTED.into_response()
+}
+
+fn tags_list(state: &Arc<MockState>, repo: &str, query: Option<&str>) -> Response {
+    let mut tags = lock(&state.manifests)
+        .keys()
+        .filter(|(name, reference)| name == repo && !reference.starts_with("sha256:"))
+        .map(|(_, reference)| reference.clone())
+        .collect::<Vec<_>>();
+    tags.sort();
+    tags.dedup();
+
+    if let Some(last) = query_param(query, "last") {
+        tags.retain(|tag| tag.as_str() > last.as_str());
+    }
+    // Two per page in the mock forces a client into the `Link` paging path.
+    let limit = query_param(query, "n")
+        .and_then(|n| n.parse::<usize>().ok())
+        .map_or(2, |n| n.min(2));
+    let more = tags.len() > limit;
+    tags.truncate(limit);
+
+    let mut response = axum::Json(json!({"name": repo, "tags": tags})).into_response();
+    if more {
+        let last = tags.last().cloned().unwrap_or_default();
+        let link = format!(
+            "<{}/v2/{}/tags/list?n={limit}&last={last}>; rel=\"next\"",
+            state.base_url, repo
+        );
+        if let Ok(value) = link.parse() {
+            response.headers_mut().insert(header::LINK, value);
+        }
+    }
+    response
 }
 
 /// A running mock registry on a loopback port.
@@ -653,6 +730,16 @@ impl MockRegistry {
         self.state
             .manifest_put_failures
             .store(count, Ordering::SeqCst);
+    }
+
+    /// Number of manifest `DELETE` requests that removed something.
+    pub fn delete_count(&self) -> usize {
+        self.state.manifest_deletes.load(Ordering::SeqCst)
+    }
+
+    /// Answer `405 UNSUPPORTED` to every manifest `DELETE`.
+    pub fn answer_405(&self) {
+        self.state.answer_405.store(1, Ordering::SeqCst);
     }
 
     /// Accept a bearer token the test invents, for a pre-issued token.

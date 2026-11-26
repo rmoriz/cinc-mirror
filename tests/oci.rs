@@ -456,6 +456,119 @@ async fn get_manifest_returns_value_and_digest() {
 }
 
 #[tokio::test]
+async fn head_manifest_reads_the_digest_header() {
+    let mock = MockRegistry::start(MockAuth::Bearer).await;
+    let registry = registry_for(&mock, OciAuth::Anonymous);
+    let digest = mock.store_manifest(REPO, "19.4.46-debian-13-amd64", b"{}");
+
+    assert_eq!(
+        registry
+            .head_manifest(REPO, "19.4.46-debian-13-amd64")
+            .await
+            .expect("head manifest"),
+        Some(digest),
+        "the probe must report the digest the registry names"
+    );
+    assert_eq!(
+        registry
+            .head_manifest(REPO, &sha256_digest(b"gone"))
+            .await
+            .expect("missing manifest"),
+        None,
+        "a missing manifest is not an error"
+    );
+}
+
+#[tokio::test]
+async fn list_tags_follows_the_link_header() {
+    let mock = MockRegistry::start(MockAuth::Bearer).await;
+    // A pre-issued token keeps the count free of the anonymous 401 round trip.
+    mock.allow_token("pre-issued");
+    let registry = registry_for(
+        &mock,
+        OciAuth::Bearer {
+            token: "pre-issued".to_string(),
+        },
+    );
+    for tag in ["19.4.40", "19.4.42", "19.4.46"] {
+        mock.store_manifest(REPO, tag, tag.as_bytes());
+    }
+
+    let tags = registry.list_tags(REPO).await.expect("list tags");
+
+    assert_eq!(
+        tags,
+        vec![
+            "19.4.40".to_string(),
+            "19.4.42".to_string(),
+            "19.4.46".to_string()
+        ],
+        "every page is read and the union is sorted"
+    );
+    let pages = mock
+        .request_log()
+        .into_iter()
+        .filter(|(method, path)| method == "GET" && path.ends_with("/tags/list"))
+        .count();
+    assert_eq!(pages, 2, "three tags at two per page need two requests");
+}
+
+#[tokio::test]
+async fn list_tags_of_an_unpublished_repository_is_empty() {
+    let mock = MockRegistry::start(MockAuth::Bearer).await;
+    let registry = registry_for(&mock, OciAuth::Anonymous);
+
+    assert_eq!(
+        registry.list_tags(REPO).await.expect("list tags"),
+        Vec::<String>::new(),
+        "a repository that was never published has no tags, not an error"
+    );
+}
+
+#[tokio::test]
+async fn delete_manifest_by_digest_removes_the_tag() {
+    let mock = MockRegistry::start(MockAuth::Bearer).await;
+    let registry = registry_for(&mock, OciAuth::Anonymous);
+    let digest = mock.store_manifest(REPO, "19.4.46-debian-13-amd64", b"{}");
+
+    registry
+        .delete_manifest(REPO, &digest)
+        .await
+        .expect("delete manifest");
+
+    assert!(
+        mock.manifest(REPO, "19.4.46-debian-13-amd64").is_none(),
+        "the tag must be gone"
+    );
+    assert_eq!(mock.delete_count(), 1);
+}
+
+#[tokio::test]
+async fn delete_manifest_treats_404_as_success() {
+    let mock = MockRegistry::start(MockAuth::Bearer).await;
+    let registry = registry_for(&mock, OciAuth::Anonymous);
+
+    registry
+        .delete_manifest(REPO, &sha256_digest(b"already gone"))
+        .await
+        .expect("an absent manifest is already deleted");
+}
+
+#[tokio::test]
+async fn delete_manifest_reports_405_as_a_status() {
+    let mock = MockRegistry::start(MockAuth::Bearer).await;
+    let registry = registry_for(&mock, OciAuth::Anonymous);
+    mock.answer_405();
+
+    match registry.delete_manifest(REPO, &sha256_digest(b"x")).await {
+        Err(OciError::Status { status, .. }) => {
+            assert_eq!(status, 405, "an unsupported delete is a status error");
+        }
+        other => panic!("unexpected result: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn package_digest_for_tag_selects_the_package_layer() {
     let mock = MockRegistry::start(MockAuth::Bearer).await;
     let registry = registry_for(&mock, OciAuth::Anonymous);

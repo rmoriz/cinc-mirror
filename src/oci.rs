@@ -46,7 +46,8 @@
 //! a jittered 0.5 s, 1 s, 2 s backoff on `429`, `5xx` and connection errors.
 //! `400`, `403` and `404` are terminal. A `401` re-authenticates exactly once
 //! before the retry decision is made, and a second `401` is an
-//! [`AuthError::Unauthorized`].
+//! [`AuthError::Unauthorized`]. Tag pages and manifest deletes retry the same
+//! way.
 //!
 //! Every network wait is bounded. [`OciConfig::request_timeout`] (300 s by
 //! default) covers one whole request, including sending a `PATCH` body that a
@@ -55,7 +56,7 @@
 //! retryable [`OciError::Http`] failure, so a stalled registry retries like a
 //! refused connection instead of wedging a worker.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -95,6 +96,9 @@ const RETRY_ATTEMPTS: usize = 4;
 
 /// First retry wait; doubled per retry and jittered into the upper half.
 const RETRY_BASE: Duration = Duration::from_millis(500);
+
+/// Tags requested per page, and the maximum number of pages a listing follows.
+const LIST_PAGE_LIMIT: usize = 100;
 
 /// Assumed token lifetime when the token endpoint omits `expires_in`.
 const TOKEN_DEFAULT_LIFETIME: u64 = 60;
@@ -578,6 +582,71 @@ impl Registry {
         self.with_retry(|| self.get_manifest_once(repo, &url)).await
     }
 
+    /// Every tag in `repo`, sorted.
+    ///
+    /// Tags are requested [`LIST_PAGE_LIMIT`] at a time and only a `Link` header
+    /// whose `rel` is `next` is followed, for at most [`LIST_PAGE_LIMIT`] pages.
+    /// A repository that was never published answers `404` and yields an empty
+    /// list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OciError`] on transport and status failures and
+    /// [`OciError::Protocol`] when a page is not a JSON tag list.
+    pub async fn list_tags(&self, repo: &str) -> Result<Vec<String>, OciError> {
+        let mut url = self.url_for(&["v2", repo, "tags", "list"])?;
+        url.query_pairs_mut()
+            .append_pair("n", &LIST_PAGE_LIMIT.to_string());
+
+        let mut tags = BTreeSet::new();
+        for _ in 0..LIST_PAGE_LIMIT {
+            let Some(page) = self.with_retry(|| self.tags_page_once(repo, &url)).await? else {
+                break;
+            };
+            tags.extend(page.tags);
+            let Some(next) = page.next else {
+                break;
+            };
+            url = self.location_url(&next)?;
+        }
+        Ok(tags.into_iter().collect())
+    }
+
+    /// Digest of the manifest at `reference`, or `None` when it is gone.
+    ///
+    /// Only the `Docker-Content-Digest` header is used; a `HEAD` that succeeds
+    /// without it also reports `None`, so the caller treats the manifest as
+    /// absent instead of guessing a digest from a body that was never read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OciError`] for anything but a success or `404`.
+    pub async fn head_manifest(
+        &self,
+        repo: &str,
+        reference: &str,
+    ) -> Result<Option<String>, OciError> {
+        let url = self.url_for(&["v2", repo, "manifests", reference])?;
+        self.with_retry(|| self.head_manifest_once(repo, &url))
+            .await
+    }
+
+    /// Delete the manifest `digest` from `repo`.
+    ///
+    /// `200`, `202` and `404` are success: a manifest that is already gone needs
+    /// no second delete. A registry without delete support answers `405`, which
+    /// surfaces as [`OciError::Status`] with that status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OciError`] for transport failures and any status other than
+    /// `200`, `202` and `404`.
+    pub async fn delete_manifest(&self, repo: &str, digest: &str) -> Result<(), OciError> {
+        let url = self.url_for(&["v2", repo, "manifests", digest])?;
+        self.with_retry(|| self.delete_manifest_once(repo, &url))
+            .await
+    }
+
     /// Digest of the package layer of the manifest at `tag`.
     ///
     /// The package layer is the first layer whose
@@ -614,6 +683,56 @@ impl Registry {
                 .status_error(&Method::HEAD, url, status, response)
                 .await),
         }
+    }
+
+    async fn head_manifest_once(&self, repo: &str, url: &Url) -> Result<Option<String>, OciError> {
+        let headers = [("accept", MANIFEST_ACCEPT.to_string())];
+        let response = self
+            .request(Method::HEAD, url, repo, &pull_scope(repo), &headers, None)
+            .await?;
+        match response.status() {
+            status if status.is_success() => Ok(digest_header(&response)),
+            StatusCode::NOT_FOUND => Ok(None),
+            status => Err(self
+                .status_error(&Method::HEAD, url, status, response)
+                .await),
+        }
+    }
+
+    async fn delete_manifest_once(&self, repo: &str, url: &Url) -> Result<(), OciError> {
+        let response = self
+            .request(Method::DELETE, url, repo, &push_scope(repo), &[], None)
+            .await?;
+        match response.status() {
+            StatusCode::OK | StatusCode::ACCEPTED => {
+                self.drain_body(response, &Method::DELETE, url).await
+            }
+            StatusCode::NOT_FOUND => Ok(()),
+            status => Err(self
+                .status_error(&Method::DELETE, url, status, response)
+                .await),
+        }
+    }
+
+    async fn tags_page_once(&self, repo: &str, url: &Url) -> Result<Option<TagPage>, OciError> {
+        let response = self
+            .request(Method::GET, url, repo, &pull_scope(repo), &[], None)
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let next = next_link(&response);
+        let response = self.check_success(response, &Method::GET, url).await?;
+        let bytes = self.read_body(response, &Method::GET, url).await?;
+        let body: TagListBody =
+            serde_json::from_slice(&bytes).map_err(|error| OciError::Protocol {
+                registry: self.registry.clone(),
+                reason: format!("tag list at {url} is not valid JSON: {error}"),
+            })?;
+        Ok(Some(TagPage {
+            tags: body.tags.unwrap_or_default(),
+            next,
+        }))
     }
 
     async fn upload_file_once(
@@ -1512,6 +1631,19 @@ pub enum AuthError {
     },
 }
 
+/// One page of a tag listing: the tags and the `rel="next"` target, if any.
+#[derive(Debug)]
+struct TagPage {
+    tags: Vec<String>,
+    next: Option<String>,
+}
+
+/// JSON body of a tag listing page.
+#[derive(Debug, serde::Deserialize)]
+struct TagListBody {
+    tags: Option<Vec<String>>,
+}
+
 /// One parsed `WWW-Authenticate` challenge.
 #[derive(Debug, Clone)]
 struct Challenge {
@@ -1568,6 +1700,32 @@ fn challenge_of(response: &Response, registry: &str) -> Result<Challenge, AuthEr
             reason: "HTTP 401 without a WWW-Authenticate header".to_string(),
         })?;
     Ok(Challenge::parse(header))
+}
+
+/// Target of the first `Link` header entry whose `rel` is `next`.
+fn next_link(response: &Response) -> Option<String> {
+    response
+        .headers()
+        .get_all("link")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(next_link_in)
+}
+
+fn next_link_in(value: &str) -> Option<String> {
+    value.split(',').find_map(|entry| {
+        let (target, parameters) = entry.split_once('>')?;
+        let target = target.trim().strip_prefix('<')?;
+        let follows = parameters.split(';').any(|parameter| {
+            matches!(
+                parameter.split_once('='),
+                Some((name, rel))
+                    if name.trim().eq_ignore_ascii_case("rel")
+                        && rel.trim().trim_matches('"').eq_ignore_ascii_case("next")
+            )
+        });
+        follows.then(|| target.to_string())
+    })
 }
 
 fn digest_header(response: &Response) -> Option<String> {
