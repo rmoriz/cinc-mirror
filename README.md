@@ -236,6 +236,12 @@ incident, alert and GitHub issue then stay away while the mirroring behaviour is
 unchanged. `mirror.ci.toml` uses the list for `omnibus-toolchain`, whose Windows
 formats collide on every crawl.
 
+A payload upstream lists in its metadata but no longer serves (a `404`) is
+recorded as one `unrecoverable` incident. The row stays unsatisfied, so a later
+run retries it, but the download no longer counts as a failure: the first run
+that sees the hole exits `3` for the incident, later runs stay green until
+upstream heals or an operator acknowledges it.
+
 ## CI and scheduled backfill
 
 `.github/workflows/ci.yml` runs formatting, clippy, tests on Linux and macOS, the

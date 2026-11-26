@@ -140,6 +140,12 @@ pub struct Summary {
     pub skipped: usize,
     /// Failed downloads and failed publication attempts.
     pub failed: usize,
+    /// Artifacts upstream no longer serves (`404`); one incident records each.
+    ///
+    /// They stay out of [`Summary::failed`] so a permanently dangling upstream
+    /// reference does not fail every run, but they stay unsatisfied in the
+    /// ledger, so a later run picks them up again when upstream heals.
+    pub unrecoverable: usize,
     /// Incident rows this run created (deduplicated detections are not counted).
     pub incidents_opened: usize,
     /// Incidents still open after the run, earlier runs' included.
@@ -184,13 +190,14 @@ impl Summary {
     pub fn to_text(&self) -> String {
         format!(
             "discovered={} satisfied={} downloaded={} published={} skipped={} failed={} \
-             incidents={} open_incidents={} bytes={} exit={}",
+             unrecoverable={} incidents={} open_incidents={} bytes={} exit={}",
             self.discovered,
             self.satisfied,
             self.downloaded,
             self.published,
             self.skipped,
             self.failed,
+            self.unrecoverable,
             self.incidents_opened,
             self.open_incidents,
             self.bytes_downloaded,
@@ -257,7 +264,7 @@ mod tests {
         assert_eq!(
             summary.to_text(),
             "discovered=3 satisfied=1 downloaded=2 published=4 skipped=0 failed=0 \
-             incidents=0 open_incidents=1 bytes=2048 exit=0"
+             unrecoverable=0 incidents=0 open_incidents=1 bytes=2048 exit=0"
         );
         assert!(summary.to_json().contains("\"published\": 4"));
         assert!(summary.to_json().contains("\"queued\": 2"));

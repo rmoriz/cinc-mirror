@@ -229,6 +229,7 @@ struct FakePayload {
     max_in_flight: AtomicUsize,
     fail_next: AtomicUsize,
     corrupt: AtomicBool,
+    gone: AtomicBool,
     delay_millis: AtomicUsize,
 }
 
@@ -243,6 +244,10 @@ impl FakePayload {
 
     fn set_corrupt(&self, corrupt: bool) {
         self.corrupt.store(corrupt, Ordering::SeqCst);
+    }
+
+    fn set_gone(&self, gone: bool) {
+        self.gone.store(gone, Ordering::SeqCst);
     }
 
     fn set_delay(&self, delay: Duration) {
@@ -285,6 +290,12 @@ impl PayloadTransport for FakePayload {
             return Err(TransportError::Retryable {
                 path: remote_path.to_string(),
                 reason: "injected transport failure".to_string(),
+            });
+        }
+
+        if self.gone.load(Ordering::SeqCst) {
+            return Err(TransportError::NotFound {
+                path: remote_path.to_string(),
             });
         }
 
@@ -551,6 +562,7 @@ impl Fixture {
             max_in_flight: AtomicUsize::new(0),
             fail_next: AtomicUsize::new(0),
             corrupt: AtomicBool::new(false),
+            gone: AtomicBool::new(false),
             delay_millis: AtomicUsize::new(0),
         });
 
@@ -1217,6 +1229,46 @@ async fn a_tag_that_already_holds_other_bytes_opens_a_conflict_incident() {
         .expect("incidents");
     assert_eq!(incidents.len(), 1);
     assert_eq!(incidents[0].kind, IncidentKind::TagConflict);
+}
+
+#[tokio::test]
+async fn a_payload_gone_upstream_opens_one_incident_and_stops_failing_the_run() {
+    clear_security_env();
+    let dir = TempDir::new().expect("state dir");
+    let package = one_package();
+    let fixture = Fixture::new(dir.path(), std::slice::from_ref(&package), &["t1"], 1, 1);
+    fixture.payload.set_gone(true);
+
+    let ctx = fixture.ctx("run-1");
+    let summary = run(&ctx, RunOpts::default()).await.expect("run");
+
+    assert_eq!(summary.unrecoverable, 1, "{summary:?}");
+    assert_eq!(
+        summary.failed, 0,
+        "a missing payload is not a retry: {summary:?}"
+    );
+    assert_eq!(summary.incidents_opened, 1, "{summary:?}");
+    assert_eq!(summary.exit_code, 3, "the hole is reported once");
+    let incidents = ctx
+        .ledger
+        .lock()
+        .await
+        .incidents(IncidentFilter::open())
+        .expect("incidents");
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].kind, IncidentKind::Unrecoverable);
+
+    // The row stays unsatisfied, so a later run tries again; the incident is
+    // already known and no longer fails the run.
+    let repeat = Fixture::new(dir.path(), std::slice::from_ref(&package), &["t1"], 1, 1);
+    repeat.payload.set_gone(true);
+    let again = run(&repeat.ctx("run-2"), RunOpts::default())
+        .await
+        .expect("second run");
+    assert_eq!(again.unrecoverable, 1, "{again:?}");
+    assert_eq!(again.incidents_opened, 0, "detection is deduplicated");
+    assert_eq!(again.failed, 0);
+    assert_eq!(again.exit_code, 0);
 }
 
 #[tokio::test]

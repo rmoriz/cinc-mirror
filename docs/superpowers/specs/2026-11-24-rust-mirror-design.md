@@ -116,7 +116,8 @@ runs may pass `--gc-after` to delete each store file once every enabled target
 reports success, which keeps CI runners inside disk limits. `repair` prefers the
 store copy, re-fetches from upstream when it is gone, and marks the artifact
 `unrecoverable` plus opens an incident when upstream no longer has those bytes
-either. A fresh clone plus `ledger pull` can rebuild all state except the local
+either. A plain mirror does the same for a `404` payload: one deduplicated
+incident, no failed count, the row stays unsatisfied so a later run retries it. A fresh clone plus `ledger pull` can rebuild all state except the local
 blob cache.
 
 ### Payload transport

@@ -324,6 +324,23 @@ pub enum DownloadError {
     },
 }
 
+impl DownloadError {
+    /// Whether upstream permanently lacks the payload (`404`/`410`).
+    ///
+    /// A rung that refuses the path as missing is final: no other rung can serve
+    /// a file that is gone. A corrupt completion or a local write failure is not
+    /// a loss, so both keep the retry behaviour.
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            Self::Rejected { source, .. } | Self::Exhausted { source, .. } => {
+                matches!(source, TransportError::NotFound { .. })
+            }
+            Self::Corrupt { .. } | Self::Io { .. } | Self::Config { .. } => false,
+        }
+    }
+}
+
 impl fmt::Display for DownloadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1291,6 +1308,41 @@ mod tests {
         );
         assert!(endpoint.remote_path("../etc/passwd").is_err());
         assert!(endpoint.remote_path("stable/../../etc").is_err());
+    }
+
+    #[test]
+    fn only_a_missing_payload_counts_as_not_found() {
+        let missing = || DownloadError::Rejected {
+            remote_path: "x".to_string(),
+            transport: TransportKind::Https,
+            source: TransportError::NotFound {
+                path: "x".to_string(),
+            },
+        };
+        assert!(missing().is_not_found());
+        assert!(DownloadError::Exhausted {
+            remote_path: "x".to_string(),
+            last_transport: TransportKind::Ftp,
+            source: TransportError::NotFound {
+                path: "x".to_string(),
+            },
+            observed: None,
+        }
+        .is_not_found());
+        assert!(!DownloadError::Exhausted {
+            remote_path: "x".to_string(),
+            last_transport: TransportKind::Ftp,
+            source: TransportError::Retryable {
+                path: "x".to_string(),
+                reason: "reset".to_string(),
+            },
+            observed: None,
+        }
+        .is_not_found());
+        assert!(!DownloadError::Config {
+            reason: "no route".to_string()
+        }
+        .is_not_found());
     }
 
     #[test]

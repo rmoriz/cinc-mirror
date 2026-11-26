@@ -263,6 +263,7 @@ struct ArtifactReport {
     bytes: u64,
     published: usize,
     failed: usize,
+    unrecoverable: usize,
     incidents: usize,
     fully_published: bool,
 }
@@ -384,6 +385,32 @@ impl Job<'_> {
                     ))
                     .await?;
                 }
+                Err(error) if error.is_not_found() => {
+                    // Upstream lists a payload it no longer serves. One
+                    // deduplicated incident records the hole; a later run tries
+                    // again because the row stays unsatisfied, but the run does
+                    // not fail on it once the incident is known.
+                    let new = self
+                        .open_incident(&artifact, &artifact.sha256, IncidentKind::Unrecoverable)
+                        .await?;
+                    tracing::warn!(
+                        artifact = %artifact.key(),
+                        %error,
+                        "payload gone upstream; incident recorded"
+                    );
+                    return Ok(ArtifactReport {
+                        key: artifact.key(),
+                        version: artifact.version.clone(),
+                        sha256: artifact.sha256.clone(),
+                        downloaded: false,
+                        bytes: 0,
+                        published: 0,
+                        failed: 0,
+                        unrecoverable: 1,
+                        incidents: incidents + usize::from(new),
+                        fully_published: false,
+                    });
+                }
                 Err(error) => {
                     tracing::warn!(
                         artifact = %artifact.key(),
@@ -398,6 +425,7 @@ impl Job<'_> {
                         bytes: 0,
                         published: 0,
                         failed: 1,
+                        unrecoverable: 0,
                         incidents,
                         fully_published: false,
                     });
@@ -450,6 +478,7 @@ impl Job<'_> {
             bytes,
             published,
             failed,
+            unrecoverable: 0,
             incidents,
             fully_published: failed == 0 && published_now.len() == self.targets.len(),
         })
@@ -908,6 +937,7 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
         summary.downloaded += usize::from(report.downloaded);
         summary.published += report.published;
         summary.failed += report.failed;
+        summary.unrecoverable += report.unrecoverable;
         summary.incidents_opened += report.incidents;
         summary.bytes_downloaded = summary.bytes_downloaded.saturating_add(report.bytes);
     }
