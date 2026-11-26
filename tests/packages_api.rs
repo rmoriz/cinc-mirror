@@ -97,13 +97,13 @@ async fn requests_carry_the_encoded_package_and_the_github_headers() {
 #[tokio::test]
 async fn a_user_404_falls_back_to_orgs_and_the_probe_is_cached() {
     let mock = MockPackages::start().await;
-    mock.owner_is_org();
+    mock.owner_is_org(OWNER);
     mock.seed_version(PACKAGE, &["19.4.46"], Utc::now());
     let client = client(&mock);
 
-    assert_eq!(client.owner_kind().await.expect("probe"), OwnerKind::Org);
     assert_eq!(client.versions().await.expect("list").len(), 1);
     assert_eq!(client.owner_kind().await.expect("cached"), OwnerKind::Org);
+    assert_eq!(client.versions().await.expect("list").len(), 1);
 
     let log = mock.request_log();
     let users = log
@@ -125,7 +125,7 @@ async fn a_missing_package_lists_nothing() {
     // The owner exists but has no such package: `/users/` 404s on the probe and
     // the organisation route 404s on the versions.
     let org_owner = MockPackages::start().await;
-    org_owner.owner_is_org();
+    org_owner.owner_is_org(OWNER);
     assert!(client(&org_owner)
         .versions()
         .await
@@ -239,6 +239,55 @@ async fn a_transport_failure_is_reported() {
     let error = client.versions().await.unwrap_err();
 
     assert!(matches!(error, PruneError::Transport { .. }), "{error}");
+}
+
+#[tokio::test]
+async fn the_catalogue_retries_the_other_owner_form() {
+    let mock = MockPackages::start().await;
+    // A user whose `cinc` package was never mirrored: the versions probe 404s,
+    // so the owner kind alone cannot tell that `/orgs/` is the wrong route.
+    mock.add_package("cinc-mirror/cinc-workstation");
+    let client = client(&mock);
+
+    let packages = client.packages().await.expect("catalogue");
+
+    assert_eq!(packages, vec!["cinc-mirror/cinc-workstation".to_string()]);
+    let log = mock.request_log();
+    assert!(
+        log.iter()
+            .any(|(_, path)| path.starts_with("/orgs/rmoriz/packages")),
+        "the probe's answer is tried first: {log:?}"
+    );
+    assert!(
+        log.last()
+            .is_some_and(|(_, path)| path.starts_with("/users/")),
+        "the retry lands on the user route: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_catalogue_fallback_corrects_the_cached_owner_form() {
+    let mock = MockPackages::start().await;
+    // The target package is absent, so only the versions in another package
+    // keep this an existing user.
+    let id = mock.seed_version("cinc-mirror/other", &["old"], Utc::now());
+    let client = client(&mock);
+
+    client.packages().await.expect("catalogue");
+    let before = mock.request_log().len();
+
+    assert_eq!(client.owner_kind().await.expect("cached"), OwnerKind::User);
+    client.delete(id).await.expect("delete");
+
+    assert_eq!(
+        mock.request_log().len(),
+        before + 1,
+        "the corrected form is cached, not re-probed: {:?}",
+        mock.request_log()
+    );
+    assert_eq!(mock.deleted(), vec![id], "the delete used the wrong route");
+    let last = mock.request_log().pop().expect("a request");
+    assert!(last.1.starts_with("/users/"), "{last:?}");
 }
 
 #[tokio::test]

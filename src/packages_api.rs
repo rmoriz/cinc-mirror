@@ -15,6 +15,8 @@
 //! [`PruneError::Denied`] rather than a fallback, so a missing credential does
 //! not look like a wrong owner. A `404` on **both** forms means the package does
 //! not exist: [`PackagesClient::versions`] returns an empty list, not an error.
+//! When a listing succeeds only under the other form, that form is cached too,
+//! so a later delete does not go to the route that just `404`ed.
 //!
 //! The package path (`<repository>/<project>`) travels as **one** percent
 //! encoded path segment, so the URLs are built through
@@ -297,9 +299,12 @@ impl PackagesClient {
         })
     }
 
-    /// Which owner route serves the package, probing `/users/` once.
+    /// Which owner route serves the package, probing `/users/`.
     ///
-    /// The answer is cached for the life of the client.
+    /// A `2xx` proves a user account and is cached at once. A `404` only says
+    /// that the package is not there, so `Org` is a guess until a listing or a
+    /// delete proves it; only a proven answer is cached, which is what lets a
+    /// fallback correct the probe.
     ///
     /// # Errors
     ///
@@ -307,10 +312,10 @@ impl PackagesClient {
     /// a fallback), [`PruneError::Unsupported`] on `405` and
     /// [`PruneError::Transport`] when the request cannot be completed.
     pub async fn owner_kind(&self) -> Result<OwnerKind, PruneError> {
-        self.kind
-            .get_or_try_init(|| self.probe_owner())
-            .await
-            .copied()
+        match self.kind.get() {
+            Some(kind) => Ok(*kind),
+            None => self.probe_owner().await,
+        }
     }
 
     /// Every version of the package, newest first.
@@ -337,16 +342,25 @@ impl PackagesClient {
                 // the first page may be a wrong owner form or an absent
                 // package. Ask the other form once, then stop either way.
                 Page::Missing if page == 1 => {
-                    kind = kind.other();
-                    url = self.page_url(kind, &["versions"], 1)?;
-                    match self.version_page(&url).await? {
-                        Page::Items(items, next) => (items, next),
+                    let other = kind.other();
+                    let other_url = self.page_url(other, &["versions"], 1)?;
+                    match self.version_page(&other_url).await? {
+                        Page::Items(items, next) => {
+                            // The loop recomputes `url` from the corrected
+                            // `kind`, so only that survives the fallback.
+                            kind = other;
+                            (items, next)
+                        }
                         Page::Missing => return Ok(Vec::new()),
                     }
                 }
                 Page::Missing => break,
             };
 
+            // Any page under a form proves it serves this owner.
+            if page == 1 {
+                let _ = self.kind.set(kind);
+            }
             let full = items.len() == PAGE_SIZE;
             versions.extend(items);
             if !full {
@@ -376,7 +390,10 @@ impl PackagesClient {
         let url = self.owner_url(kind, &["versions", &version_id.to_string()])?;
         let response = self.send(Method::DELETE, &url).await?;
         match response.status() {
-            status if status.is_success() => Ok(()),
+            status if status.is_success() => {
+                let _ = self.kind.set(kind);
+                Ok(())
+            }
             StatusCode::NOT_FOUND => Ok(()),
             StatusCode::FORBIDDEN => Err(self.denied(response).await),
             StatusCode::METHOD_NOT_ALLOWED => Err(self.unsupported()),
@@ -386,13 +403,18 @@ impl PackagesClient {
 
     /// Every container package of the owner, sorted as GitHub sends them.
     ///
+    /// The probe answers for the package's versions route, which says nothing
+    /// about the owner when that package does not exist. A `404` on the first
+    /// page therefore retries the other owner form once and caches the
+    /// corrected kind.
+    ///
     /// # Errors
     ///
     /// Returns [`PruneError::Denied`] for a `403`, [`PruneError::Unsupported`]
     /// for a `405`, [`PruneError::List`] for any other unexpected status and
     /// [`PruneError::Transport`] when a request cannot be completed.
     pub async fn packages(&self) -> Result<Vec<String>, PruneError> {
-        let kind = self.owner_kind().await?;
+        let mut kind = self.owner_kind().await?;
         let mut url = self.catalogue_url(kind, 1)?;
         let mut packages = Vec::new();
         let mut page = 1;
@@ -400,8 +422,28 @@ impl PackagesClient {
         for _ in 0..MAX_PAGES {
             let (items, next) = match self.package_page(&url).await? {
                 Page::Items(items, next) => (items, next),
+                // The probe discriminates on the versions route, so a `404`
+                // here can mean the wrong owner form rather than an absent
+                // package (a user whose package nobody mirrored yet, for
+                // example). Ask the other form once and keep the correction.
+                Page::Missing if page == 1 => {
+                    let other = kind.other();
+                    let other_url = self.catalogue_url(other, 1)?;
+                    match self.package_page(&other_url).await? {
+                        Page::Items(items, next) => {
+                            // The loop recomputes `url` from the corrected
+                            // `kind`, so only that survives the fallback.
+                            kind = other;
+                            (items, next)
+                        }
+                        Page::Missing => break,
+                    }
+                }
                 Page::Missing => break,
             };
+            if page == 1 {
+                let _ = self.kind.set(kind);
+            }
             let full = items.len() == PAGE_SIZE;
             packages.extend(items);
             if !full {
@@ -423,7 +465,10 @@ impl PackagesClient {
         let url = self.page_url(OwnerKind::User, &["versions"], 1)?;
         let response = self.send(Method::GET, &url).await?;
         match response.status() {
-            status if status.is_success() => Ok(OwnerKind::User),
+            status if status.is_success() => {
+                let _ = self.kind.set(OwnerKind::User);
+                Ok(OwnerKind::User)
+            }
             StatusCode::NOT_FOUND => Ok(OwnerKind::Org),
             StatusCode::FORBIDDEN => Err(self.denied(response).await),
             StatusCode::METHOD_NOT_ALLOWED => Err(self.unsupported()),

@@ -14,8 +14,12 @@
 //! Switches make the awkward GitHub answers reproducible: [`MockPackages::deny`]
 //! answers `403` everywhere and echoes the received `Authorization` header in
 //! the body (so a client can be checked for leaking its token), and
-//! [`MockPackages::owner_is_org`] answers `404` under `/users/` so only the
-//! organisation route works.
+//! [`MockPackages::owner_is_org`] marks the named owner as an organisation.
+//!
+//! Owners are users unless marked otherwise, and the owner routes follow the
+//! real API: a user owner `404`s under `/orgs/`, an organisation `404`s under
+//! `/users/`. A client cannot get away with guessing the form from the owner of
+//! a package's versions route.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,7 +47,7 @@ struct SeededVersion {
 #[derive(Debug)]
 struct MockState {
     base_url: String,
-    owner_is_org: AtomicBool,
+    orgs: Mutex<BTreeSet<String>>,
     deny: AtomicBool,
     omit_links: AtomicBool,
     failure: AtomicU16,
@@ -61,7 +65,7 @@ impl MockState {
     fn new(base_url: String) -> Self {
         Self {
             base_url,
-            owner_is_org: AtomicBool::new(false),
+            orgs: Mutex::new(BTreeSet::new()),
             deny: AtomicBool::new(false),
             omit_links: AtomicBool::new(false),
             failure: AtomicU16::new(0),
@@ -169,7 +173,12 @@ async fn api(
     if kind != "users" && kind != "orgs" {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if kind == "users" && state.owner_is_org.load(Ordering::SeqCst) {
+    let Some(owner) = parts.get(1) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // A user owner has no `/orgs/` route and an organisation no `/users/` one.
+    let org_owner = lock(&state.orgs).contains(owner.as_str());
+    if (kind == "users") == org_owner {
         return StatusCode::NOT_FOUND.into_response();
     }
     if parts.len() < 3 || parts[2] != "packages" {
@@ -271,14 +280,23 @@ fn versions(state: &Arc<MockState>, package: &str, query: Option<&str>, path: &s
 
 fn delete(state: &Arc<MockState>, package: &str, id: u64) -> Response {
     let mut versions = lock(&state.versions);
-    let Some(list) = versions.get_mut(package) else {
+
+    // Version ids are unique across the owner, so a test may seed the version
+    // in a package other than the client's.
+    let holder = match versions.get_mut(package) {
+        Some(list) if list.iter().any(|version| version.id == id) => Some(package.to_string()),
+        _ => versions
+            .iter()
+            .find(|(_, list)| list.iter().any(|version| version.id == id))
+            .map(|(name, _)| name.clone()),
+    };
+    let Some(holder) = holder else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let before = list.len();
-    list.retain(|version| version.id != id);
-    if list.len() == before {
+    let Some(list) = versions.get_mut(&holder) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
+    list.retain(|version| version.id != id);
     drop(versions);
 
     lock(&state.deleted).push(id);
@@ -336,9 +354,12 @@ impl MockPackages {
         &self.base_url
     }
 
-    /// Answer `404` under `/users/`, as GitHub does for an organisation owner.
-    pub fn owner_is_org(&self) {
-        self.state.owner_is_org.store(true, Ordering::SeqCst);
+    /// Treat `owner` as an organisation.
+    ///
+    /// Unmarked owners are users, and each owner only answers under its own
+    /// route: `/users/` `404`s for an organisation, `/orgs/` for a user.
+    pub fn owner_is_org(&self, owner: &str) {
+        lock(&self.state.orgs).insert(owner.to_string());
     }
 
     /// Answer `403` to every request, echoing the `Authorization` header.
