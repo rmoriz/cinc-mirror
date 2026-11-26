@@ -18,32 +18,90 @@ This project is neither affiliated nor approved by Progress Chef and/or the Cinc
 
 ## Usage/Installation
 
-To install the mirrored Cinc packages, run one of the following commands.
+The installers from https://github.com/cinc-mirror/cinc-mirror.github.io replace
+https://omnitruck.cinc.sh/install.sh and https://omnitruck.cinc.sh/install.ps1:
+metadata still comes from cinc.sh, only the packages come from ghcr.io. In the
+metadata dump the upstream `url` line is followed by
+`mapped to cinc-mirror url: ghcr.io/rmoriz/cinc-mirror/<project>@sha256:<digest>`,
+so the mirror address is visible before anything is fetched; the blob is pulled
+from there and the installer falls back to the upstream URL only if the mirror
+cannot serve it.
 
-POSIX (Linux, macOS):
+`-P` (POSIX) and `-project` (PowerShell) name the product. Without it, `cinc`
+is installed.
+
+| `-P` / `-project` | installs |
+| --- | --- |
+| `cinc` (default) | Cinc Client |
+| `cinc-auditor` | Cinc Auditor |
+| `cinc-foundation` | Cinc Foundation |
+| `cinc-server` | Cinc Server (Linux/x86_64 only) |
+| `cinc-workstation` | Cinc Workstation |
+| `omnibus-toolchain` | the Omnibus build toolchain |
+
+Linux and macOS:
 
 ```bash
-curl -sSL https://cinc-mirror.github.io/install.sh | bash
+# Cinc Client (default)
+curl -sSL https://cinc-mirror.github.io/install.sh | sudo bash
+
+# Cinc Auditor
+curl -sSL https://cinc-mirror.github.io/install.sh | sudo bash -s -- -P cinc-auditor
+
+# Cinc Workstation
+curl -sSL https://cinc-mirror.github.io/install.sh | sudo bash -s -- -P cinc-workstation
+
+# Cinc Server
+curl -sSL https://cinc-mirror.github.io/install.sh | sudo bash -s -- -P cinc-server
+
+# Cinc Foundation
+curl -sSL https://cinc-mirror.github.io/install.sh | sudo bash -s -- -P cinc-foundation
+
+# Omnibus toolchain
+curl -sSL https://cinc-mirror.github.io/install.sh | sudo bash -s -- -P omnibus-toolchain
 ```
 
-Windows PowerShell:
+`cinc-server` exists only for Linux/x86_64 — no macOS, Windows or arm64 build —
+the server example needs an x86_64 host. All other products build for several
+platforms and the installer picks the matching package.
+
+Windows PowerShell (elevated):
 
 ```powershell
+# Cinc Client
 . { iwr -useb https://cinc-mirror.github.io/install.ps1 } | iex; install -project cinc
+
+# Cinc Auditor
+. { iwr -useb https://cinc-mirror.github.io/install.ps1 } | iex; install -project cinc-auditor
+
+# Cinc Workstation
+. { iwr -useb https://cinc-mirror.github.io/install.ps1 } | iex; install -project cinc-workstation
+
+# Cinc Foundation
+. { iwr -useb https://cinc-mirror.github.io/install.ps1 } | iex; install -project cinc-foundation
+
+# Omnibus toolchain
+. { iwr -useb https://cinc-mirror.github.io/install.ps1 } | iex; install -project omnibus-toolchain
 ```
 
-`install` is the upstream-compatible alias for `Install-Project` and accepts the
-same flags, e.g. `install -version 19` for the latest 19.x release or
-`install -project cinc-workstation -channel current`.
-
-The actual scripts are at https://github.com/cinc-mirror/cinc-mirror.github.io and should replace https://omnitruck.cinc.sh/install.sh and https://omnitruck.cinc.sh/install.ps1 - metadata is still retrieved from cinc.sh, only packages are retrieved from ghcr.
+Both installers accept the upstream flags, e.g. `-v 26.4.0` / `-version 26.4.0`
+to pin a version, `-c current` for the current channel's integration builds, and
+`-d /tmp/dl` / `-f file` (POSIX) or `-download_directory` / `-filename`
+(PowerShell) to choose where the package is saved before it is installed.
+`-s once` (POSIX) skips the install when the project is already present, and
+`-WhatIf` (PowerShell) reports what would be downloaded and installed. `install`
+is the upstream-compatible alias for `Install-Project`, so
+`install -project cinc-workstation -channel current` works too.
 
 **Requirements:**
-- `curl` must be installed for the POSIX installer
-- Only supports Cinc 18+
+- `curl` must be installed for the POSIX installer; the mirror fetch always uses
+  it, even when metadata came in over `wget`
 - The PowerShell installer needs an elevated shell because it installs the
   `.msi` via `msiexec`. The mirrored `.msi` packages can also be downloaded and
   installed directly (see [Windows](#windows)).
+- The mirror follows the current major of each product, so older majors come
+  from upstream once the installer falls back.
+
 
 ## Build from source
 
