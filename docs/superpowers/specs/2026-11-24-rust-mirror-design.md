@@ -195,8 +195,10 @@ Version selection: `min_version`, `max_version`, `versions = ["18.8.*"]` and
 `all_versions = true`, intersected. `all_versions = true` removes the global
 `min_version` floor for that policy. Versions compare numerically segment by
 segment, so `19.10.0` > `19.4.46`. Globs are `*`/`?` only and match whole
-segments. `platforms`/`arches` take exact values or `*`; `platform_versions` is
-an optional map limiting specific platforms and must key a platform listed in
+segments, so `19.*` selects the 19 major line and nothing else; the committed CI
+configuration uses one such glob per project to follow the current major only.
+`platforms`/`arches` take exact values or `*`; `platform_versions` is an
+optional map limiting specific platforms and must key a platform listed in
 `platforms` unless `platforms = "*"`.
 
 `--project` accepts policy ids, or a bare project name to select every policy

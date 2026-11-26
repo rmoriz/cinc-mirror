@@ -4,7 +4,11 @@
 # config the workflow creates from `GITHUB_TOKEN`, and the ledger uses the git
 # authentication configured in the job environment.
 #
-# This file mirrors every project at every version the upstream still serves.
+# This file mirrors every project, but only its current major line: the globs
+# below select the latest major release and every minor and bug release under
+# it, not the whole version history. When upstream starts a new major, bump the
+# project's glob; until then the new line is ignored.
+#
 # The workflow bounds each run with --limit / --limit-bytes; the ledger cursor
 # carries the position into the next scheduled run.
 
@@ -16,7 +20,7 @@ upload_concurrency = 2
 id = "cinc"
 project = "cinc"
 channel = "stable"
-all_versions = true
+versions = ["19.*"]
 platforms = "*"
 arches = "*"
 
@@ -24,7 +28,7 @@ arches = "*"
 id = "cinc-auditor"
 project = "cinc-auditor"
 channel = "stable"
-all_versions = true
+versions = ["7.*"]
 platforms = "*"
 arches = "*"
 
@@ -32,7 +36,7 @@ arches = "*"
 id = "cinc-foundation"
 project = "cinc-foundation"
 channel = "stable"
-all_versions = true
+versions = ["3.*"]
 platforms = "*"
 arches = "*"
 
@@ -40,7 +44,7 @@ arches = "*"
 id = "cinc-server"
 project = "cinc-server"
 channel = "stable"
-all_versions = true
+versions = ["15.*"]
 platforms = "*"
 arches = "*"
 
@@ -48,7 +52,7 @@ arches = "*"
 id = "cinc-workstation"
 project = "cinc-workstation"
 channel = "stable"
-all_versions = true
+versions = ["26.*"]
 platforms = "*"
 arches = "*"
 
@@ -56,7 +60,7 @@ arches = "*"
 id = "omnibus-toolchain"
 project = "omnibus-toolchain"
 channel = "stable"
-all_versions = true
+versions = ["26.*"]
 platforms = "*"
 arches = "*"
 

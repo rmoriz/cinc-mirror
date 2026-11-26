@@ -148,10 +148,12 @@ Variables already present in the environment are not overridden.
 `auths` entry from `GITHUB_TOKEN`.
 
 `mirror.ci.toml` is the committed configuration the scheduled workflow uses; it
-mirrors all six upstream projects at every version. `omnibus-toolchain` is the
-build toolchain rather than a Cinc product, and its Windows formats collide
-under one descriptive tag, so it is listed under
-`[incident] ignore_arch_collisions` (see below).
+mirrors all six upstream projects, but only the current major line of each:
+`versions = ["19.*"]` and so on, so every minor and bug release of that major is
+mirrored and older majors are left alone. A new upstream major needs a one-word
+edit there. `omnibus-toolchain` is the build toolchain rather than a Cinc
+product, and its Windows formats collide under one descriptive tag, so it is
+listed under `[incident] ignore_arch_collisions` (see below).
 
 When adding a new project, the GHCR package is private by default. Make it
 public once under **Package settings → Change package visibility**, e.g.

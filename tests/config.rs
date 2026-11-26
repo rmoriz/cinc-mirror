@@ -699,6 +699,50 @@ fn loads_the_shipped_example_config() {
     assert!(!config.targets.is_empty());
 }
 
+#[test]
+fn the_ci_config_follows_one_major_line_per_project() {
+    // The scheduled backfill mirrors the current major of every project, not the
+    // whole history. A missing or widened glob here silently re-adds thousands
+    // of old artifacts.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("mirror.ci.toml");
+
+    let config = Config::load(Some(&path)).expect("CI config parses");
+    config.validate().expect("CI config is valid");
+    assert_eq!(config.projects.len(), 6);
+
+    for policy in &config.projects {
+        assert!(
+            !policy.all_versions,
+            "{}: a wide open policy would crawl every version",
+            policy.id
+        );
+        assert_eq!(
+            policy.versions.len(),
+            1,
+            "{}: exactly one major glob",
+            policy.id
+        );
+        let raw = &policy.versions[0];
+        let major: u64 = raw
+            .trim_end_matches(".*")
+            .parse()
+            .unwrap_or_else(|_| panic!("{}: `{raw}` must be `<major>.*`", policy.id));
+        let glob: cinc_mirror::VersionGlob = raw.parse().expect("valid glob");
+        let probe = |version: &str| glob.matches(&version.parse().expect("probe version"));
+        assert!(probe(&format!("{major}.99.99")), "{}: own line", policy.id);
+        assert!(
+            !probe(&format!("{}.0.0", major - 1)),
+            "{}: previous major must be out",
+            policy.id
+        );
+        assert!(
+            !probe(&format!("{}.0.0", major + 1)),
+            "{}: next major must be out",
+            policy.id
+        );
+    }
+}
+
 // CLI behaviour: exit codes are part of the contract even while commands are
 // stubs.
 
