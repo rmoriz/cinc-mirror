@@ -223,10 +223,13 @@ Arch collisions — two upstream files that map to one descriptive tag, such as 
 `.msi` and an `.appx`, or the same package rebuilt under a compatibility
 directory — are incidents, but they no longer cost a file. The first artifact
 keeps the plain tag; every latecomer is published under the same tag plus its
-digest, so both files reach the registry and the reference stays unique. On an
-rsync target the upstream file name is the address, so only files with distinct
-names coexist there; a latecomer with the same name overwrites the path (the
-digest-qualified tag has no rsync equivalent). A project can mute the reports with
+digest, so both files reach the registry and the reference stays unique. The
+ledger stores that qualified reference and the crawl reuses it, so a later
+listing that ranks the pair differently cannot move an artifact back onto the
+other file's tag. On an rsync target the upstream file name is the address, so
+only files with distinct names coexist there; a latecomer with the same name
+overwrites the path (the digest-qualified tag has no rsync equivalent). A project
+can mute the reports with
 `[incident] ignore_arch_collisions = ["omnibus-toolchain"]`; the ledger
 incident, alert and GitHub issue then stay away while the mirroring behaviour is
 unchanged. `mirror.ci.toml` uses the list for `omnibus-toolchain`, whose Windows

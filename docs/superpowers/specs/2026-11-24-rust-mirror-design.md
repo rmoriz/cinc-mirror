@@ -299,7 +299,9 @@ Arch mapping keeps the existing public namespace: `x86_64`→`amd64`,
 `s390x`→`s390x`, `i386`/`i686`→`386`; anything else is sanitised and passed
 through. If two raw values would map to the same tag with different digests,
 the first file keeps the tag, the latecomer is published under
-`<tag>-<shortsha>`, and the pair is reported as an incident.
+`<tag>-<shortsha>`, and the pair is reported as an incident. The qualified
+reference is stored on the artifact row and reused, so a later crawl that ranks
+the pair differently does not move the artifact again.
 
 ### Bootstrap
 
