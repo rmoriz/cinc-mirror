@@ -354,8 +354,9 @@ max_deletions = 2000                # per target and run; the rest waits
 
 `auto` resolves to the GitHub Packages API on `ghcr.io`, which rejects deletes on
 the distribution API with `405`, and to the registry API elsewhere. The packages
-path authenticates with `GHCR_TOKEN`, falling back to `GITHUB_TOKEN`
-(`CINC_MIRROR_GHCR_API_TOKEN` is not read).
+path authenticates with `CINC_MIRROR_<TARGET>_API_TOKEN` (the target name
+upper-cased, non-alphanumerics as `_`), falling back to `GHCR_TOKEN` and then
+`GITHUB_TOKEN`.
 
 `cinc-mirror prune` runs the same pass on its own: it crawls to learn what is
 still wanted, but neither downloads nor publishes. `--dry-run` deletes the first
@@ -371,9 +372,10 @@ token that lost `packages:write` — counts into `failed`, names its target unde
 named under `skipped targets:` as well, but is only counted in `skipped=`, not
 in `failed`.
 
-An **ineligible** target — no `GHCR_TOKEN`/`GITHUB_TOKEN`, a namespace without an
-`<owner>/<repository>`, a non-OCI target — is only warned about on stderr and
-appears in neither count: the run reports `pruned=0 ... failed=0 skipped=0`.
+An **ineligible** target — no `CINC_MIRROR_<TARGET>_API_TOKEN`, `GHCR_TOKEN` or
+`GITHUB_TOKEN`, a namespace without an `<owner>/<repository>`, a non-OCI target —
+is only warned about on stderr and appears in neither count: the run reports
+`pruned=0 ... failed=0 skipped=0`.
 
 Only the standalone command turns a denial or a `405` into a non-zero exit. In a
 scheduled `mirror` run a prune never moves the exit code: a denial raises
@@ -382,8 +384,8 @@ the run's `run_finished` detail, yet the run still exits `0` with
 `outcome: "success"`. A revocation therefore stops
 pruning silently while every run stays green; a dedicated `cinc-mirror prune`
 step is what makes it visible. A missing token is the same silent green in either
-command. The fix for both is `GHCR_TOKEN` (or the `GITHUB_TOKEN` fallback) with
-`packages: write`.
+command. The fix for both is `CINC_MIRROR_<TARGET>_API_TOKEN` (or the `GHCR_TOKEN`
+and `GITHUB_TOKEN` fallbacks) with `packages: write`.
 
 A first prune is not a tidy-up of a stray tag; it removes whole old majors that
 the configured lines no longer cover. `max_deletions` spreads that over several
@@ -393,9 +395,17 @@ resolve a version upstream first and fall back to the upstream download URL when
 the mirror cannot serve it, so they can re-install it and a later `backfill`
 puts it back.
 
+A scope-narrowed run deletes outside its own narrowness: `prune --versions
+'19.4.46*'` keeps only the matching versions of every project it touches and
+deletes every other version of those projects. The same holds for a
+`mirror --versions` run, whose closing prune reconciles the whole touched project
+against the narrowed crawl.
+
 Going back to a binary without `prune` needs both steps: remove the whole
 `[retention]` table (the older binary rejects the unknown keys) and delete the
-`pruned` events (an older ledger would read them as broken publications).
+`pruned` and `prune_failed` events (an older ledger reads a `pruned` event as a
+broken publication and does not know `prune_failed` at all); the events live in
+the run files (`<state_dir>/ledger-repo/runs/<run_id>.ndjson`).
 
 ## CI and scheduled backfill
 

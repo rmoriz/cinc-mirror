@@ -613,7 +613,10 @@ fn prune_binary(config: &Path, extra: &[&str], token: bool) -> std::process::Out
     if token {
         command.env("GHCR_TOKEN", "ghcr-e2e-token");
     } else {
-        command.env_remove("GHCR_TOKEN").env_remove("GITHUB_TOKEN");
+        command
+            .env_remove("GHCR_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("CINC_MIRROR_GHCR_API_TOKEN");
     }
     command.output().expect("run prune")
 }
@@ -740,7 +743,9 @@ async fn e2e_binary_prune_without_a_token_stays_green_and_prunes_nothing() {
     );
     // Only the warning distinguishes it from a reconciled, empty target.
     assert!(
-        stderr.contains("packages deletes need GHCR_TOKEN or GITHUB_TOKEN"),
+        stderr.contains(
+            "packages deletes need CINC_MIRROR_<TARGET>_API_TOKEN, GHCR_TOKEN or GITHUB_TOKEN"
+        ),
         "{stderr}"
     );
     assert!(mock.versions_for("mirror/cinc").len() == 1);

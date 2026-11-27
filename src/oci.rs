@@ -73,6 +73,7 @@ use reqwest::{Client, Method, Response, StatusCode};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tracing::warn;
 use url::Url;
 
 use crate::config::{Config, TargetAuth, TargetConfig, TargetKind};
@@ -231,6 +232,7 @@ pub struct Registry {
     auth: OciAuth,
     client: Client,
     tokens: Mutex<HashMap<(String, String), CachedToken>>,
+    warned_head_digest: std::sync::atomic::AtomicBool,
     request_timeout: Duration,
     idle_read_timeout: Duration,
     attempts: usize,
@@ -337,6 +339,7 @@ impl Registry {
             auth: config.auth,
             client,
             tokens: Mutex::new(HashMap::new()),
+            warned_head_digest: std::sync::atomic::AtomicBool::new(false),
             request_timeout: config.request_timeout,
             idle_read_timeout: config.idle_read_timeout,
             attempts: RETRY_ATTEMPTS,
@@ -616,7 +619,8 @@ impl Registry {
     ///
     /// Only the `Docker-Content-Digest` header is used; a `HEAD` that succeeds
     /// without it also reports `None`, so the caller treats the manifest as
-    /// absent instead of guessing a digest from a body that was never read.
+    /// absent instead of guessing a digest from a body that was never read. A
+    /// registry that answers that way is warned about once per client.
     ///
     /// # Errors
     ///
@@ -691,7 +695,21 @@ impl Registry {
             .request(Method::HEAD, url, repo, &pull_scope(repo), &headers, None)
             .await?;
         match response.status() {
-            status if status.is_success() => Ok(digest_header(&response)),
+            status if status.is_success() => {
+                let digest = digest_header(&response);
+                if digest.is_none()
+                    && !self
+                        .warned_head_digest
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    warn!(
+                        registry = self.registry.as_str(),
+                        repo,
+                        "the registry answers a manifest HEAD without Docker-Content-Digest; the manifest is treated as absent"
+                    );
+                }
+                Ok(digest)
+            }
             StatusCode::NOT_FOUND => Ok(None),
             status => Err(self
                 .status_error(&Method::HEAD, url, status, response)
@@ -2018,8 +2036,8 @@ fn read_password_file(path: &Path) -> Result<String, AuthError> {
     Ok(password.to_string())
 }
 
-/// `<NAME>` in `CINC_MIRROR_<NAME>_{USER,PASSWORD,TOKEN}`.
-fn target_env_prefix(name: &str) -> String {
+/// `<NAME>` in `CINC_MIRROR_<NAME>_{USER,PASSWORD,TOKEN,API_TOKEN}`.
+pub(crate) fn target_env_prefix(name: &str) -> String {
     let mut sanitized = String::with_capacity(name.len());
     for character in name.chars() {
         if character.is_ascii_alphanumeric() {

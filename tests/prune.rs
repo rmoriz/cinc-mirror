@@ -423,7 +423,6 @@ async fn a_project_without_crawled_artifacts_is_emptied_and_warned_about_once() 
     let protected = mock.seed_version("mirror/cinc", &[&protected_artifact.tag()], Utc::now());
     let wanted = Wanted {
         tags: ["19.4.46".to_string()].into_iter().collect(),
-        digests: Default::default(),
     };
 
     let ctx = packages_context(state.path(), ledger, &mock);
@@ -865,6 +864,161 @@ async fn a_dry_run_on_a_405_endpoint_skips_instead_of_planning() {
 }
 
 #[tokio::test]
+async fn a_version_with_one_wanted_tag_survives_the_prune() {
+    let _guard = lock_env().await;
+    let _token = EnvVar::set("GHCR_TOKEN", "test-token");
+    let mock = MockPackages::start().await;
+    mock.owner_is_org("acme");
+    // A second policy mirrored the same payload, so GitHub stores one version
+    // under both tags. Deleting the version would take the wanted tag with it.
+    let stale = "19.4.45-debian-13-amd64";
+    let wanted_tag = "19.4.46-debian-13-amd64";
+    let version = mock.seed_version(
+        "mirror/cinc",
+        &[stale, wanted_tag],
+        Utc::now() - ChronoDuration::hours(2),
+    );
+    assert!(version > 0);
+    let state = tempfile::tempdir().expect("state dir");
+    let ledger = Ledger::open(state.path()).expect("ledger");
+    let wanted = Wanted {
+        tags: [wanted_tag.to_string()].into_iter().collect(),
+    };
+
+    let ctx = packages_context(state.path(), ledger, &mock);
+    let report = prune(&ctx, &[PROJECT], &wanted, Opts::default()).await;
+
+    assert_eq!(report.pruned, 0, "{report:?}");
+    assert!(mock.deleted().is_empty(), "the shared version stays");
+    let versions = mock.versions_for("mirror/cinc");
+    assert!(
+        versions.contains(&wanted_tag.to_string()),
+        "the wanted tag still resolves: {versions:?}"
+    );
+    assert!(versions.contains(&stale.to_string()), "{versions:?}");
+    assert_eq!(mock.versions_for("mirror/cinc").len(), 2);
+}
+
+#[tokio::test]
+async fn a_version_with_two_stale_tags_is_deleted_once() {
+    let _guard = lock_env().await;
+    let _token = EnvVar::set("GHCR_TOKEN", "test-token");
+    let mock = MockPackages::start().await;
+    mock.owner_is_org("acme");
+    let version = mock.seed_version(
+        "mirror/cinc",
+        &["19.4.45-debian-13-amd64", "19.4.44-debian-13-amd64"],
+        Utc::now() - ChronoDuration::hours(2),
+    );
+    let state = tempfile::tempdir().expect("state dir");
+    let ledger = Ledger::open(state.path()).expect("ledger");
+
+    let ctx = packages_context(state.path(), ledger, &mock);
+    let report = prune(&ctx, &[PROJECT], &Wanted::default(), Opts::default()).await;
+
+    assert_eq!(report.pruned, 1, "one version, one deletion: {report:?}");
+    assert_eq!(mock.deleted(), vec![version]);
+    assert_eq!(report.deferred, 0, "{report:?}");
+    assert_eq!(
+        mock.request_log()
+            .iter()
+            .filter(|(method, _)| method == "DELETE")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_stale_tag_sharing_a_manifest_with_a_wanted_tag_survives() {
+    let mock = mock_registry().await;
+    let state = tempfile::tempdir().expect("state dir");
+    let ledger = Ledger::open(state.path()).expect("ledger");
+    // Both tags resolve to one manifest, as a second policy's digest-qualified
+    // tag does. A delete by digest would drop the wanted tag as well.
+    let wanted_tag = "19.4.46-debian-13-amd64";
+    let stale_tag = "19.4.45-debian-13-amd64";
+    mock.store_manifest(&repo(PROJECT), wanted_tag, b"shared bytes");
+    mock.store_manifest(&repo(PROJECT), stale_tag, b"shared bytes");
+    let wanted = Wanted {
+        tags: [wanted_tag.to_string()].into_iter().collect(),
+    };
+
+    let ctx = registry_context(state.path(), ledger, &mock);
+    let report = prune(&ctx, &[PROJECT], &wanted, Opts::default()).await;
+
+    assert_eq!(report.pruned, 0, "{report:?}");
+    assert_eq!(mock.delete_count(), 0);
+    assert!(mock.manifest(&repo(PROJECT), stale_tag).is_some());
+    assert!(
+        mock.manifest(&repo(PROJECT), wanted_tag).is_some(),
+        "the wanted tag still resolves"
+    );
+}
+
+#[tokio::test]
+async fn a_target_api_token_alone_authenticates_the_packages_backend() {
+    let _guard = lock_env().await;
+    let _ghcr = EnvVar::remove("GHCR_TOKEN");
+    let _github = EnvVar::remove("GITHUB_TOKEN");
+    let _target = EnvVar::remove("CINC_MIRROR_GHCR_API_TOKEN");
+    let _target_set = EnvVar::set("CINC_MIRROR_GHCR_API_TOKEN", "target-token");
+    let mock = MockPackages::start().await;
+    mock.owner_is_org("acme");
+    let version = mock.seed_version(
+        "mirror/cinc",
+        &["19.4.46"],
+        Utc::now() - ChronoDuration::hours(2),
+    );
+    let state = tempfile::tempdir().expect("state dir");
+    let ledger = Ledger::open(state.path()).expect("ledger");
+
+    let ctx = packages_context(state.path(), ledger, &mock);
+    let report = prune(&ctx, &[PROJECT], &Wanted::default(), Opts::default()).await;
+
+    assert_eq!(report.pruned, 1, "{report:?}");
+    assert_eq!(mock.deleted(), vec![version]);
+    assert!(
+        mock.authorizations()
+            .iter()
+            .flatten()
+            .any(|header| header == "Bearer target-token"),
+        "{:?}",
+        mock.authorizations()
+    );
+}
+
+#[tokio::test]
+async fn a_405_keeps_the_whole_round_deferred() {
+    let mock = mock_registry().await;
+    mock.answer_405();
+    let state = tempfile::tempdir().expect("state dir");
+    let ledger = Ledger::open(state.path()).expect("ledger");
+    mock.store_manifest(&repo(PROJECT), "19.4.46-debian-13-amd64", b"stale one");
+    mock.store_manifest(&repo("cinc-auditor"), "4.18.100-debian-13-amd64", b"other");
+
+    let ctx = registry_context(state.path(), ledger, &mock);
+    let report = prune(
+        &ctx,
+        &[PROJECT, "cinc-auditor"],
+        &Wanted::default(),
+        Opts::default(),
+    )
+    .await;
+
+    assert_eq!(report.targets_skipped, vec!["ghcr".to_string()]);
+    assert_eq!(report.pruned, 0, "{report:?}");
+    assert_eq!(
+        report.deferred, 2,
+        "both refused references wait for the next run: {report:?}"
+    );
+    assert_eq!(
+        mock.delete_attempts(),
+        2,
+        "both references were already in flight"
+    );
+}
+
+#[tokio::test]
 async fn a_digest_qualified_wanted_tag_survives() {
     let mock = mock_registry().await;
     let state = tempfile::tempdir().expect("state dir");
@@ -874,7 +1028,6 @@ async fn a_digest_qualified_wanted_tag_survives() {
     mock.store_manifest(&repo(PROJECT), "19.4.45-debian-13-amd64", b"stale");
     let wanted = Wanted {
         tags: [tag.to_string()].into_iter().collect(),
-        digests: Default::default(),
     };
 
     let ctx = registry_context(state.path(), ledger, &mock);
@@ -901,7 +1054,6 @@ async fn sweep_orphans_empties_unnamed_packages_and_spares_foreign_repositories(
     let ledger = Ledger::open(state.path()).expect("ledger");
     let wanted = Wanted {
         tags: ["19.4.46".to_string()].into_iter().collect(),
-        digests: Default::default(),
     };
 
     let ctx = packages_context(state.path(), ledger, &mock);
@@ -963,6 +1115,7 @@ async fn an_ineligible_target_has_no_backend() {
     let _guard = lock_env().await;
     let _ghcr = EnvVar::remove("GHCR_TOKEN");
     let _github = EnvVar::remove("GITHUB_TOKEN");
+    let _target = EnvVar::remove("CINC_MIRROR_GHCR_API_TOKEN");
     let mock = mock_registry().await;
     let state = tempfile::tempdir().expect("state dir");
     let config = config_with_retention(

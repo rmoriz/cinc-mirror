@@ -238,7 +238,8 @@ pub struct RunArgs {
     #[arg(long)]
     pub prune: bool,
 
-    /// Report what would happen without downloading or publishing
+    /// Report what would happen without downloading or publishing (a prune
+    /// deletes the first candidate per target as a capability probe)
     #[arg(long)]
     pub dry_run: bool,
 
@@ -356,7 +357,7 @@ pub struct PruneArgs {
     #[arg(long = "target", value_name = "NAME")]
     pub targets: Vec<String>,
 
-    /// Delete at most this many references (default: `[retention]
+    /// Delete at most this many references per target (default: `[retention]
     /// max_deletions`)
     #[arg(long = "limit", value_name = "N", value_parser = parse_positive)]
     pub limit: Option<usize>,

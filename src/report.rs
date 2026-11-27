@@ -57,8 +57,9 @@ pub fn redact_secrets(text: &str) -> String {
 ///
 /// The mirror hands `RSYNC_PASSWORD` (the rsync daemon password),
 /// `CINC_MIRROR_<TARGET>_PASSWORD` (basic-auth registry credentials) and
-/// `CINC_MIRROR_GHCR_API_TOKEN` (the packages delete token) to child processes
-/// and libraries, so a diagnostic that quotes one must not echo it back.
+/// `CINC_MIRROR_<TARGET>_API_TOKEN` (the packages delete token) to child
+/// processes and libraries, so a diagnostic that quotes one must not echo it
+/// back.
 fn is_secret_env(name: &str) -> bool {
     TOKEN_ENV.contains(&name)
         || (name.starts_with("CINC_MIRROR_")

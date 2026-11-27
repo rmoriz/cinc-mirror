@@ -35,7 +35,8 @@ own test and operator story may not depend on GitHub.
    or forced by configuration.
 4. Prune is off in a plain `mirror.toml`, on in `mirror.ci.toml`. A local run
    against the untracked config stays conservative; CI cannot forget the switch.
-5. `--dry-run` lists what would be deleted and deletes nothing.
+5. `--dry-run` lists what would be deleted; only the first candidate of each
+   target is deleted for real, as a capability probe.
 6. Every deletion and every failure is a ledger event; the run summary counts
    both and `--json` carries them.
 7. A pruned publication is a first-class state: `verify` stops checking it, and
@@ -164,9 +165,15 @@ delete bytes the policy still asks for.
   not. The immutability archive outlives the incident: the local GC also keeps
   those blobs forever, and the rsync target keeps
   `<basename>.superseded-<sha12>` forever.
-- On the packages path, an untagged version whose manifest digest is either a
-  wanted tag's digest in the listing, or the `remote_digest` of a wanted
-  publication row; and any untagged version created after the cutoff.
+- The newest reference under a tag serves it. A serving reference of a wanted or
+  protected tag survives with every other tag on it, and its digest protects
+  every other reference of the same bytes. Both backends delete a whole manifest
+  or version, so a wanted tag also has to keep a stale tag that points at the
+  same bytes; older duplicates under the same wanted tag carry no other tag and
+  are candidates.
+- On the packages path, an untagged version whose manifest digest one of those
+  survivors holds, or which is the `remote_digest` of a wanted publication row;
+  and any untagged version created after the cutoff.
 - On the spec path, nothing is deleted that arrived after the cutoff: resolve
   `HEAD` before `DELETE`, and a missing manifest is a no-op success.
 
@@ -177,7 +184,10 @@ the events and the summary. The backends only list and delete:
 
 ```rust
 pub struct RemoteReference {
+    /// Primary tag, for log lines and the one-tag registry backend.
     pub tag: Option<String>,
+    /// Every tag on this reference; one version can carry several.
+    pub tags: Vec<String>,
     pub digest: String,
     pub created: Option<DateTime<Utc>>,
     pub version_id: Option<u64>,
@@ -273,10 +283,10 @@ sweeps.
   below `collect_garbage` is reached. The dry-run prune pass therefore runs
   *before* that return and fills the summary with what it would delete; the real
   pass runs after `collect_garbage`, before `run_finished`.
-- The prune pass skips a target when: the run is a dry run without `--json` and
-  the caller asked for no list, the packages credential is missing, the
-  namespace is ineligible, or the target answered `Unsupported`. All but the
-  first are warnings.
+- The prune pass skips a target when: the packages credential is missing, the
+  namespace is ineligible, or the target answered `Unsupported`. All are
+  warnings. A dry run runs the same pass over every target and only limits how
+  much it deletes.
 - `--dry-run` streams the would-be deletions to stdout as
   `<registry>/<repo>:<tag>` (or `<registry>/<repo>@<digest>` for an untagged
   version), one per line, and writes no events.
@@ -318,10 +328,11 @@ redacted.
   probe; the package catalogue; and a denial switch.
 - `tests/prune.rs` covers: wanted tag kept; a digest-qualified tag kept; stale
   tag deleted; open incident's canonical and superseded tags kept; closed
-  incident's superseded tag kept; untagged version wanted-by-digest kept;
+  incident's superseded tag kept; untagged version with a protected digest kept;
   untagged version newer than the cutoff kept; older untagged version deleted;
-  the `max_deletions` tail deferred and reported; `--dry-run` deletes nothing
-  and surfaces a listing failure as a warning; a failed deletion does not change
+  the `max_deletions` tail deferred and reported; `--dry-run` deletes only the
+  first candidate per target, lists the rest and surfaces a listing failure as a
+  warning; a failed deletion does not change
   a publish run's exit code; `prune` alone exits `2`; a project outside
   `--project` is untouched; `404` on `DELETE` is success; a denial aborts the
   package with one warning; orphan package pruned; non-`<repo>/` package

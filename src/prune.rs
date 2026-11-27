@@ -2,10 +2,9 @@
 //! delete and the deletes themselves.
 //!
 //! The wanted set is what the crawl still covers: the descriptive tag of every
-//! crawled artifact, the `-superseded` archive tag when the crawl flagged the
-//! artifact as superseded, and the artifact's `sha256:` digest. Every reference
-//! a target lists that no wanted or protected reference claims is a delete
-//! candidate.
+//! crawled artifact and the `-superseded` archive tag when the crawl flagged the
+//! artifact as superseded. Every reference a target lists that no wanted or
+//! protected reference claims is a delete candidate.
 //!
 //! Two sources protect beyond the wanted set:
 //!
@@ -15,9 +14,19 @@
 //! - Every reference of an artifact with an open incident stays until a human
 //!   decides what happens to it.
 //!
-//! A digest the crawl still wants also protects an untagged copy: the same
-//! bytes can be listed both with and without a tag, and only the tagged copy
-//! carries the identity the crawl knows.
+//! A reference's tags are a set, not a single tag: one manifest can carry
+//! several (a second policy mirroring the same bytes gets a digest-qualified tag
+//! next to the plain one), and both backends delete a whole manifest or version
+//! with all of its tags. The reference that serves a wanted or protected tag
+//! therefore survives, and its digest protects every other reference of the same
+//! bytes — which is what keeps a stale tag from taking a wanted tag's manifest
+//! with it.
+//!
+//! The `remote_digest` of a wanted publication also protects an untagged copy:
+//! the same bytes can be listed both with and without a tag, and only the tagged
+//! copy carries the identity the crawl knows. Those digests are manifest digests,
+//! the space every listing digest lives in; the artifact `sha256:` is the
+//! payload's and never matches one.
 //!
 //! # Execution
 //!
@@ -66,9 +75,18 @@ use crate::runner::Seq;
 /// One reference a target lists: a tag, a digest, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteReference {
-    /// The tag, when the reference is tagged.
+    /// The tag used in log lines and dry-run lines, when the reference is
+    /// tagged: the alphabetically first of [`RemoteReference::tags`].
     pub tag: Option<String>,
-    /// The manifest digest the reference resolves to.
+    /// Every tag the reference carries.
+    ///
+    /// A registry listing has exactly one; a packages version carries every tag
+    /// GitHub lists for it, and can carry none. Both backends delete a whole
+    /// manifest or version, so all of them travel with the reference and any one
+    /// of them can keep it alive.
+    pub tags: Vec<String>,
+    /// The manifest digest the reference resolves to, empty when the listing
+    /// could not resolve one.
     pub digest: String,
     /// When the target says the reference was created, when it says so at all.
     pub created: Option<DateTime<Utc>>,
@@ -76,13 +94,11 @@ pub struct RemoteReference {
     pub version_id: Option<u64>,
 }
 
-/// The tags and digests the crawl still wants.
+/// The tags the crawl still wants.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Wanted {
     /// Descriptive and `-superseded` tags of the crawled artifacts.
     pub tags: BTreeSet<String>,
-    /// `sha256:<hex>` digests of the crawled artifacts.
-    pub digests: BTreeSet<String>,
 }
 
 /// The tags and digests that keep a reference alive past the wanted set.
@@ -90,7 +106,8 @@ pub struct Wanted {
 pub struct Protection {
     /// References and tags kept for an open incident or an archived artifact.
     pub tags: BTreeSet<String>,
-    /// Digests of wanted publication rows; they keep untagged copies alive.
+    /// Digests of wanted publication rows; they keep untagged copies and stale
+    /// tags of the same bytes alive.
     pub digests: BTreeSet<String>,
 }
 
@@ -103,9 +120,12 @@ pub struct Planned {
     pub deferred: usize,
     /// Untagged references that survive on their digest or their age.
     pub kept_untagged: usize,
+    /// Candidates that survive because a surviving reference holds their
+    /// digest: the bytes have to stay for the survivor.
+    pub kept_shared: usize,
 }
 
-/// Collect the tags and digests the crawl still wants.
+/// Collect the tags the crawl still wants.
 ///
 /// A superseded artifact also wants its `-superseded` archive tag, because that
 /// is the reference its bytes are published under.
@@ -117,7 +137,6 @@ pub fn wanted(artifacts: &[&Artifact]) -> Wanted {
         if artifact.superseded {
             wanted.tags.insert(artifact.superseded_tag());
         }
-        wanted.digests.insert(format!("sha256:{}", artifact.sha256));
     }
     wanted
 }
@@ -166,7 +185,7 @@ fn bare_tag(remote_ref: &str) -> &str {
 /// open incident.
 ///
 /// The `remote_digest` of every publication whose key is wanted also protects
-/// untagged copies of those bytes.
+/// untagged copies and stale tags of those bytes.
 #[must_use]
 pub fn protect(
     wanted_keys: &BTreeSet<String>,
@@ -204,13 +223,27 @@ pub fn protect(
 
 /// Decide which listed references to delete.
 ///
-/// A tag survives when it is wanted or protected; the digest of the reference
-/// that survives under it then protects untagged copies of the same bytes. An
-/// untagged reference survives on a wanted or protected digest, or when it is
-/// newer than `cutoff` (an undated one is not newer).
+/// The newest reference under a tag serves it; only the other tags of that
+/// reference save it. A serving reference of a wanted or protected tag survives
+/// and its digest protects every other reference of the same bytes: both
+/// backends delete the manifest or version with all of its tags at once, so a
+/// stale tag that happens to sit next to a wanted one on the same version cannot
+/// take it down. A candidate whose digest a survivor also holds stays as well
+/// ([`Planned::kept_shared`]). Older duplicates under a wanted tag carry no other
+/// tag and are candidates.
+///
+/// An untagged reference survives on a protected digest or when it is newer than
+/// `cutoff` (an undated one is not newer).
 ///
 /// References are deleted oldest first, undated ones first; `budget` caps the
-/// deletions and the rest is counted in [`Planned::deferred`].
+/// deletions and the rest is counted in [`Planned::deferred`]. The command layer
+/// plans with `usize::MAX` and hands the budget out one reference per project at
+/// a time instead, so the cap only matters to the unit tests.
+///
+/// The registry path protects no freshness beyond the `cutoff` check on untagged
+/// references: a tag carries no creation time, and `HEAD`-then-`DELETE` removes
+/// whatever the tag points at when the delete runs, not what it pointed at while
+/// the listing was read.
 #[must_use]
 pub fn plan(
     wanted: &Wanted,
@@ -225,12 +258,15 @@ pub fn plan(
 
     let mut by_tag: BTreeMap<&str, Vec<&RemoteReference>> = BTreeMap::new();
     for reference in listed {
-        if let Some(tag) = reference.tag.as_deref() {
+        for tag in &reference.tags {
             by_tag.entry(tag).or_default().push(reference);
         }
     }
+    let mut seen: BTreeSet<(String, Option<u64>)> = BTreeSet::new();
     // The newest reference under a tag is the one that serves it. `None` sorts
-    // first, so it is the oldest, and the digest breaks ties.
+    // first, so it is the oldest, and the digest breaks ties. A serving
+    // reference of a wanted or protected tag keeps the bytes; the older
+    // duplicates under the same tag do not.
     for (tag, mut references) in by_tag {
         references.sort_by(|left, right| oldest_first(left, right));
         let Some((serving, older)) = references.split_last() else {
@@ -239,30 +275,63 @@ pub fn plan(
         if wanted.tags.contains(tag) || protection.tags.contains(tag) {
             protected_digests.insert(serving.digest.as_str());
         } else {
-            candidates.push((*serving).clone());
+            push_candidate(serving, &mut candidates, &mut seen);
         }
-        candidates.extend(older.iter().map(|reference| (*reference).clone()));
+        for reference in older {
+            push_candidate(reference, &mut candidates, &mut seen);
+        }
     }
 
-    for reference in listed.iter().filter(|reference| reference.tag.is_none()) {
+    for reference in listed.iter().filter(|reference| reference.tags.is_empty()) {
         let digest = reference.digest.as_str();
         let newer = reference.created.is_some_and(|created| created > cutoff);
-        if wanted.digests.contains(digest)
-            || protection.digests.contains(digest)
-            || protected_digests.contains(digest)
-            || newer
-        {
+        if protection.digests.contains(digest) || protected_digests.contains(digest) || newer {
             planned.kept_untagged += 1;
         } else {
-            candidates.push(reference.clone());
+            push_candidate(reference, &mut candidates, &mut seen);
         }
     }
 
     candidates.sort_by(oldest_first);
-    planned.deferred = candidates.len().saturating_sub(budget);
-    candidates.truncate(budget);
-    planned.delete = candidates;
+    let mut kept: Vec<RemoteReference> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let digest = candidate.digest.as_str();
+        if !digest.is_empty()
+            && (protected_digests.contains(digest) || protection.digests.contains(digest))
+        {
+            // The bytes stay for a surviving reference; deleting them would take
+            // the survivor with them.
+            planned.kept_shared += 1;
+        } else {
+            kept.push(candidate);
+        }
+    }
+    planned.deferred = kept.len().saturating_sub(budget);
+    kept.truncate(budget);
+    planned.delete = kept;
     planned
+}
+
+/// Add `reference` to `candidates` unless it is already there.
+///
+/// One reference shows up once per tag it carries, and a digest the listing
+/// reports twice is one manifest; deleting it twice would only waste a request.
+fn push_candidate(
+    reference: &RemoteReference,
+    candidates: &mut Vec<RemoteReference>,
+    seen: &mut BTreeSet<(String, Option<u64>)>,
+) {
+    let key = if reference.digest.is_empty() {
+        (
+            reference.tag.clone().unwrap_or_default(),
+            reference.version_id,
+        )
+    } else {
+        (reference.digest.clone(), reference.version_id)
+    };
+    if seen.insert(key) {
+        candidates.push(reference.clone());
+    }
 }
 
 /// Order delete candidates oldest first, undated ones before everything.
@@ -493,11 +562,16 @@ pub fn backend_for(config: &Config, target: &TargetConfig) -> Option<Backend> {
         );
         return None;
     }
-    let token = env_value("GHCR_TOKEN").or_else(|| env_value("GITHUB_TOKEN"));
+    let token = env_value(&format!(
+        "{}_API_TOKEN",
+        crate::oci::target_env_prefix(&target.name)
+    ))
+    .or_else(|| env_value("GHCR_TOKEN"))
+    .or_else(|| env_value("GITHUB_TOKEN"));
     let Some(token) = token else {
         warn!(
             target = target.name.as_str(),
-            "packages deletes need GHCR_TOKEN or GITHUB_TOKEN; skipping the target"
+            "packages deletes need CINC_MIRROR_<TARGET>_API_TOKEN, GHCR_TOKEN or GITHUB_TOKEN; skipping the target"
         );
         return None;
     };
@@ -697,7 +771,9 @@ async fn prune_target(
 
     // Plan every project with the whole budget; the rounds below hand it out
     // one reference per project at a time, so no project can drain the target
-    // and a denial costs at most the requests already in flight.
+    // and a denial costs at most the requests already in flight. The budget is
+    // therefore always `usize::MAX` here and `Planned::deferred` stays `0`; the
+    // rounds count what they leave behind instead.
     struct Slot {
         project: String,
         references: VecDeque<RemoteReference>,
@@ -711,7 +787,6 @@ async fn prune_target(
             (pass.wanted, &protection)
         };
         let planned = plan(wanted, protection, &project.references, cutoff, usize::MAX);
-        report.deferred += planned.deferred;
         slots.push(Slot {
             project: project.project.clone(),
             dead: planned.delete.is_empty(),
@@ -863,7 +938,11 @@ async fn prune_target(
             .collect()
             .await;
 
-        for (index, outcome) in outcomes {
+        let mut outcomes: BTreeMap<usize, Deleted> = outcomes.into_iter().collect();
+        for (index, candidate) in window {
+            let Some(outcome) = outcomes.remove(&index) else {
+                continue;
+            };
             match outcome {
                 Deleted::Missing => budget += 1,
                 Deleted::Pruned(_) => report.pruned += 1,
@@ -871,6 +950,9 @@ async fn prune_target(
                     note_skip(target, report);
                     abandoned = true;
                     budget += 1;
+                    // The reference was only refused, so it waits like the rest
+                    // of the target instead of vanishing from the counts.
+                    slots[index].references.push_front(candidate.reference);
                 }
                 Deleted::Denied(reason) => {
                     report.failed += 1;
@@ -964,11 +1046,7 @@ async fn protection_and_index(
 
     let wanted_keys: BTreeSet<String> = rows
         .iter()
-        .filter(|row| {
-            wanted
-                .digests
-                .contains(&format!("sha256:{}", row.artifact.sha256))
-        })
+        .filter(|row| wanted.tags.contains(&row.artifact.tag()))
         .map(|row| row.artifact.key())
         .collect();
     let by_key: BTreeMap<String, &ArtifactRow> =
@@ -994,21 +1072,30 @@ async fn list_references(
     match backend {
         Backend::Registry(registry) => {
             let repo = format!("{namespace}/{project}");
-            registry.list_tags(&repo).await.map_or_else(
-                |error| Err(oci_failure(&error)),
-                |tags| {
-                    let references = tags
-                        .into_iter()
-                        .map(|tag| RemoteReference {
-                            tag: Some(tag),
-                            digest: String::new(),
-                            created: None,
-                            version_id: None,
-                        })
-                        .collect();
-                    Ok((references, None))
-                },
-            )
+            let tags = registry
+                .list_tags(&repo)
+                .await
+                .map_err(|error| oci_failure(&error))?;
+            // The plan decides on digests, so every tag is resolved here. A
+            // `HEAD` that fails leaves the digest empty; `delete_one` resolves
+            // it again right before the delete and reports its own failure.
+            let mut references = Vec::with_capacity(tags.len());
+            for tag in tags {
+                let digest = registry
+                    .head_manifest(&repo, &tag)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                references.push(RemoteReference {
+                    tag: Some(tag.clone()),
+                    tags: vec![tag],
+                    digest,
+                    created: None,
+                    version_id: None,
+                });
+            }
+            Ok((references, None))
         }
         Backend::Packages {
             api_base,
@@ -1027,9 +1114,14 @@ async fn list_references(
 }
 
 /// Turn one listed package version into a reference.
-fn reference_from_version(version: RemoteVersion) -> RemoteReference {
+///
+/// All tags travel with the version; GitHub lists them in no particular order,
+/// so they are sorted and the first one is the primary for log lines.
+fn reference_from_version(mut version: RemoteVersion) -> RemoteReference {
+    version.tags.sort();
     RemoteReference {
-        tag: version.tags.into_iter().next(),
+        tag: version.tags.first().cloned(),
+        tags: version.tags,
         digest: version.digest,
         created: Some(version.created_at),
         version_id: Some(version.id),
@@ -1093,18 +1185,23 @@ async fn record(
     let Some(seq) = pass.seq else {
         return;
     };
+    let package = format!("{}/{repo}", target.registry.as_deref().unwrap_or_default());
     let (kind, detail) = match outcome {
         Deleted::Pruned(digest) => (
             EventKind::Pruned,
             json!({
                 "remote_ref": remote_ref,
                 "remote_digest": digest,
-                "package": format!("{}/{repo}", target.registry.as_deref().unwrap_or_default()),
+                "package": package,
             }),
         ),
         Deleted::Failed(error) => (
             EventKind::PruneFailed,
-            json!({"remote_ref": remote_ref, "error": redact_secrets(error)}),
+            json!({
+                "remote_ref": remote_ref,
+                "package": package,
+                "error": redact_secrets(error),
+            }),
         ),
         Deleted::Missing | Deleted::Unsupported | Deleted::Denied(_) => return,
     };
@@ -1306,6 +1403,22 @@ mod tests {
     fn tagged(tag: &str, digest: &str, created: Option<DateTime<Utc>>) -> RemoteReference {
         RemoteReference {
             tag: Some(tag.to_string()),
+            tags: vec![tag.to_string()],
+            digest: digest.to_string(),
+            created,
+            version_id: None,
+        }
+    }
+
+    /// One version carrying several tags, as a packages listing reports it.
+    fn multi_tagged(
+        tags: &[&str],
+        digest: &str,
+        created: Option<DateTime<Utc>>,
+    ) -> RemoteReference {
+        RemoteReference {
+            tag: tags.first().map(|tag| (*tag).to_string()),
+            tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
             digest: digest.to_string(),
             created,
             version_id: None,
@@ -1315,6 +1428,7 @@ mod tests {
     fn untagged(digest: &str, created: Option<DateTime<Utc>>) -> RemoteReference {
         RemoteReference {
             tag: None,
+            tags: Vec::new(),
             digest: digest.to_string(),
             created,
             version_id: None,
@@ -1324,14 +1438,6 @@ mod tests {
     fn wanted_tags(tags: &[&str]) -> Wanted {
         Wanted {
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
-            digests: BTreeSet::new(),
-        }
-    }
-
-    fn wanted_digests(digests: &[&str]) -> Wanted {
-        Wanted {
-            tags: BTreeSet::new(),
-            digests: digests.iter().map(|digest| (*digest).to_string()).collect(),
         }
     }
 
@@ -1417,7 +1523,7 @@ mod tests {
     }
 
     #[test]
-    fn wanted_collects_the_tag_the_archive_tag_and_the_digest() {
+    fn wanted_collects_the_tag_and_the_archive_tag() {
         let plain = artifact("19.4.46", &sha('a'));
         let archived = artifact("19.4.47", &sha('b')).with_superseded(true);
 
@@ -1426,7 +1532,7 @@ mod tests {
         assert!(wanted.tags.contains(&plain.tag()));
         assert!(wanted.tags.contains(&archived.tag()));
         assert!(wanted.tags.contains(&archived.superseded_tag()));
-        assert_eq!(wanted.digests, BTreeSet::from([digest('a'), digest('b')]));
+        assert_eq!(wanted.tags.len(), 3);
     }
 
     #[test]
@@ -1657,22 +1763,6 @@ mod tests {
     }
 
     #[test]
-    fn an_untagged_version_is_kept_while_its_digest_is_wanted() {
-        let listed = vec![untagged(&digest('a'), Some(at(1)))];
-
-        let planned = plan(
-            &wanted_digests(&[&digest('a')]),
-            &Protection::default(),
-            &listed,
-            at(10),
-            10,
-        );
-
-        assert!(planned.delete.is_empty());
-        assert_eq!(planned.kept_untagged, 1);
-    }
-
-    #[test]
     fn an_untagged_version_is_kept_while_its_digest_is_protected() {
         let listed = vec![untagged(&digest('a'), Some(at(1)))];
         let protection = Protection {
@@ -1803,6 +1893,83 @@ mod tests {
         );
 
         assert_eq!(planned.delete, vec![older]);
+    }
+
+    #[test]
+    fn a_version_with_one_wanted_tag_survives_whole() {
+        // Both backends delete the version and every tag on it, so the wanted
+        // tag has to keep the stale one alive too.
+        let kept = multi_tagged(
+            &["19.4.45-debian-13-amd64", "19.4.46-debian-13-amd64"],
+            &digest('a'),
+            Some(at(1)),
+        );
+        let listed = vec![kept];
+
+        let planned = plan(
+            &wanted_tags(&["19.4.46-debian-13-amd64"]),
+            &Protection::default(),
+            &listed,
+            at(10),
+            10,
+        );
+
+        assert!(planned.delete.is_empty());
+        assert_eq!(planned.kept_shared, 1);
+    }
+
+    #[test]
+    fn a_wanted_tag_protects_another_stale_tag_of_its_digest() {
+        let stale = tagged("19.4.45-debian-13-amd64", &digest('a'), Some(at(1)));
+        let wanted = tagged("19.4.46-debian-13-amd64", &digest('a'), Some(at(2)));
+        let listed = vec![wanted, stale];
+
+        let planned = plan(
+            &wanted_tags(&["19.4.46-debian-13-amd64"]),
+            &Protection::default(),
+            &listed,
+            at(10),
+            10,
+        );
+
+        assert!(planned.delete.is_empty());
+        assert_eq!(planned.kept_shared, 1);
+    }
+
+    #[test]
+    fn a_version_with_two_stale_tags_is_one_candidate() {
+        let stale = multi_tagged(
+            &["19.4.44-debian-13-amd64", "19.4.45-debian-13-amd64"],
+            &digest('a'),
+            Some(at(1)),
+        );
+        let listed = vec![stale.clone()];
+
+        let planned = plan(
+            &Wanted::default(),
+            &Protection::default(),
+            &listed,
+            at(10),
+            10,
+        );
+
+        assert_eq!(planned.delete.len(), 1);
+        assert_eq!(planned.delete[0].digest, stale.digest);
+    }
+
+    #[test]
+    fn a_protected_digest_keeps_a_stale_tag() {
+        let stale = tagged("19.4.45-debian-13-amd64", &digest('a'), Some(at(1)));
+        let listed = vec![stale];
+        let protection = Protection {
+            tags: BTreeSet::new(),
+            digests: BTreeSet::from([digest('a')]),
+        };
+
+        let planned = plan(&Wanted::default(), &protection, &listed, at(10), 10);
+
+        assert!(planned.delete.is_empty());
+        assert_eq!(planned.kept_shared, 1);
     }
 
     #[test]

@@ -48,6 +48,7 @@ use reqwest::{Client, Method, Response, StatusCode};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::OnceCell;
+use tracing::warn;
 use url::Url;
 
 use crate::report::redact_secrets;
@@ -380,6 +381,13 @@ impl PackagesClient {
             };
         }
 
+        if page > MAX_PAGES {
+            warn!(
+                repo = %self.repo(),
+                pages = MAX_PAGES,
+                "the version listing hit the page cap; the rest is not listed and waits for a later run"
+            );
+        }
         Ok(versions)
     }
 
@@ -463,6 +471,13 @@ impl PackagesClient {
             };
         }
 
+        if page > MAX_PAGES {
+            warn!(
+                owner = %self.owner,
+                pages = MAX_PAGES,
+                "the package listing hit the page cap; the rest is not listed and waits for a later run"
+            );
+        }
         Ok(packages)
     }
 
