@@ -315,7 +315,8 @@ pub struct Pass<'a> {
     pub configured: &'a HashSet<String>,
     /// Also delete packages of projects no policy names any more.
     pub sweep_orphans: bool,
-    /// Report the deletions without performing them.
+    /// Report the deletions instead of performing them, apart from the one
+    /// probing deletion per target (see [`prune_targets`]).
     pub dry_run: bool,
     /// Deletion attempts allowed per target; `0` deletes nothing and leaves the
     /// whole plan deferred. A refused or already gone reference refunds its
@@ -328,7 +329,8 @@ pub struct Pass<'a> {
 /// What one prune pass did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PruneReport {
-    /// References deleted.
+    /// References deleted. A dry run deletes only the probe, so this is `1` at
+    /// most while [`PruneReport::lines`] carries the rest of the plan.
     pub pruned: usize,
     /// References or projects that failed; an unsupported target never bumps
     /// it and only lands in [`PruneReport::targets_skipped`].
@@ -339,7 +341,8 @@ pub struct PruneReport {
     /// Targets whose backend cannot delete; they are left alone.
     pub targets_skipped: Vec<String>,
     /// One `registry/repo:tag` (or `@digest`) line per planned deletion; filled
-    /// on a dry run only.
+    /// on a dry run only. A planned reference is never [deleted](Self::pruned),
+    /// so the two counts together are what the pass would delete.
     pub lines: Vec<String>,
     /// Process exit code implied by the counts.
     pub exit_code: i32,
@@ -453,7 +456,18 @@ pub fn backend_for(config: &Config, target: &TargetConfig) -> Option<Backend> {
 ///
 /// Each target is independent: a listing failure, a denied token or a
 /// `405`-only registry stays inside the report, and the remaining targets still
-/// run. Nothing is deleted when `pass.dry_run` is set.
+/// run.
+///
+/// A dry run performs exactly one deletion per target: the first reference it
+/// would delete is deleted for real and doubles as the capability probe, only
+/// the references after it are planned. Without that probe an endpoint that
+/// answers `405` to `DELETE` would be planned in full — a dry run against GHCR
+/// with `delete = "registry"` would promise deletions that the real run then
+/// skips. The alternative, a separate `HEAD`-then-`DELETE` probe, costs an extra
+/// request and has to duplicate the budget and error handling; reusing the
+/// first candidate keeps both and reports what actually happens. An unsupported
+/// endpoint therefore lands in [`PruneReport::targets_skipped`] with nothing
+/// planned, and the rest of its references count as deferred.
 pub async fn prune_targets(ctx: &Ctx, pass: &Pass<'_>) -> PruneReport {
     let mut report = PruneReport::default();
     let concurrency = usize::try_from(ctx.config.upload_concurrency)
@@ -669,6 +683,7 @@ async fn prune_target(
 
     let mut budget = pass.budget;
     let mut abandoned = false;
+    let mut probed = false;
     while budget > 0 && !abandoned {
         // One round: at most one reference per live project, and never more
         // than the budget. A project that fails to list or delete therefore
@@ -698,12 +713,66 @@ async fn prune_target(
         }
 
         if pass.dry_run {
-            for (_, candidate) in &window {
-                report.lines.push(display_reference(
-                    &registry,
-                    &format!("{namespace}/{}", candidate.project),
-                    &candidate.reference,
-                ));
+            // The first reference of the target is deleted for real: it probes
+            // whether the endpoint deletes at all, so a `405` reaches the
+            // report instead of turning into plans. Everything after it is
+            // planned only (`prune_targets` explains why).
+            if !probed {
+                probed = true;
+                let mut window = window.into_iter();
+                let Some((index, candidate)) = window.next() else {
+                    break;
+                };
+                let repo = format!("{namespace}/{}", candidate.project);
+                let client = clients.get(candidate.project.as_str()).copied();
+                let outcome = delete_one(backend, client, &repo, &candidate).await;
+                if matches!(outcome, Deleted::Unsupported) {
+                    warn!(
+                        target = target.name.as_str(),
+                        "endpoint does not support deletes; skipping the target"
+                    );
+                    note_skip(target, report);
+                    abandoned = true;
+                    // The probed reference was only refused, so it waits like
+                    // the rest; that one was already taken off its slot.
+                    report.deferred += 1;
+                    for (index, candidate) in window {
+                        slots[index].references.push_front(candidate.reference);
+                    }
+                    continue;
+                }
+                match outcome {
+                    Deleted::Missing => budget += 1,
+                    Deleted::Pruned(_) => report.pruned += 1,
+                    Deleted::Denied(reason) => {
+                        report.failed += 1;
+                        budget += 1;
+                        warn!(
+                            target = target.name.as_str(),
+                            project = slots[index].project.as_str(),
+                            reason,
+                            "delete denied; abandoning the project"
+                        );
+                        slots[index].dead = true;
+                    }
+                    Deleted::Failed(_) => report.failed += 1,
+                    Deleted::Unsupported => {}
+                }
+                for (_, candidate) in window {
+                    report.lines.push(display_reference(
+                        &registry,
+                        &format!("{namespace}/{}", candidate.project),
+                        &candidate.reference,
+                    ));
+                }
+            } else {
+                for (_, candidate) in &window {
+                    report.lines.push(display_reference(
+                        &registry,
+                        &format!("{namespace}/{}", candidate.project),
+                        &candidate.reference,
+                    ));
+                }
             }
             continue;
         }

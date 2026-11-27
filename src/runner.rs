@@ -47,7 +47,9 @@
 //! the run file or pushes the ledger: the command layer owns the git commit
 //! (and can append its own lease metadata).
 //! A dry run reads the ledger and the source, counts what it would do, and
-//! writes nothing at all.
+//! writes nothing at all. Its prune pass still lists every enabled target and
+//! deletes the first would-be deletion of each for real as a capability probe,
+//! so a dry run needs the target credentials and network access too.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -801,7 +803,9 @@ pub async fn run(ctx: &Ctx, mut opts: RunOpts) -> Result<Summary, RunError> {
 
     let (candidates, collisions, crawl_skipped) = crawl_scope(ctx).await?;
     let discovered = candidates.len();
-    let prune_inputs = PruneInputs::collect(ctx, &candidates, &crawl_skipped, opts.sweep_orphans);
+    let prune_inputs = opts
+        .prune
+        .then(|| PruneInputs::collect(ctx, &candidates, &crawl_skipped, opts.sweep_orphans));
 
     let snapshot = {
         let ledger = ctx.ledger.lock().await;
@@ -857,7 +861,7 @@ pub async fn run(ctx: &Ctx, mut opts: RunOpts) -> Result<Summary, RunError> {
         // The report-only pass runs before the return so the summary carries
         // what a real run would delete; nothing is written, so it has no event
         // sequence.
-        let pruned = prune_pass(ctx, None, &opts, &prune_inputs).await;
+        let pruned = prune_pass(ctx, None, &opts, prune_inputs.as_ref()).await;
         let mut summary = Summary {
             discovered,
             satisfied,
@@ -866,10 +870,12 @@ pub async fn run(ctx: &Ctx, mut opts: RunOpts) -> Result<Summary, RunError> {
             open_incidents: open_incident_count(ctx).await?,
             ..Summary::default()
         };
-        // Nothing is deleted, so the planned lines stand in for the count.
-        summary.pruned = pruned.lines.len();
+        // Only the probed reference was really deleted; the planned lines stand
+        // in for the rest of the count.
+        summary.pruned = pruned.pruned + pruned.lines.len();
         summary.prune_failed = pruned.failed;
         summary.prune_deferred = pruned.deferred;
+        summary.prune_skipped = pruned.targets_skipped.len();
         summary.prune_lines = pruned.lines;
         return Ok(summary.finish());
     }
@@ -993,11 +999,13 @@ pub async fn run(ctx: &Ctx, mut opts: RunOpts) -> Result<Summary, RunError> {
     }
 
     // The real pass runs on what is left after the local store was collected;
-    // its counts never move the exit code set above.
-    let pruned = prune_pass(ctx, Some(&seq), &opts, &prune_inputs).await;
+    // its counts never move the exit code set above. It has to run before the
+    // `run_finished` event so the ledger carries the counts too.
+    let pruned = prune_pass(ctx, Some(&seq), &opts, prune_inputs.as_ref()).await;
     summary.pruned = pruned.pruned;
     summary.prune_failed = pruned.failed;
     summary.prune_deferred = pruned.deferred;
+    summary.prune_skipped = pruned.targets_skipped.len();
 
     if !opts.dry_run {
         let outcome = if summary.incidents_opened > 0 {
@@ -1167,17 +1175,18 @@ impl<'a> PruneInputs<'a> {
 /// Run the prune pass over the targets, unless the run does not prune.
 ///
 /// `seq` is `None` for the report-only pass of a dry run, which must write no
-/// events. Everything else comes from `opts` and `skip`; the returned report is
-/// folded into the summary by the caller.
+/// events. `skip` is `None` exactly when the run does not prune, so a plain run
+/// never builds the input sets. The returned report is folded into the summary
+/// by the caller.
 async fn prune_pass(
     ctx: &Ctx,
     seq: Option<&Seq>,
     opts: &RunOpts,
-    skip: &PruneInputs<'_>,
+    skip: Option<&PruneInputs<'_>>,
 ) -> PruneReport {
-    if !opts.prune {
+    let Some(skip) = skip else {
         return PruneReport::default();
-    }
+    };
     prune::prune_targets(
         ctx,
         &Pass {

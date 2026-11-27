@@ -2195,17 +2195,33 @@ async fn prune_deletes_a_stale_tag_at_the_end_of_a_run() {
     );
     assert_eq!(summary.pruned, 1);
     assert_eq!(summary.exit_code, EXIT_OK);
+
+    // The pass has to land before `run_finished`, not just in the returned
+    // summary: the ledger is what a later reader sees.
+    let events = ctx
+        .ledger
+        .lock()
+        .await
+        .events_for_run("run-1")
+        .expect("events");
+    let finished = events
+        .iter()
+        .find(|event| event.kind == EventKind::RunFinished)
+        .expect("the run finished");
+    assert_eq!(finished.detail["summary"]["pruned"], json!(1));
 }
 
 #[tokio::test]
-async fn a_dry_run_reports_the_deletion_and_keeps_the_tag() {
+async fn a_dry_run_deletes_the_probe_and_reports_the_rest() {
     let dir = TempDir::new().expect("state dir");
     let package = one_package();
     let mock = mock_registry().await;
     let fixture =
         Fixture::new(dir.path(), std::slice::from_ref(&package), &["ghcr"], 1, 1).prunable(&mock);
-    let stale = stale_tag("19.4.45");
-    mock.store_manifest(&repo_of("cinc"), &stale, b"stale bytes");
+    let first = stale_tag("19.4.45");
+    let second = stale_tag("19.4.44");
+    mock.store_manifest(&repo_of("cinc"), &first, b"stale one");
+    mock.store_manifest(&repo_of("cinc"), &second, b"stale two");
     let ctx = fixture.ctx("run-1");
 
     let summary = run(
@@ -2219,17 +2235,70 @@ async fn a_dry_run_reports_the_deletion_and_keeps_the_tag() {
     .await
     .expect("run");
 
-    assert!(mock.manifest(&repo_of("cinc"), &stale).is_some());
-    assert_eq!(mock.delete_count(), 0);
-    assert_eq!(summary.pruned, 1);
+    // The first candidate is deleted for real as the capability probe, the
+    // second is only reported.
+    assert_eq!(mock.delete_count(), 1);
+    let doomed = [&first, &second]
+        .into_iter()
+        .find(|tag| mock.manifest(&repo_of("cinc"), tag).is_none())
+        .expect("the probe deleted one stale tag");
+    let planned = if doomed == &first { &second } else { &first };
+    assert!(
+        mock.manifest(&repo_of("cinc"), planned).is_some(),
+        "a planned reference survives"
+    );
+    assert_eq!(
+        summary.pruned, 2,
+        "the probe counts and the plan is reported"
+    );
     assert_eq!(
         summary.prune_lines,
         vec![format!(
-            "{}/{}:{stale}",
+            "{}/{}:{planned}",
             mock.registry_name(),
             repo_of("cinc")
         )]
     );
+    assert_eq!(summary.prune_skipped, 0);
+    assert_eq!(summary.exit_code, EXIT_OK);
+}
+
+#[tokio::test]
+async fn a_dry_run_on_a_405_endpoint_skips_the_target() {
+    let dir = TempDir::new().expect("state dir");
+    let package = one_package();
+    let mock = mock_registry().await;
+    let fixture =
+        Fixture::new(dir.path(), std::slice::from_ref(&package), &["ghcr"], 1, 1).prunable(&mock);
+    let first = stale_tag("19.4.45");
+    let second = stale_tag("19.4.44");
+    mock.store_manifest(&repo_of("cinc"), &first, b"stale one");
+    mock.store_manifest(&repo_of("cinc"), &second, b"stale two");
+    mock.answer_405();
+    let ctx = fixture.ctx("run-1");
+
+    let summary = run(
+        &ctx,
+        RunOpts {
+            prune: true,
+            dry_run: true,
+            ..RunOpts::default()
+        },
+    )
+    .await
+    .expect("run");
+
+    // The probe is refused, so the two stale tags must not become two plans.
+    assert_eq!(mock.delete_attempts(), 1, "only the probe is attempted");
+    assert!(summary.prune_lines.is_empty(), "{:?}", summary.prune_lines);
+    assert_eq!(summary.pruned, 0);
+    assert_eq!(summary.prune_skipped, 1);
+    assert_eq!(
+        summary.prune_deferred, 2,
+        "both references wait for a run that can delete"
+    );
+    assert!(mock.manifest(&repo_of("cinc"), &first).is_some());
+    assert!(mock.manifest(&repo_of("cinc"), &second).is_some());
 }
 
 #[tokio::test]
@@ -2351,6 +2420,8 @@ async fn a_collision_keeps_the_digest_qualified_tag_wanted() {
     mock.store_manifest(&repo_of("cinc"), &qualified, b"stale second");
     let stale = stale_tag("19.4.45");
     mock.store_manifest(&repo_of("cinc"), &stale, b"stale");
+    let planned = stale_tag("19.4.44");
+    mock.store_manifest(&repo_of("cinc"), &planned, b"planned stale");
     let ctx = fixture.ctx("run-1");
 
     let summary = run(
@@ -2364,6 +2435,19 @@ async fn a_collision_keeps_the_digest_qualified_tag_wanted() {
     .await
     .expect("run");
 
+    // One stale tag is the deleted probe, the other stays a plan; neither the
+    // descriptive nor the qualified tag may show up on either side.
+    for tag in [&descriptive, &qualified] {
+        assert!(
+            mock.manifest(&repo_of("cinc"), tag).is_some(),
+            "{tag} stays"
+        );
+    }
     assert_eq!(summary.prune_lines.len(), 1, "{:?}", summary.prune_lines);
-    assert!(summary.prune_lines[0].ends_with(&format!(":{stale}")));
+    let remaining = [&stale, &planned]
+        .into_iter()
+        .find(|tag| mock.manifest(&repo_of("cinc"), tag).is_some())
+        .expect("one stale tag survives to be planned");
+    assert!(summary.prune_lines[0].ends_with(&format!(":{remaining}")));
+    assert_eq!(summary.pruned, 2);
 }

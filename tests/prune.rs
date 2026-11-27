@@ -780,11 +780,14 @@ async fn the_budget_defers_the_tail() {
 }
 
 #[tokio::test]
-async fn a_dry_run_deletes_nothing_and_reports_the_lines() {
+async fn a_dry_run_probes_one_delete_and_plans_the_rest() {
     let mock = mock_registry().await;
     let state = tempfile::tempdir().expect("state dir");
     let ledger = Ledger::open(state.path()).expect("ledger");
-    mock.store_manifest(&repo(PROJECT), "19.4.46-debian-13-amd64", b"stale");
+    let first = "19.4.46-debian-13-amd64";
+    let second = "19.4.45-debian-13-amd64";
+    mock.store_manifest(&repo(PROJECT), first, b"stale one");
+    mock.store_manifest(&repo(PROJECT), second, b"stale two");
 
     let ctx = registry_context(state.path(), ledger, &mock);
     let report = prune(
@@ -795,20 +798,51 @@ async fn a_dry_run_deletes_nothing_and_reports_the_lines() {
     )
     .await;
 
+    // The first candidate probes the capability and is deleted for real; the
+    // tail is only planned.
+    assert_eq!(report.pruned, 1, "{report:?}");
+    assert_eq!(report.targets_skipped, Vec::<String>::new());
+    let remaining = [first, second]
+        .into_iter()
+        .find(|tag| mock.manifest(&repo(PROJECT), tag).is_some())
+        .expect("the probe deleted one of the two");
     assert_eq!(
         report.lines,
         vec![format!(
-            "{}/{}:19.4.46-debian-13-amd64",
+            "{}/{}:{remaining}",
             mock.registry_name(),
             repo(PROJECT)
         )]
     );
+    assert_eq!(mock.delete_count(), 1);
+    assert!(events(&ctx).await.is_empty(), "a dry run writes no events");
+}
+
+#[tokio::test]
+async fn a_dry_run_on_a_405_endpoint_skips_instead_of_planning() {
+    let mock = mock_registry().await;
+    mock.answer_405();
+    let state = tempfile::tempdir().expect("state dir");
+    let ledger = Ledger::open(state.path()).expect("ledger");
+    mock.store_manifest(&repo(PROJECT), "19.4.46-debian-13-amd64", b"stale one");
+    mock.store_manifest(&repo(PROJECT), "19.4.45-debian-13-amd64", b"stale two");
+
+    let ctx = registry_context(state.path(), ledger, &mock);
+    let report = prune(
+        &ctx,
+        &[PROJECT],
+        &Wanted::default(),
+        Opts::default().dry_run(),
+    )
+    .await;
+
+    // The probe is refused, so the two stale tags must not become two plans.
+    assert_eq!(report.targets_skipped, vec!["ghcr".to_string()]);
+    assert!(report.lines.is_empty(), "{report:?}");
     assert_eq!(report.pruned, 0);
-    assert_eq!(mock.delete_count(), 0);
-    assert!(mock
-        .manifest(&repo(PROJECT), "19.4.46-debian-13-amd64")
-        .is_some());
-    assert!(events(&ctx).await.is_empty());
+    assert_eq!(report.deferred, 2);
+    assert_eq!(mock.delete_attempts(), 1);
+    assert_eq!(report.exit_code, EXIT_PARTIAL);
 }
 
 #[tokio::test]
