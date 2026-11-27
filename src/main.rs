@@ -915,6 +915,7 @@ async fn run_mirror_like(
     let guard = acquire_lease(&env, &run_id, allow_unleased).await?;
 
     let mut opts = run_args.to_run_opts();
+    opts.sweep_orphans = filters.projects.is_empty() && filters.versions.is_empty();
     if mode == BackfillMode::Backfill {
         let fingerprint = policy_fingerprint(&scope);
         let cursor = env.ledger()?.cursor(&fingerprint)?;
@@ -971,6 +972,11 @@ fn print_summary(summary: &Summary, json: bool) {
     if json {
         println!("{}", summary.to_json());
     } else {
+        // A dry run lists what it would delete, one reference per line, before
+        // the text summary; the JSON summary leaves the lines out.
+        for line in &summary.prune_lines {
+            println!("{line}");
+        }
         println!("{}", summary.to_text());
     }
 }

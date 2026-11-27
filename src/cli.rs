@@ -226,7 +226,8 @@ pub struct RunArgs {
     #[arg(long)]
     pub gc_after: bool,
 
-    /// Prune every publication the policy no longer selects (default: `[retention] prune`)
+    /// Delete publications the policy no longer selects at the end of the run
+    /// (default: `[retention] prune`)
     #[arg(long)]
     pub prune: bool,
 
@@ -248,6 +249,7 @@ impl RunArgs {
             max_bytes: self.limit_bytes,
             order: self.order.to_order(),
             gc_after: self.gc_after,
+            prune: self.prune,
             dry_run: self.dry_run,
             ..RunOpts::default()
         }

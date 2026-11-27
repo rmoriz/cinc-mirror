@@ -162,6 +162,15 @@ pub struct Summary {
     /// Reported for the operator; only newly opened incidents drive the exit
     /// code.
     pub open_incidents: usize,
+    /// References the prune pass deleted.
+    pub pruned: usize,
+    /// References or projects the prune pass failed on.
+    pub prune_failed: usize,
+    /// References the prune pass left for a later run.
+    pub prune_deferred: usize,
+    /// One would-be deletion per line, filled by a dry run's report-only pass.
+    #[serde(skip)]
+    pub prune_lines: Vec<String>,
     /// Bytes actually transferred by the download ladder, resume offset excluded.
     pub bytes_downloaded: u64,
     /// Whether a limit stopped the run with work left in the queue.
@@ -181,6 +190,9 @@ impl Summary {
     /// saw bytes change behind a published name, which is the more urgent
     /// condition even when other targets also failed. An `unrecoverable`
     /// incident is exempt: upstream served nothing, so nothing was left undone.
+    ///
+    /// Prune counts never move the code: the publish job succeeded, so a prune
+    /// failure leaves [`EXIT_OK`] in a publish run.
     #[must_use]
     pub fn finish(mut self) -> Self {
         self.exit_code = if self.incidents_opened > self.incidents_unrecoverable {
@@ -200,7 +212,8 @@ impl Summary {
     pub fn to_text(&self) -> String {
         format!(
             "discovered={} satisfied={} downloaded={} published={} skipped={} failed={} \
-             unrecoverable={} incidents={} open_incidents={} bytes={} exit={}",
+             unrecoverable={} incidents={} open_incidents={} pruned={} prune_failed={} \
+             prune_deferred={} bytes={} exit={}",
             self.discovered,
             self.satisfied,
             self.downloaded,
@@ -210,6 +223,9 @@ impl Summary {
             self.unrecoverable,
             self.incidents_opened,
             self.open_incidents,
+            self.pruned,
+            self.prune_failed,
+            self.prune_deferred,
             self.bytes_downloaded,
             self.exit_code,
         )
@@ -274,11 +290,27 @@ mod tests {
         assert_eq!(
             summary.to_text(),
             "discovered=3 satisfied=1 downloaded=2 published=4 skipped=0 failed=0 \
-             unrecoverable=0 incidents=0 open_incidents=1 bytes=2048 exit=0"
+             unrecoverable=0 incidents=0 open_incidents=1 pruned=0 prune_failed=0 \
+             prune_deferred=0 bytes=2048 exit=0"
         );
         assert!(summary.to_json().contains("\"published\": 4"));
         assert!(summary.to_json().contains("\"queued\": 2"));
         assert!(summary.to_json().contains("\"open_incidents\": 1"));
+        assert!(summary.to_json().contains("\"pruned\": 0"));
+        assert!(summary.to_json().contains("\"prune_failed\": 0"));
+        assert!(!summary.to_json().contains("prune_lines"));
+    }
+
+    #[test]
+    fn prune_counts_do_not_change_the_exit_code() {
+        let summary = Summary {
+            pruned: 2,
+            prune_failed: 4,
+            prune_deferred: 7,
+            ..Summary::default()
+        }
+        .finish();
+        assert_eq!(summary.exit_code, EXIT_OK);
     }
 
     #[test]

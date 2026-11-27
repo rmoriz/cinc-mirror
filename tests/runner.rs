@@ -25,6 +25,7 @@ use cinc_mirror::ledger::{
 };
 use cinc_mirror::net::RateLimiter;
 use cinc_mirror::oci::{OciAuth, OciConfig, OciError, Registry};
+use cinc_mirror::report::EXIT_OK;
 use cinc_mirror::runner::{run, Order, RunError, RunOpts};
 use cinc_mirror::scope::{ResolvedPolicy, ResolvedScope};
 use cinc_mirror::source::transport::{PayloadTransport, RetryPolicy, TransportError};
@@ -33,6 +34,7 @@ use cinc_mirror::store::Store;
 use cinc_mirror::targets::{
     OciTarget, PutOutcome, RsyncConfig, RsyncTarget, Target, TargetError, TargetSet,
 };
+use common::mirror::{mock_registry, oci_target_config};
 use common::registry::{MockAuth, MockRegistry};
 use serde_json::json;
 use tempfile::TempDir;
@@ -45,24 +47,36 @@ const REPO: &str = "cinc-mirror/cinc";
 /// One package the fake upstream publishes.
 #[derive(Debug, Clone)]
 struct Spec {
+    project: String,
     version: String,
     platform: String,
     platform_version: String,
     basename: String,
     arch: String,
     body: Vec<u8>,
+    /// Version the metadata document claims, when it differs from the
+    /// directory (a document the crawl has to skip).
+    metadata_version: Option<String>,
 }
 
 impl Spec {
     fn new(version: &str, basename: &str, body: &[u8]) -> Self {
         Self {
+            project: "cinc".to_string(),
             version: version.to_string(),
             platform: "debian".to_string(),
             platform_version: "13".to_string(),
             basename: basename.to_string(),
             arch: "x86_64".to_string(),
             body: body.to_vec(),
+            metadata_version: None,
         }
+    }
+
+    /// Publish the package under another project.
+    fn in_project(mut self, project: &str) -> Self {
+        self.project = project.to_string();
+        self
     }
 
     /// Publish this package under a different raw architecture, so two specs
@@ -74,8 +88,8 @@ impl Spec {
 
     fn upstream_path(&self) -> String {
         format!(
-            "stable/cinc/{}/{}/{}/{}",
-            self.version, self.platform, self.platform_version, self.basename
+            "stable/{}/{}/{}/{}/{}",
+            self.project, self.version, self.platform, self.platform_version, self.basename
         )
     }
 }
@@ -91,7 +105,7 @@ fn metadata_json(spec: &Spec) -> String {
         "platform": spec.platform,
         "platform_version": spec.platform_version,
         "arch": spec.arch,
-        "version": spec.version,
+        "version": spec.metadata_version.as_deref().unwrap_or(&spec.version),
         "iteration": 1,
         "unknown_field": "tolerated",
     })
@@ -103,7 +117,7 @@ fn artifact_of(spec: &Spec) -> Artifact {
     Artifact::new(
         &ArtifactContext {
             channel: "stable".to_string(),
-            project: "cinc".to_string(),
+            project: spec.project.clone(),
             version: spec.version.clone(),
             platform: spec.platform.clone(),
             platform_version: spec.platform_version.clone(),
@@ -133,15 +147,20 @@ fn listing(entries: impl IntoIterator<Item = String>) -> String {
     body
 }
 
+/// Project → version → platform → platform version → basenames.
+type UpstreamTree =
+    BTreeMap<String, BTreeMap<String, BTreeMap<String, BTreeMap<String, Vec<String>>>>>;
+
 /// Build the Apache index pages and payload map for `specs`.
 fn build_upstream(specs: &[Spec]) -> (HashMap<String, String>, HashMap<String, Vec<u8>>) {
     let mut pages = HashMap::new();
     let mut payloads = HashMap::new();
-    let mut tree: BTreeMap<String, BTreeMap<String, BTreeMap<String, Vec<String>>>> =
-        BTreeMap::new();
+    let mut tree: UpstreamTree = BTreeMap::new();
 
     for spec in specs {
-        tree.entry(spec.version.clone())
+        tree.entry(spec.project.clone())
+            .or_default()
+            .entry(spec.version.clone())
             .or_default()
             .entry(spec.platform.clone())
             .or_default()
@@ -150,8 +169,8 @@ fn build_upstream(specs: &[Spec]) -> (HashMap<String, String>, HashMap<String, V
             .push(spec.basename.clone());
 
         let dir = format!(
-            "files/stable/cinc/{}/{}/{}",
-            spec.version, spec.platform, spec.platform_version
+            "files/stable/{}/{}/{}/{}",
+            spec.project, spec.version, spec.platform, spec.platform_version
         );
         pages.insert(
             format!("{dir}/{}.metadata.json", spec.basename),
@@ -160,25 +179,31 @@ fn build_upstream(specs: &[Spec]) -> (HashMap<String, String>, HashMap<String, V
         payloads.insert(spec.upstream_path(), spec.body.clone());
     }
 
-    pages.insert(
-        "files/stable/cinc/".to_string(),
-        listing(tree.keys().map(|version| format!("{version}/"))),
-    );
-    for (version, platforms) in &tree {
+    for (project, versions) in &tree {
         pages.insert(
-            format!("files/stable/cinc/{version}/"),
-            listing(platforms.keys().map(|platform| format!("{platform}/"))),
+            format!("files/stable/{project}/"),
+            listing(versions.keys().map(|version| format!("{version}/"))),
         );
-        for (platform, versions) in platforms {
+        for (version, platforms) in versions {
             pages.insert(
-                format!("files/stable/cinc/{version}/{platform}/"),
-                listing(versions.keys().map(|value| format!("{value}/"))),
+                format!("files/stable/{project}/{version}/"),
+                listing(platforms.keys().map(|platform| format!("{platform}/"))),
             );
-            for (platform_version, basenames) in versions {
+            for (platform, platform_versions) in platforms {
                 pages.insert(
-                    format!("files/stable/cinc/{version}/{platform}/{platform_version}/"),
-                    listing(basenames.iter().map(|name| format!("{name}.metadata.json"))),
+                    format!("files/stable/{project}/{version}/{platform}/"),
+                    listing(
+                        platform_versions
+                            .keys()
+                            .map(|platform_version| format!("{platform_version}/")),
+                    ),
                 );
+                for (platform_version, basenames) in platform_versions {
+                    pages.insert(
+                        format!("files/stable/{project}/{version}/{platform}/{platform_version}/"),
+                        listing(basenames.iter().map(|name| format!("{name}.metadata.json"))),
+                    );
+                }
             }
         }
     }
@@ -579,7 +604,7 @@ impl Fixture {
                 ..Config::default()
             }),
             scope: ResolvedScope {
-                policies: vec![policy()],
+                policies: vec![policy("cinc")],
             },
             source,
             store: Store::open(state_dir).expect("store"),
@@ -598,6 +623,31 @@ impl Fixture {
             .incident
             .ignore_arch_collisions
             .push(project.to_string());
+        self.config = Arc::new(config);
+        self
+    }
+
+    /// Resolve `projects` instead of the single default policy.
+    fn scoped(mut self, projects: &[&str]) -> Self {
+        self.scope = ResolvedScope {
+            policies: projects.iter().map(|project| policy(project)).collect(),
+        };
+        self
+    }
+
+    /// Give the configuration an OCI target on `mock`, which is what prune
+    /// lists and deletes through; publishing still goes to the fake targets.
+    fn prunable(mut self, mock: &MockRegistry) -> Self {
+        let mut config = (*self.config).clone();
+        config.targets = vec![oci_target_config(mock, "ghcr")];
+        self.config = Arc::new(config);
+        self
+    }
+
+    /// Turn `[retention] prune` on instead of the CLI flag.
+    fn prunes_by_config(mut self) -> Self {
+        let mut config = (*self.config).clone();
+        config.retention.prune = true;
         self.config = Arc::new(config);
         self
     }
@@ -717,10 +767,10 @@ fn base_url() -> Url {
     Url::parse(BASE).expect("base url")
 }
 
-fn policy() -> ResolvedPolicy {
+fn policy(project: &str) -> ResolvedPolicy {
     ResolvedPolicy {
-        id: "cinc".to_string(),
-        project: "cinc".to_string(),
+        id: project.to_string(),
+        project: project.to_string(),
         channel: "stable".to_string(),
         min_version: None,
         max_version: None,
@@ -2097,4 +2147,223 @@ async fn run_records_order_and_summary_in_the_run_row() {
     assert_eq!(row.summary["published"], json!(summary.published));
     assert_eq!(row.summary["exit_code"], json!(0));
     assert_eq!(row.transport_order, vec!["ftp", "ftps", "https"]);
+}
+
+// Prune at the end of a run ---------------------------------------------------
+
+/// A tag shape the fake upstream never publishes, for seeding a stale one.
+///
+/// Iteration 1 is the default and carries no `-r` suffix (see
+/// `normalize_iteration`), which keeps this identical to a crawled tag.
+fn stale_tag(version: &str) -> String {
+    format!("{version}-debian-13-amd64")
+}
+
+/// The mock's repository for `project`.
+fn repo_of(project: &str) -> String {
+    format!("{NAMESPACE}/{project}")
+}
+
+#[tokio::test]
+async fn prune_deletes_a_stale_tag_at_the_end_of_a_run() {
+    let dir = TempDir::new().expect("state dir");
+    let package = one_package();
+    let mock = mock_registry().await;
+    let fixture =
+        Fixture::new(dir.path(), std::slice::from_ref(&package), &["ghcr"], 1, 1).prunable(&mock);
+    let stale = stale_tag("19.4.45");
+    mock.store_manifest(&repo_of("cinc"), &stale, b"stale bytes");
+    // The crawled tag as a previous run would have left it on the target.
+    let wanted = artifact_of(&package).tag();
+    mock.store_manifest(&repo_of("cinc"), &wanted, &package.body);
+    let ctx = fixture.ctx("run-1");
+
+    let summary = run(
+        &ctx,
+        RunOpts {
+            prune: true,
+            ..RunOpts::default()
+        },
+    )
+    .await
+    .expect("run");
+
+    assert!(mock.manifest(&repo_of("cinc"), &stale).is_none());
+    assert!(
+        mock.manifest(&repo_of("cinc"), &wanted).is_some(),
+        "the crawled tag survives"
+    );
+    assert_eq!(summary.pruned, 1);
+    assert_eq!(summary.exit_code, EXIT_OK);
+}
+
+#[tokio::test]
+async fn a_dry_run_reports_the_deletion_and_keeps_the_tag() {
+    let dir = TempDir::new().expect("state dir");
+    let package = one_package();
+    let mock = mock_registry().await;
+    let fixture =
+        Fixture::new(dir.path(), std::slice::from_ref(&package), &["ghcr"], 1, 1).prunable(&mock);
+    let stale = stale_tag("19.4.45");
+    mock.store_manifest(&repo_of("cinc"), &stale, b"stale bytes");
+    let ctx = fixture.ctx("run-1");
+
+    let summary = run(
+        &ctx,
+        RunOpts {
+            prune: true,
+            dry_run: true,
+            ..RunOpts::default()
+        },
+    )
+    .await
+    .expect("run");
+
+    assert!(mock.manifest(&repo_of("cinc"), &stale).is_some());
+    assert_eq!(mock.delete_count(), 0);
+    assert_eq!(summary.pruned, 1);
+    assert_eq!(
+        summary.prune_lines,
+        vec![format!(
+            "{}/{}:{stale}",
+            mock.registry_name(),
+            repo_of("cinc")
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_prune_failure_leaves_the_run_exit_code_alone() {
+    let dir = TempDir::new().expect("state dir");
+    let package = one_package();
+    let mock = mock_registry().await;
+    let fixture =
+        Fixture::new(dir.path(), std::slice::from_ref(&package), &["ghcr"], 1, 1).prunable(&mock);
+    let stale = stale_tag("19.4.45");
+    mock.store_manifest(&repo_of("cinc"), &stale, b"stale bytes");
+    mock.fail_all_deletes_with(500);
+    let ctx = fixture.ctx("run-1");
+
+    let summary = run(
+        &ctx,
+        RunOpts {
+            prune: true,
+            ..RunOpts::default()
+        },
+    )
+    .await
+    .expect("run");
+
+    assert!(mock.manifest(&repo_of("cinc"), &stale).is_some());
+    assert_eq!(summary.pruned, 0);
+    assert_eq!(summary.prune_failed, 1);
+    assert_eq!(summary.failed, 0);
+    assert_eq!(summary.exit_code, EXIT_OK);
+}
+
+#[tokio::test]
+async fn the_configuration_switch_prunes_without_the_flag() {
+    let dir = TempDir::new().expect("state dir");
+    let package = one_package();
+    let mock = mock_registry().await;
+    let fixture = Fixture::new(dir.path(), std::slice::from_ref(&package), &["ghcr"], 1, 1)
+        .prunable(&mock)
+        .prunes_by_config();
+    let stale = stale_tag("19.4.45");
+    mock.store_manifest(&repo_of("cinc"), &stale, b"stale bytes");
+    let ctx = fixture.ctx("run-1");
+
+    let summary = run(&ctx, RunOpts::default()).await.expect("run");
+
+    assert!(mock.manifest(&repo_of("cinc"), &stale).is_none());
+    assert_eq!(summary.pruned, 1);
+}
+
+#[tokio::test]
+async fn without_the_prune_flag_nothing_is_listed() {
+    let dir = TempDir::new().expect("state dir");
+    let package = one_package();
+    let mock = mock_registry().await;
+    let fixture =
+        Fixture::new(dir.path(), std::slice::from_ref(&package), &["ghcr"], 1, 1).prunable(&mock);
+    mock.store_manifest(&repo_of("cinc"), &stale_tag("19.4.45"), b"stale bytes");
+    let ctx = fixture.ctx("run-1");
+
+    let summary = run(&ctx, RunOpts::default()).await.expect("run");
+
+    assert_eq!(summary.pruned, 0);
+    assert_eq!(summary.prune_failed, 0);
+    assert_eq!(summary.prune_deferred, 0);
+    assert!(
+        mock.request_log().is_empty(),
+        "no request reaches the target"
+    );
+}
+
+#[tokio::test]
+async fn a_project_with_a_skipped_document_is_held_back() {
+    let dir = TempDir::new().expect("state dir");
+    let mut broken =
+        Spec::new("9.9.9", "cinc_9.9.9-1_amd64.deb", b"broken package").in_project("other");
+    broken.metadata_version = Some("3.0.28".to_string());
+    let mock = mock_registry().await;
+    let fixture = Fixture::new(dir.path(), &[one_package(), broken], &["ghcr"], 1, 1)
+        .scoped(&["cinc", "other"])
+        .prunable(&mock);
+    let reachable = stale_tag("19.4.45");
+    let held = stale_tag("9.9.8");
+    mock.store_manifest(&repo_of("cinc"), &reachable, b"stale bytes");
+    mock.store_manifest(&repo_of("other"), &held, b"stale other bytes");
+    let ctx = fixture.ctx("run-1");
+
+    let summary = run(
+        &ctx,
+        RunOpts {
+            prune: true,
+            ..RunOpts::default()
+        },
+    )
+    .await
+    .expect("run");
+
+    assert!(mock.manifest(&repo_of("cinc"), &reachable).is_none());
+    assert!(
+        mock.manifest(&repo_of("other"), &held).is_some(),
+        "a project with a skipped document is not reconciled"
+    );
+    assert_eq!(summary.pruned, 1);
+}
+
+#[tokio::test]
+async fn a_collision_keeps_the_digest_qualified_tag_wanted() {
+    clear_security_env();
+    let dir = TempDir::new().expect("state dir");
+    let first = Spec::new("19.4.46", "cinc_19.4.46-1_amd64.deb", b"first bytes");
+    let second_body = b"second bytes".to_vec();
+    let second = Spec::new("19.4.46", "cinc_19.4.46-2_amd64.deb", &second_body);
+    let mock = mock_registry().await;
+    let fixture = Fixture::new(dir.path(), &[first, second], &["ghcr"], 1, 1).prunable(&mock);
+    // Both files share the descriptive tag, so the second is published under
+    // its digest-qualified tag; both seeded copies have to be wanted.
+    let descriptive = stale_tag("19.4.46");
+    let qualified = format!("{descriptive}-{}", &sha256_hex(&second_body)[..12]);
+    mock.store_manifest(&repo_of("cinc"), &descriptive, b"stale first");
+    mock.store_manifest(&repo_of("cinc"), &qualified, b"stale second");
+    let stale = stale_tag("19.4.45");
+    mock.store_manifest(&repo_of("cinc"), &stale, b"stale");
+    let ctx = fixture.ctx("run-1");
+
+    let summary = run(
+        &ctx,
+        RunOpts {
+            prune: true,
+            dry_run: true,
+            ..RunOpts::default()
+        },
+    )
+    .await
+    .expect("run");
+
+    assert_eq!(summary.prune_lines.len(), 1, "{:?}", summary.prune_lines);
+    assert!(summary.prune_lines[0].ends_with(&format!(":{stale}")));
 }
