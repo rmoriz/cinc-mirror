@@ -810,6 +810,7 @@ async fn prune_target(
                     Deleted::Denied(reason) => {
                         report.failed += 1;
                         budget += 1;
+                        note_skip(target, report);
                         warn!(
                             target = target.name.as_str(),
                             project = slots[index].project.as_str(),
@@ -869,6 +870,7 @@ async fn prune_target(
                 Deleted::Denied(reason) => {
                     report.failed += 1;
                     budget += 1;
+                    note_skip(target, report);
                     warn!(
                         target = target.name.as_str(),
                         project = slots[index].project.as_str(),
@@ -893,7 +895,7 @@ async fn prune_target(
     if !pass.dry_run && report.targets_skipped.contains(&target.name) {
         warn!(
             target = target.name.as_str(),
-            "endpoint does not support deletes; skipping the target"
+            "the target is reported as skipped; see the warnings above"
         );
     }
 }

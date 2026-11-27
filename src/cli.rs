@@ -63,8 +63,8 @@ pub enum Command {
     /// Delete publications the policy no longer selects
     #[command(long_about = "Delete publications the policy no longer selects.\n\n\
                       The command crawls upstream to learn what the policies still want, \
-                      then deletes everything else. It neither downloads nor publishes \
-                      package bytes.")]
+                      then deletes what it still finds, at most `--limit` references per \
+                      target. It neither downloads nor publishes package bytes.")]
     Prune(PruneArgs),
     /// Inspect and acknowledge integrity incidents
     Incidents {

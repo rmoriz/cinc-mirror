@@ -1470,7 +1470,9 @@ async fn prune_command(
 /// Print a prune report as JSON or as the text summary.
 ///
 /// A dry run lists what it would delete first; on a dry run `pruned` counts the
-/// same lines, so the closing line needs no second source.
+/// same lines, so the closing line needs no second source. The JSON carries the
+/// same list under `references`, because a dry run is exactly where a machine
+/// reader has nothing else to go by.
 fn print_prune(report: &PruneReport, dry_run: bool, json: bool) {
     if json {
         println!(
@@ -1481,6 +1483,7 @@ fn print_prune(report: &PruneReport, dry_run: bool, json: bool) {
                 "deferred": report.deferred,
                 "skipped": report.targets_skipped.len(),
                 "targets_skipped": report.targets_skipped,
+                "references": report.lines,
                 "exit_code": report.exit_code,
             }))
             .unwrap_or_else(|_| "{}".to_string())

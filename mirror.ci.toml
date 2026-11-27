@@ -74,8 +74,7 @@ arches = "*"
 ignore_arch_collisions = ["omnibus-toolchain"]
 
 [retention]
-# A registry that is never reconciled only grows: every major the globs above
-# leave behind would stay forever. The globs are the policy this reconciles to.
+# Without this the registry only grows: the globs above are the policy.
 prune = true
 
 [ledger]

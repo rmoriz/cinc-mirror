@@ -359,7 +359,25 @@ path authenticates with `GHCR_TOKEN`, falling back to `GITHUB_TOKEN`
 
 `cinc-mirror prune` runs the same pass on its own: it crawls to learn what is
 still wanted, but neither downloads nor publishes. `--dry-run` deletes the first
-candidate per target for real as a capability probe and lists the rest.
+candidate per target for real as a capability probe and lists the rest, so that
+one reference really is gone afterwards and a later `verify` sees it missing;
+without the probe a `405` would only surface on the day the real run runs.
+
+A prune reports trouble in three places, and they do not mean the same thing. A
+**denied** delete — `403` from the registry or the Packages API, typically a
+token that lost `packages:write` — counts into `failed`, names its target under
+`skipped targets:`, and exits `2`; the rest of that project waits for the next
+run. A target whose endpoint refuses deletes (`405`) is named under
+`skipped targets:` as well, but is only counted in `skipped=`, not in `failed`,
+and still exits `2`, because the target set was not reconciled.
+
+An **ineligible** target — no `GHCR_TOKEN`/`GITHUB_TOKEN`, a namespace without an
+`<owner>/<repository>`, a non-OCI target — is only warned about on stderr and
+appears in neither count: the run reports `pruned=0 ... failed=0 skipped=0` and
+exits `0`. In the scheduled workflow that cuts both ways: a denial turns an
+otherwise green run red, while a missing token leaves green runs that quietly
+prune nothing. `GHCR_TOKEN` (or the `GITHUB_TOKEN` fallback) with
+`packages:write` is the fix.
 
 A first prune is not a tidy-up of a stray tag; it removes whole old majors that
 the configured lines no longer cover. `max_deletions` spreads that over several
