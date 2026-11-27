@@ -375,10 +375,11 @@ An **ineligible** target — no `GHCR_TOKEN`/`GITHUB_TOKEN`, a namespace without
 `<owner>/<repository>`, a non-OCI target — is only warned about on stderr and
 appears in neither count: the run reports `pruned=0 ... failed=0 skipped=0`.
 
-Only the standalone command turns that into a non-zero exit. In a scheduled
-`mirror` run a prune never moves the exit code: a denial raises `prune_failed`
-and `prune_deferred` in the summary and in the run's `run_finished` detail, yet
-the run still exits `0` with `outcome: "success"`. A revocation therefore stops
+Only the standalone command turns a denial or a `405` into a non-zero exit. In a
+scheduled `mirror` run a prune never moves the exit code: a denial raises
+`prune_failed` and reports the rest as `prune_deferred` in the summary and in
+the run's `run_finished` detail, yet the run still exits `0` with
+`outcome: "success"`. A revocation therefore stops
 pruning silently while every run stays green; a dedicated `cinc-mirror prune`
 step is what makes it visible. A missing token is the same silent green in either
 command. The fix for both is `GHCR_TOKEN` (or the `GITHUB_TOKEN` fallback) with

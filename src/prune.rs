@@ -339,8 +339,9 @@ pub struct PruneReport {
     /// References left for a later run: the budget, a failed listing, a denied
     /// delete and the tail of an abandoned project.
     pub deferred: usize,
-    /// Targets that could not be fully reconciled, by capability or by a
-    /// refusal; they are left alone and the run exits partially.
+    /// Targets that could not be fully reconciled — a refused `DELETE`, an
+    /// unbuildable client or a target that cannot delete at all; they are left
+    /// alone and the run exits partially.
     ///
     /// A denied target is also counted in [`PruneReport::failed`] and raises
     /// `prune_failed` in a run summary, where its exit code does not move.
