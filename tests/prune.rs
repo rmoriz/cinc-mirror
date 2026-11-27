@@ -975,6 +975,7 @@ async fn a_pruned_version_marks_the_ledger_row_under_any_of_its_tags() {
 
 #[tokio::test]
 async fn an_unresolved_stale_digest_is_not_deleted() {
+    let _guard = log_guard().await;
     let mock = mock_registry().await;
     let state = tempfile::tempdir().expect("state dir");
     let ledger = Ledger::open(state.path()).expect("ledger");
@@ -982,10 +983,10 @@ async fn an_unresolved_stale_digest_is_not_deleted() {
     let stale_tag = "19.4.45-debian-13-amd64";
     mock.store_manifest(&repo(PROJECT), wanted_tag, b"shared bytes");
     mock.store_manifest(&repo(PROJECT), stale_tag, b"shared bytes");
-    // The listing cannot see the stale tag's digest, so it cannot tell that the
-    // wanted tag serves the same manifest. The delete would resolve one and take
-    // both tags down.
-    mock.omit_head_digest_once(&repo(PROJECT), stale_tag);
+    // The registry never sends a digest for the stale tag, so neither the
+    // listing nor the delete can tell that the wanted tag serves the same
+    // manifest. Deleting it would take both tags down.
+    mock.omit_head_digest_for(&repo(PROJECT), stale_tag);
     let wanted = Wanted {
         tags: [wanted_tag.to_string()].into_iter().collect(),
     };
@@ -1000,6 +1001,12 @@ async fn an_unresolved_stale_digest_is_not_deleted() {
     assert!(
         mock.manifest(&repo(PROJECT), wanted_tag).is_some(),
         "the wanted tag still resolves"
+    );
+    assert!(
+        warnings()
+            .contains("1 held back: their digest could not be resolved; they are retried next run"),
+        "{}",
+        warnings()
     );
 }
 

@@ -630,8 +630,9 @@ impl Registry {
     /// Digest of the manifest at `reference`, or `None` when it is gone.
     ///
     /// Only the `Docker-Content-Digest` header is used; a `HEAD` that succeeds
-    /// without it also reports `None`, so the caller treats the manifest as
-    /// absent instead of guessing a digest from a body that was never read. A
+    /// without it also reports `None`, because the digest is then unknown: the
+    /// plan holds the reference back for a later run, and a delete reports it
+    /// missing instead of guessing a digest from a body that was never read. A
     /// registry that answers that way is warned about once per client.
     ///
     /// # Errors
@@ -713,7 +714,7 @@ impl Registry {
                     warn!(
                         registry = self.registry.as_str(),
                         repo,
-                        "the registry answers a manifest HEAD without Docker-Content-Digest; the manifest is treated as absent"
+                        "the registry answers a manifest HEAD without Docker-Content-Digest; the digest is unknown, so the plan holds the reference back and a delete treats it as absent"
                     );
                 }
                 Ok(digest)

@@ -89,9 +89,8 @@ pub struct MockState {
     fail_deletes: AtomicU16,
     fail_all_deletes: AtomicU16,
     denied_repos: Mutex<HashSet<String>>,
-    /// `(repo, reference)` pairs whose next manifest `HEAD` omits the digest
-    /// header, with the number of responses left that must omit it.
-    headerless_heads: Mutex<HashMap<(String, String), usize>>,
+    /// `(repo, reference)` pairs whose manifest `HEAD` omits the digest header.
+    headerless_heads: Mutex<HashSet<(String, String)>>,
     blob_heads: AtomicUsize,
     stall_patch: AtomicU64,
     stall_patch_body: AtomicU64,
@@ -126,7 +125,7 @@ impl MockState {
             fail_deletes: AtomicU16::new(0),
             fail_all_deletes: AtomicU16::new(0),
             denied_repos: Mutex::new(HashSet::new()),
-            headerless_heads: Mutex::new(HashMap::new()),
+            headerless_heads: Mutex::new(HashSet::new()),
             blob_heads: AtomicUsize::new(0),
             stall_patch: AtomicU64::new(0),
             stall_patch_body: AtomicU64::new(0),
@@ -521,12 +520,8 @@ fn manifest_response(
     );
 
     if head_only {
-        let mut headerless = lock(&state.headerless_heads);
-        if let Some(left) = headerless.get_mut(&(repo.to_string(), reference.to_string())) {
-            if *left > 0 {
-                *left -= 1;
-                headers.remove("docker-content-digest");
-            }
+        if lock(&state.headerless_heads).contains(&(repo.to_string(), reference.to_string())) {
+            headers.remove("docker-content-digest");
         }
         return (StatusCode::OK, headers).into_response();
     }
@@ -800,10 +795,10 @@ impl MockRegistry {
         self.state.fail_all_deletes.store(status, Ordering::SeqCst);
     }
 
-    /// Answer the next manifest `HEAD` for `repo` at `reference` with `200` but
-    /// no `Docker-Content-Digest` header.
-    pub fn omit_head_digest_once(&self, repo: &str, reference: &str) {
-        lock(&self.state.headerless_heads).insert((repo.to_string(), reference.to_string()), 1);
+    /// Answer manifest `HEAD`s for `repo` at `reference` with `200` but no
+    /// `Docker-Content-Digest` header, for good.
+    pub fn omit_head_digest_for(&self, repo: &str, reference: &str) {
+        lock(&self.state.headerless_heads).insert((repo.to_string(), reference.to_string()));
     }
 
     /// Answer every manifest `DELETE` below `repo` with `403 FORBIDDEN`.

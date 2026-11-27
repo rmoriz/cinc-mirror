@@ -790,6 +790,7 @@ async fn prune_target(
         dead: bool,
     }
     let mut slots: Vec<Slot> = Vec::new();
+    let mut held_back = 0;
     for project in &listed {
         let (wanted, protection) = if project.empty {
             (&empty_wanted, &empty_protection)
@@ -797,11 +798,18 @@ async fn prune_target(
             (pass.wanted, &protection)
         };
         let planned = plan(wanted, protection, &project.references, cutoff, usize::MAX);
+        held_back += planned.kept_unresolved;
         slots.push(Slot {
             project: project.project.clone(),
             dead: planned.delete.is_empty(),
             references: planned.delete.into(),
         });
+    }
+    if held_back > 0 {
+        warn!(
+            target = target.name.as_str(),
+            "{held_back} held back: their digest could not be resolved; they are retried next run"
+        );
     }
     if let Backend::Packages { .. } = backend {
         let mut seen: BTreeSet<u64> = BTreeSet::new();

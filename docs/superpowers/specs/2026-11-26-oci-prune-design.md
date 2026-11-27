@@ -324,14 +324,18 @@ redacted.
 
 - `tests/common/registry.rs` needs a digest index (it currently keys manifests by
   PUT reference only, so `HEAD`/`DELETE` by digest 404), `GET /tags/list` with
-  `Link` paging, a deletion counter, and a switch to answer `405` for a
-  GHCR-like registry.
+  `Link` paging, a deletion counter, a switch to omit `Docker-Content-Digest`
+  for one tag, and a switch to answer `405` for a GHCR-like registry.
 - A new `tests/common/packages.rs` mock serves the packages API: versions with
   ids, tags, `created_at`; `DELETE …/versions/{id}`; the `/users/` → `/orgs/`
   probe; the package catalogue; and a denial switch.
 - `tests/prune.rs` covers: wanted tag kept; a digest-qualified tag kept; stale
-  tag deleted; open incident's canonical and superseded tags kept; closed
-  incident's superseded tag kept; untagged version with a protected digest kept;
+  tag deleted; a version with one wanted and one stale tag survives whole on
+  both backends; a stale tag sharing a wanted manifest digest survives; a tag
+  whose digest cannot be resolved is held back and warned about; a pruned
+  multi-tag version marks its ledger row under any of its tags; open incident's
+  canonical and superseded tags kept; closed incident's superseded tag kept;
+  untagged version with a protected digest kept;
   untagged version newer than the cutoff kept; older untagged version deleted;
   the `max_deletions` tail deferred and reported; `--dry-run` deletes only the
   first candidate per target, lists the rest and surfaces a listing failure as a
