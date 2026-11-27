@@ -50,7 +50,8 @@
 //!   deleted copy. It only updates a publication row that already exists; for a
 //!   tag the ledger never recorded, or an event without an artifact key, it is
 //!   recorded but changes nothing.
-//! - `prune_failed`: `remote_ref` and `error`; the event itself is the record.
+//! - `prune_failed`: `remote_ref`, `package` and `error`; the event itself is the
+//!   record.
 //!
 //! `download_started`, `prune_failed` and `lease_taken_over` are audit events
 //! only. `publication_started` marks a target's publication as `uploading`; an

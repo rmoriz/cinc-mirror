@@ -61,6 +61,7 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -232,7 +233,8 @@ pub struct Registry {
     auth: OciAuth,
     client: Client,
     tokens: Mutex<HashMap<(String, String), CachedToken>>,
-    warned_head_digest: std::sync::atomic::AtomicBool,
+    warned_head_digest: AtomicBool,
+    warned_page_cap: AtomicBool,
     request_timeout: Duration,
     idle_read_timeout: Duration,
     attempts: usize,
@@ -339,7 +341,8 @@ impl Registry {
             auth: config.auth,
             client,
             tokens: Mutex::new(HashMap::new()),
-            warned_head_digest: std::sync::atomic::AtomicBool::new(false),
+            warned_head_digest: AtomicBool::new(false),
+            warned_page_cap: AtomicBool::new(false),
             request_timeout: config.request_timeout,
             idle_read_timeout: config.idle_read_timeout,
             attempts: RETRY_ATTEMPTS,
@@ -602,15 +605,24 @@ impl Registry {
             .append_pair("n", &LIST_PAGE_LIMIT.to_string());
 
         let mut tags = BTreeSet::new();
+        let mut truncated = true;
         for _ in 0..LIST_PAGE_LIMIT {
             let Some(page) = self.with_retry(|| self.tags_page_once(repo, &url)).await? else {
+                truncated = false;
                 break;
             };
             tags.extend(page.tags);
             let Some(next) = page.next else {
+                truncated = false;
                 break;
             };
             url = self.location_url(&next)?;
+        }
+        if truncated && !self.warned_page_cap.swap(true, Ordering::Relaxed) {
+            warn!(
+                registry = self.registry.as_str(),
+                repo, "the tag listing hit the page cap; the rest is not listed and waits for a later run"
+            );
         }
         Ok(tags.into_iter().collect())
     }
@@ -697,11 +709,7 @@ impl Registry {
         match response.status() {
             status if status.is_success() => {
                 let digest = digest_header(&response);
-                if digest.is_none()
-                    && !self
-                        .warned_head_digest
-                        .swap(true, std::sync::atomic::Ordering::Relaxed)
-                {
+                if digest.is_none() && !self.warned_head_digest.swap(true, Ordering::Relaxed) {
                     warn!(
                         registry = self.registry.as_str(),
                         repo,

@@ -123,6 +123,10 @@ pub struct Planned {
     /// Candidates that survive because a surviving reference holds their
     /// digest: the bytes have to stay for the survivor.
     pub kept_shared: usize,
+    /// Tagged candidates whose digest the listing could not resolve. The delete
+    /// would resolve one with a fresh `HEAD`, but the plan never saw it, so it
+    /// might land on a manifest a wanted tag also points at; they wait instead.
+    pub kept_unresolved: usize,
 }
 
 /// Collect the tags the crawl still wants.
@@ -229,8 +233,11 @@ pub fn protect(
 /// backends delete the manifest or version with all of its tags at once, so a
 /// stale tag that happens to sit next to a wanted one on the same version cannot
 /// take it down. A candidate whose digest a survivor also holds stays as well
-/// ([`Planned::kept_shared`]). Older duplicates under a wanted tag carry no other
-/// tag and are candidates.
+/// ([`Planned::kept_shared`]). A candidate whose digest the listing could not
+/// resolve waits instead ([`Planned::kept_unresolved`]): the delete would resolve
+/// one with a fresh `HEAD`, and it could be a manifest a wanted tag serves, which
+/// the plan never saw. Older duplicates under a wanted tag carry no other tag and
+/// are candidates.
 ///
 /// An untagged reference survives on a protected digest or when it is newer than
 /// `cutoff` (an undated one is not newer).
@@ -296,9 +303,12 @@ pub fn plan(
     let mut kept: Vec<RemoteReference> = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let digest = candidate.digest.as_str();
-        if !digest.is_empty()
-            && (protected_digests.contains(digest) || protection.digests.contains(digest))
-        {
+        if digest.is_empty() {
+            // The listing's `HEAD` for this tag failed. `delete_one` would
+            // resolve a digest right before deleting, but the plan never saw
+            // it, so it could be a manifest a wanted tag also serves.
+            planned.kept_unresolved += 1;
+        } else if protected_digests.contains(digest) || protection.digests.contains(digest) {
             // The bytes stay for a surviving reference; deleting them would take
             // the survivor with them.
             planned.kept_shared += 1;
@@ -882,8 +892,7 @@ async fn prune_target(
                         // any other planned deletion, so count and lines agree.
                         report.pruned += 1;
                         report.lines.push(display_reference(
-                            &registry,
-                            &format!("{namespace}/{}", candidate.project),
+                            &format!("{registry}/{namespace}/{}", candidate.project),
                             &candidate.reference,
                         ));
                     }
@@ -905,8 +914,7 @@ async fn prune_target(
                 for (_, candidate) in window {
                     report.pruned += 1;
                     report.lines.push(display_reference(
-                        &registry,
-                        &format!("{namespace}/{}", candidate.project),
+                        &format!("{registry}/{namespace}/{}", candidate.project),
                         &candidate.reference,
                     ));
                 }
@@ -916,8 +924,7 @@ async fn prune_target(
                 for (_, candidate) in &window {
                     report.pruned += 1;
                     report.lines.push(display_reference(
-                        &registry,
-                        &format!("{namespace}/{}", candidate.project),
+                        &format!("{registry}/{namespace}/{}", candidate.project),
                         &candidate.reference,
                     ));
                 }
@@ -928,10 +935,18 @@ async fn prune_target(
         let outcomes: Vec<(usize, Deleted)> =
             futures::stream::iter(window.iter().map(|(slot, candidate)| async {
                 let repo = format!("{namespace}/{}", candidate.project);
-                let remote_ref = display_reference(&registry, &repo, &candidate.reference);
                 let client = clients.get(candidate.project.as_str()).copied();
                 let outcome = delete_one(backend, client, &repo, candidate).await;
-                record(ctx, pass, target, &repo, &remote_ref, &outcome, &index).await;
+                record(
+                    ctx,
+                    pass,
+                    target,
+                    &format!("{registry}/{repo}"),
+                    &candidate.reference,
+                    &outcome,
+                    &index,
+                )
+                .await;
                 (*slot, outcome)
             }))
             .buffer_unordered(concurrency)
@@ -1173,19 +1188,24 @@ async fn delete_one(
 }
 
 /// Append the event of one outcome.
+///
+/// The artifact key is looked up under every tag of the reference, not just the
+/// one the log line names: a version can carry several and the ledger may have
+/// recorded any of them.
 async fn record(
     ctx: &Ctx,
     pass: &Pass<'_>,
     target: &TargetConfig,
-    repo: &str,
-    remote_ref: &str,
+    place: &str,
+    reference: &RemoteReference,
     outcome: &Deleted,
     index: &BTreeMap<String, String>,
 ) {
     let Some(seq) = pass.seq else {
         return;
     };
-    let package = format!("{}/{repo}", target.registry.as_deref().unwrap_or_default());
+    let remote_ref = display_reference(place, reference);
+    let package = place.to_string();
     let (kind, detail) = match outcome {
         Deleted::Pruned(digest) => (
             EventKind::Pruned,
@@ -1209,7 +1229,13 @@ async fn record(
     let mut event = Event::new(ctx.run_id.as_str(), seq.next(), Utc::now(), kind)
         .with_target(target.name.as_str())
         .with_detail(detail);
-    if let Some(key) = index.get(remote_ref) {
+    let key = index.get(&remote_ref).or_else(|| {
+        reference
+            .tags
+            .iter()
+            .find_map(|tag| index.get(&format!("{place}:{tag}")))
+    });
+    if let Some(key) = key {
         event = event.with_artifact(key.clone());
     }
 
@@ -1222,11 +1248,12 @@ async fn record(
     }
 }
 
-/// Format a reference the way a human retries it and a dry run prints it.
-fn display_reference(registry: &str, repo: &str, reference: &RemoteReference) -> String {
+/// Format a reference the way a human retries it and a dry run prints it;
+/// `place` is `registry/namespace/project`.
+fn display_reference(place: &str, reference: &RemoteReference) -> String {
     match &reference.tag {
-        Some(tag) => format!("{registry}/{repo}:{tag}"),
-        None => format!("{registry}/{repo}@{}", reference.digest),
+        Some(tag) => format!("{place}:{tag}"),
+        None => format!("{place}@{}", reference.digest),
     }
 }
 

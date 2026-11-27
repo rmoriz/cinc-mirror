@@ -74,7 +74,8 @@ own test and operator story may not depend on GitHub.
   `metadata.container.tags`.
 - Listing on an ordinary registry is `GET /v2/<repo>/tags/list?n=…&last=…`,
   paged by the `Link` header, and returns tag names only — no digests, no
-  creation times. A digest is resolved with a manifest `HEAD` when needed.
+  creation times. A digest is resolved with a manifest `HEAD` when needed, and a
+  listing that stops at the page cap warns and lets the rest wait.
 - `--limit` bounds processing, not the crawl: the run already holds the complete
   wanted set for its scope. But `--project` / `--versions` narrow the crawl, so
   a prune must stay inside the projects the crawl covered — except for the
@@ -175,7 +176,9 @@ delete bytes the policy still asks for.
   survivors holds, or which is the `remote_digest` of a wanted publication row;
   and any untagged version created after the cutoff.
 - On the spec path, nothing is deleted that arrived after the cutoff: resolve
-  `HEAD` before `DELETE`, and a missing manifest is a no-op success.
+  `HEAD` before `DELETE`, and a missing manifest is a no-op success. A tag whose
+  listing `HEAD` left no digest is kept for a later run: the plan never saw one,
+  so it could share a manifest with a wanted tag.
 
 ### Both backends
 
@@ -249,8 +252,8 @@ sweeps.
 ### The ledger
 
 - `EventKind::Pruned` (`pruned`, detail `{remote_ref, remote_digest, package}`)
-  and `EventKind::PruneFailed` (`prune_failed`, detail `{remote_ref, error}`)
-  get `as_str`/`FromStr` arms and a line in the module doc's event list.
+  and `EventKind::PruneFailed` (`prune_failed`, detail `{remote_ref, package,
+  error}`) get `as_str`/`FromStr` arms and a line in the module doc's event list.
 - `publications.artifact_key` is a foreign key to `artifacts(key)` and foreign
   keys are on, so an event cannot carry a key that has no row. The pruner builds
   a `remote_ref → artifact_key` index from `publications(target)` first and

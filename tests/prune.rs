@@ -15,7 +15,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use cinc_mirror::artifact::Artifact;
 use cinc_mirror::config::TargetKind;
 use cinc_mirror::ctx::Ctx;
-use cinc_mirror::ledger::{Event, EventKind, Ledger};
+use cinc_mirror::ledger::{Event, EventKind, Ledger, PublicationStatus};
 use cinc_mirror::prune::{backend_for, prune_targets, Pass, PruneReport, Wanted};
 use cinc_mirror::report::{EXIT_OK, EXIT_PARTIAL};
 use cinc_mirror::runner::Seq;
@@ -925,6 +925,81 @@ async fn a_version_with_two_stale_tags_is_deleted_once() {
             .filter(|(method, _)| method == "DELETE")
             .count(),
         1
+    );
+}
+
+#[tokio::test]
+async fn a_pruned_version_marks_the_ledger_row_under_any_of_its_tags() {
+    let _guard = lock_env().await;
+    let _token = EnvVar::set("GHCR_TOKEN", "test-token");
+    let mock = MockPackages::start().await;
+    mock.owner_is_org("acme");
+    // The ledger recorded the second tag; the version serves both, and the
+    // alphabetically first tag is the one the log line names.
+    let stale_tag = "19.4.45-debian-13-amd64";
+    let artifact = package_artifact(b"stale bytes", "19.4.46");
+    let recorded_tag = artifact.tag();
+    let version = mock.seed_version(
+        "mirror/cinc",
+        &[stale_tag, &recorded_tag],
+        Utc::now() - ChronoDuration::hours(2),
+    );
+    let state = tempfile::tempdir().expect("state dir");
+    let mut ledger = Ledger::open(state.path()).expect("ledger");
+    seed_artifact(&mut ledger, &artifact);
+    seed_publication(
+        &mut ledger,
+        &artifact,
+        "ghcr",
+        &format!("ghcr.io/acme/mirror/cinc:{recorded_tag}"),
+    );
+
+    let ctx = packages_context(state.path(), ledger, &mock);
+    let report = prune(&ctx, &[PROJECT], &Wanted::default(), Opts::default()).await;
+
+    assert_eq!(report.pruned, 1, "{report:?}");
+    assert_eq!(mock.deleted(), vec![version]);
+    let row = ctx
+        .ledger
+        .lock()
+        .await
+        .publication(&artifact.key(), "ghcr")
+        .expect("publication query")
+        .expect("publication row");
+    assert_eq!(
+        row.status,
+        PublicationStatus::Pruned,
+        "the row must not stay published for verify to act on"
+    );
+}
+
+#[tokio::test]
+async fn an_unresolved_stale_digest_is_not_deleted() {
+    let mock = mock_registry().await;
+    let state = tempfile::tempdir().expect("state dir");
+    let ledger = Ledger::open(state.path()).expect("ledger");
+    let wanted_tag = "19.4.46-debian-13-amd64";
+    let stale_tag = "19.4.45-debian-13-amd64";
+    mock.store_manifest(&repo(PROJECT), wanted_tag, b"shared bytes");
+    mock.store_manifest(&repo(PROJECT), stale_tag, b"shared bytes");
+    // The listing cannot see the stale tag's digest, so it cannot tell that the
+    // wanted tag serves the same manifest. The delete would resolve one and take
+    // both tags down.
+    mock.omit_head_digest_once(&repo(PROJECT), stale_tag);
+    let wanted = Wanted {
+        tags: [wanted_tag.to_string()].into_iter().collect(),
+    };
+
+    let ctx = registry_context(state.path(), ledger, &mock);
+    let report = prune(&ctx, &[PROJECT], &wanted, Opts::default()).await;
+
+    assert_eq!(report.pruned, 0, "{report:?}");
+    assert_eq!(report.deferred, 0, "{report:?}");
+    assert_eq!(mock.delete_count(), 0);
+    assert!(mock.manifest(&repo(PROJECT), stale_tag).is_some());
+    assert!(
+        mock.manifest(&repo(PROJECT), wanted_tag).is_some(),
+        "the wanted tag still resolves"
     );
 }
 

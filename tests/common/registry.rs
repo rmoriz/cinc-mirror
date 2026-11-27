@@ -89,6 +89,9 @@ pub struct MockState {
     fail_deletes: AtomicU16,
     fail_all_deletes: AtomicU16,
     denied_repos: Mutex<HashSet<String>>,
+    /// `(repo, reference)` pairs whose next manifest `HEAD` omits the digest
+    /// header, with the number of responses left that must omit it.
+    headerless_heads: Mutex<HashMap<(String, String), usize>>,
     blob_heads: AtomicUsize,
     stall_patch: AtomicU64,
     stall_patch_body: AtomicU64,
@@ -123,6 +126,7 @@ impl MockState {
             fail_deletes: AtomicU16::new(0),
             fail_all_deletes: AtomicU16::new(0),
             denied_repos: Mutex::new(HashSet::new()),
+            headerless_heads: Mutex::new(HashMap::new()),
             blob_heads: AtomicUsize::new(0),
             stall_patch: AtomicU64::new(0),
             stall_patch_body: AtomicU64::new(0),
@@ -500,16 +504,30 @@ fn manifest_response(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let headers = [
-        (
-            "content-type",
-            "application/vnd.oci.image.manifest.v1+json".to_string(),
-        ),
-        ("docker-content-digest", manifest.digest.clone()),
-        ("content-length", manifest.bytes.len().to_string()),
-    ];
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        "application/vnd.oci.image.manifest.v1+json"
+            .parse()
+            .expect("header"),
+    );
+    headers.insert(
+        "docker-content-digest",
+        manifest.digest.parse().expect("header"),
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        manifest.bytes.len().to_string().parse().expect("header"),
+    );
 
     if head_only {
+        let mut headerless = lock(&state.headerless_heads);
+        if let Some(left) = headerless.get_mut(&(repo.to_string(), reference.to_string())) {
+            if *left > 0 {
+                *left -= 1;
+                headers.remove("docker-content-digest");
+            }
+        }
         return (StatusCode::OK, headers).into_response();
     }
 
@@ -780,6 +798,12 @@ impl MockRegistry {
     /// Answer every manifest `DELETE` with `status`.
     pub fn fail_all_deletes_with(&self, status: u16) {
         self.state.fail_all_deletes.store(status, Ordering::SeqCst);
+    }
+
+    /// Answer the next manifest `HEAD` for `repo` at `reference` with `200` but
+    /// no `Docker-Content-Digest` header.
+    pub fn omit_head_digest_once(&self, repo: &str, reference: &str) {
+        lock(&self.state.headerless_heads).insert((repo.to_string(), reference.to_string()), 1);
     }
 
     /// Answer every manifest `DELETE` below `repo` with `403 FORBIDDEN`.
