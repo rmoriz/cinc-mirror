@@ -329,8 +329,9 @@ pub struct Pass<'a> {
 /// What one prune pass did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PruneReport {
-    /// References deleted. A dry run lists these too, so this is always
-    /// [`PruneReport::lines`]`.len()`.
+    /// References deleted. A dry run lists and counts these alike, so on a dry
+    /// run this is [`PruneReport::lines`]`.len()`; a real pass deletes them and
+    /// leaves `lines` empty.
     pub pruned: usize,
     /// References or projects that failed; an unsupported target never bumps
     /// it and only lands in [`PruneReport::targets_skipped`].
