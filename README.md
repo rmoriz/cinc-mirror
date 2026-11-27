@@ -125,8 +125,9 @@ is the upstream-compatible alias for `Install-Project`, so
 - The PowerShell installer needs an elevated shell because it installs the
   `.msi` via `msiexec`. The mirrored `.msi` packages can also be downloaded and
   installed directly (see [Windows](#windows)).
-- The mirror follows the current major of each product, so older majors come
-  from upstream once the installer falls back.
+- The mirror follows the major lines each product still releases — for the
+  client that is 19.x plus the maintained 18.x line — so older majors come from
+  upstream once the installer falls back.
 
 
 ## Build from source
@@ -159,8 +160,9 @@ A commented, ready-to-edit example that publishes to GHCR is in
 
 Every project is an explicit policy. Version bounds, globs, platforms, platform
 versions and architectures narrow what is crawled; `all_versions` and `"*"`
-widen it. A single major glob such as `versions = ["19.*"]` follows the current
-major line only and is what every policy in `mirror.ci.toml` uses.
+widen it. Major globs such as `versions = ["19.*"]` follow one major line and
+are what every policy in `mirror.ci.toml` uses; a policy may list more than one
+glob when upstream still releases several lines.
 
 ```toml
 state_dir = "~/.local/state/cinc-mirror"
@@ -233,12 +235,14 @@ Variables already present in the environment are not overridden.
 `auths` entry from `GITHUB_TOKEN`.
 
 `mirror.ci.toml` is the committed configuration the scheduled workflow uses; it
-mirrors all six upstream projects, but only the current major line of each:
-`versions = ["19.*"]` and so on, so every minor and bug release of that major is
-mirrored and older majors are left alone. A new upstream major needs a one-word
-edit there. `omnibus-toolchain` is the build toolchain rather than a Cinc
-product, and its Windows formats collide under one descriptive tag, so it is
-listed under `[incident] ignore_arch_collisions` (see below).
+mirrors all six upstream projects, but only the major lines upstream still
+releases: `versions = ["19.*"]` and so on, so every minor and bug release of
+that major is mirrored and older majors are left alone. `cinc` carries two
+globs, `["19.*", "18.*"]`, because upstream still releases 18.x next to 19.x. A
+new upstream major needs a one-word edit there. `omnibus-toolchain` is the
+build toolchain rather than a Cinc product, and its Windows formats collide
+under one descriptive tag, so it is listed under
+`[incident] ignore_arch_collisions` (see below).
 
 When adding a new project, the GHCR package is private by default. Make it
 public once under **Package settings → Change package visibility**, e.g.

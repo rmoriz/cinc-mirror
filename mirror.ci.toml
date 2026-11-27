@@ -4,10 +4,13 @@
 # config the workflow creates from `GITHUB_TOKEN`, and the ledger uses the git
 # authentication configured in the job environment.
 #
-# This file mirrors every project, but only its current major line: the globs
-# below select the latest major release and every minor and bug release under
-# it, not the whole version history. When upstream starts a new major, bump the
-# project's glob; until then the new line is ignored.
+# This file mirrors every project, but only the major lines upstream still
+# releases: the globs below select the current major release and every minor and
+# bug release under it, not the whole version history. When upstream starts a
+# new major, bump the project's glob and drop the line that went quiet.
+#
+# `cinc` is the exception: upstream still cuts releases on 18.x next to 19.x, so
+# the policy carries both globs. Drop `18.*` once the 18 line stops releasing.
 #
 # The workflow bounds each run with --limit / --limit-bytes; the ledger cursor
 # carries the position into the next scheduled run.
@@ -20,7 +23,7 @@ upload_concurrency = 2
 id = "cinc"
 project = "cinc"
 channel = "stable"
-versions = ["19.*"]
+versions = ["19.*", "18.*"]
 platforms = "*"
 arches = "*"
 

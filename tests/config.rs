@@ -700,46 +700,54 @@ fn loads_the_shipped_example_config() {
 }
 
 #[test]
-fn the_ci_config_follows_one_major_line_per_project() {
-    // The scheduled backfill mirrors the current major of every project, not the
-    // whole history. A missing or widened glob here silently re-adds thousands
-    // of old artifacts.
+fn the_ci_config_follows_the_expected_major_lines() {
+    // The scheduled backfill mirrors only the major lines each product still
+    // releases, not the whole history. A widened glob here silently re-adds
+    // thousands of old artifacts. `cinc` keeps 18.x because upstream still cuts
+    // releases on that line next to 19.x.
+    let expected: [(&str, &[&str]); 6] = [
+        ("cinc", &["19.*", "18.*"]),
+        ("cinc-auditor", &["7.*"]),
+        ("cinc-foundation", &["3.*"]),
+        ("cinc-server", &["15.*"]),
+        ("cinc-workstation", &["26.*"]),
+        ("omnibus-toolchain", &["26.*"]),
+    ];
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("mirror.ci.toml");
 
     let config = Config::load(Some(&path)).expect("CI config parses");
     config.validate().expect("CI config is valid");
-    assert_eq!(config.projects.len(), 6);
+    assert_eq!(config.projects.len(), expected.len());
 
-    for policy in &config.projects {
+    for (id, globs) in expected {
+        let policy = config
+            .projects
+            .iter()
+            .find(|policy| policy.id == id)
+            .unwrap_or_else(|| panic!("`{id}` must stay in the CI config"));
         assert!(
             !policy.all_versions,
-            "{}: a wide open policy would crawl every version",
-            policy.id
+            "{id}: a wide open policy would crawl every version"
         );
-        assert_eq!(
-            policy.versions.len(),
-            1,
-            "{}: exactly one major glob",
-            policy.id
-        );
-        let raw = &policy.versions[0];
-        let major: u64 = raw
-            .trim_end_matches(".*")
-            .parse()
-            .unwrap_or_else(|_| panic!("{}: `{raw}` must be `<major>.*`", policy.id));
-        let glob: cinc_mirror::VersionGlob = raw.parse().expect("valid glob");
-        let probe = |version: &str| glob.matches(&version.parse().expect("probe version"));
-        assert!(probe(&format!("{major}.99.99")), "{}: own line", policy.id);
-        assert!(
-            !probe(&format!("{}.0.0", major - 1)),
-            "{}: previous major must be out",
-            policy.id
-        );
-        assert!(
-            !probe(&format!("{}.0.0", major + 1)),
-            "{}: next major must be out",
-            policy.id
-        );
+        let versions: Vec<&str> = policy.versions.iter().map(String::as_str).collect();
+        assert_eq!(versions, globs, "{id}: unexpected major lines");
+        for raw in &policy.versions {
+            let major: u64 = raw
+                .trim_end_matches(".*")
+                .parse()
+                .unwrap_or_else(|_| panic!("{id}: `{raw}` must be `<major>.*`"));
+            let glob: cinc_mirror::VersionGlob = raw.parse().expect("valid glob");
+            let probe = |version: &str| glob.matches(&version.parse().expect("probe version"));
+            assert!(probe(&format!("{major}.99.99")), "{id}: own line");
+            assert!(
+                !probe(&format!("{}.0.0", major - 1)),
+                "{id}: previous major must be out"
+            );
+            assert!(
+                !probe(&format!("{}.0.0", major + 1)),
+                "{id}: next major must be out"
+            );
+        }
     }
 }
 
