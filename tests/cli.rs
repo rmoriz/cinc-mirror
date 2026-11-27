@@ -15,6 +15,7 @@ use assert_cmd::Command;
 use chrono::Utc;
 use cinc_mirror::artifact::Artifact;
 use cinc_mirror::cli::Cli;
+use cinc_mirror::cli::Command as CliCommand;
 use cinc_mirror::ledger::{Event, EventKind, Lease, Ledger, LedgerStore};
 use clap::Parser;
 use common::mirror::package_artifact;
@@ -104,6 +105,7 @@ fn help_lists_every_subcommand() {
         .stdout(predicate::str::contains("backfill"))
         .stdout(predicate::str::contains("verify"))
         .stdout(predicate::str::contains("repair"))
+        .stdout(predicate::str::contains("prune"))
         .stdout(predicate::str::contains("incidents"))
         .stdout(predicate::str::contains("ledger"))
         .stdout(predicate::str::contains("targets"))
@@ -217,6 +219,32 @@ fn zero_byte_limit_is_a_usage_error() {
 #[test]
 fn mirror_accepts_prune() {
     assert!(Cli::try_parse_from(["cinc-mirror", "mirror", "--prune"]).is_ok());
+}
+
+#[test]
+fn prune_parses_filters_targets_limit_and_dry_run() {
+    let cli = Cli::try_parse_from([
+        "cinc-mirror",
+        "prune",
+        "--dry-run",
+        "--project",
+        "cinc",
+        "--target",
+        "ghcr",
+        "--limit",
+        "5",
+    ])
+    .expect("prune arguments");
+    assert_eq!(cli.cmd.name(), "prune");
+
+    let CliCommand::Prune(args) = cli.cmd else {
+        panic!("expected prune");
+    };
+    assert_eq!(args.filters.projects, vec!["cinc".to_string()]);
+    assert_eq!(args.targets, vec!["ghcr".to_string()]);
+    assert_eq!(args.limit, Some(5));
+    assert!(args.dry_run);
+    assert!(!args.json);
 }
 
 #[test]

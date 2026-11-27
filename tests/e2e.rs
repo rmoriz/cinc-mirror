@@ -25,6 +25,7 @@ use cinc_mirror::config::{Config, Selection, TransportKind};
 use cinc_mirror::ctx::Ctx;
 use cinc_mirror::ledger::{Ledger, LedgerStore};
 use cinc_mirror::net::RateLimiter;
+use cinc_mirror::prune;
 use cinc_mirror::repair::{self, RepairOpts};
 use cinc_mirror::runner::{self, RunOpts};
 use cinc_mirror::scope::{ResolvedPolicy, ResolvedScope};
@@ -302,6 +303,13 @@ async fn fixture() -> Fixture {
         state_dir: state.path().to_path_buf(),
         concurrency: 2,
         upload_concurrency: 2,
+        // `prune_targets` walks `config.targets`; the publishing `TargetSet`
+        // below is built separately.
+        targets: vec![common::mirror::oci_target_config(&mock, "oci")],
+        retention: cinc_mirror::config::RetentionConfig {
+            prune: true,
+            ..cinc_mirror::config::RetentionConfig::default()
+        },
         ..Config::default()
     };
     let scope = ResolvedScope {
@@ -467,6 +475,77 @@ async fn e2e_mirror_then_noop_then_repair() {
         .collect();
     assert_eq!(keys.len(), 2);
     let _ = json!({ "ok": true });
+}
+
+#[tokio::test]
+async fn e2e_prune_removes_a_stale_publication_a_denied_prune_exits_two() {
+    let mut fixture = fixture().await;
+    let repo = format!("{}/{}", common::mirror::NAMESPACE, common::mirror::PROJECT);
+
+    // A reference no policy selects any more: an old major line.
+    fixture
+        .mock
+        .store_manifest(&repo, "19.4.1", b"the package bytes of 19.4.1");
+
+    // The mirror run publishes both wanted artifacts and prunes the stale one.
+    let first = runner::run(&fixture.ctx, RunOpts::default())
+        .await
+        .expect("mirror run with prune");
+    assert_eq!(first.published, 4, "{first:?}");
+    assert_eq!(first.pruned, 1, "{first:?}");
+    assert_eq!(first.exit_code, 0, "{first:?}");
+    assert_eq!(fixture.mock.delete_count(), 1);
+    assert!(
+        fixture.mock.manifest(&repo, "19.4.1").is_none(),
+        "the stale reference is gone"
+    );
+    for spec in &fixture.specs {
+        let artifact = fixture.artifact(spec);
+        assert!(
+            fixture.mock.manifest(&repo, &artifact.tag()).is_some(),
+            "the wanted tag {} survives",
+            artifact.tag()
+        );
+    }
+
+    // A prune on its own, with the registry refusing deletes: one failure and
+    // exit code 2, and the stale reference stays.
+    fixture
+        .mock
+        .store_manifest(&repo, "19.4.1", b"the package bytes of 19.4.1");
+    fixture.mock.deny_deletes(&repo);
+
+    let artifacts: Vec<Artifact> = fixture
+        .specs
+        .iter()
+        .map(|spec| fixture.artifact(spec))
+        .collect();
+    let wanted = prune::wanted(&artifacts.iter().collect::<Vec<_>>());
+    let crawled = BTreeMap::from([(common::mirror::PROJECT.to_string(), artifacts.len())]);
+    let hold_back: HashSet<String> = HashSet::new();
+    let configured = HashSet::from([common::mirror::PROJECT.to_string()]);
+    let projects = vec![common::mirror::PROJECT];
+    let pass = prune::Pass {
+        projects: &projects,
+        wanted: &wanted,
+        crawled: &crawled,
+        hold_back: &hold_back,
+        configured: &configured,
+        sweep_orphans: false,
+        dry_run: false,
+        budget: 10,
+        seq: None,
+    };
+
+    fixture.start_run("e2e-prune-denied");
+    let denied = prune::prune_targets(&fixture.ctx, &pass).await;
+    assert_eq!(denied.pruned, 0, "{denied:?}");
+    assert!(denied.failed > 0, "{denied:?}");
+    assert_eq!(denied.exit_code, 2, "{denied:?}");
+    assert!(
+        fixture.mock.manifest(&repo, "19.4.1").is_some(),
+        "a denied prune leaves the reference alone"
+    );
 }
 
 #[tokio::test]

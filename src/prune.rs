@@ -366,6 +366,58 @@ impl PruneReport {
     }
 }
 
+/// The target names a prune run should touch, in configuration order.
+///
+/// An empty `requested` selects every enabled OCI target. Otherwise every name
+/// must be an enabled OCI target: a name the configuration does not know, a
+/// name of another kind and a disabled target are usage errors, so a typo cannot
+/// silently reconcile nothing. The result is deduplicated and follows the
+/// configuration order, not the argument order.
+///
+/// # Errors
+///
+/// Returns [`PruneError::Usage`] for a name that is not an enabled OCI target.
+pub fn selected_targets<'a>(
+    config: &'a Config,
+    requested: &[String],
+) -> Result<Vec<&'a str>, PruneError> {
+    if requested.is_empty() {
+        return Ok(config
+            .targets
+            .iter()
+            .filter(|target| target.enabled && target.kind == TargetKind::Oci)
+            .map(|target| target.name.as_str())
+            .collect());
+    }
+
+    for name in requested {
+        let target = config
+            .targets
+            .iter()
+            .find(|target| &target.name == name)
+            .ok_or_else(|| PruneError::Usage {
+                reason: format!("target `{name}` is not an enabled oci target"),
+            })?;
+        if target.kind != TargetKind::Oci {
+            return Err(PruneError::Usage {
+                reason: format!("target `{name}` is not an oci target"),
+            });
+        }
+        if !target.enabled {
+            return Err(PruneError::Usage {
+                reason: format!("target `{name}` is not enabled"),
+            });
+        }
+    }
+
+    Ok(config
+        .targets
+        .iter()
+        .filter(|target| requested.contains(&target.name))
+        .map(|target| target.name.as_str())
+        .collect())
+}
+
 /// Pick the delete backend for `target`.
 ///
 /// [`DeleteMode::Auto`] uses the packages API exactly on [`GHCR_HOST`] and the
@@ -1154,6 +1206,7 @@ mod tests {
 
     use super::*;
     use crate::artifact::{Artifact, ArtifactContext, ArtifactInput};
+    use crate::config::TargetAuth;
     use crate::ledger::{ArtifactRow, IncidentKind, IncidentState, PublicationStatus};
 
     fn at(day: u32) -> DateTime<Utc> {
@@ -1278,6 +1331,80 @@ mod tests {
         Protection {
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
             digests: BTreeSet::new(),
+        }
+    }
+
+    fn target(name: &str, kind: TargetKind, enabled: bool) -> TargetConfig {
+        TargetConfig {
+            name: name.to_string(),
+            kind,
+            enabled,
+            registry: Some("registry.example".to_string()),
+            namespace: Some("owner/repository".to_string()),
+            url: None,
+            auth: TargetAuth::Anonymous,
+            max_bandwidth: None,
+            identity_file: None,
+            password_file: None,
+        }
+    }
+
+    fn config_of(targets: Vec<TargetConfig>) -> Config {
+        Config {
+            targets,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn selected_targets_defaults_to_every_enabled_oci_target() {
+        let config = config_of(vec![
+            target("oci", TargetKind::Oci, true),
+            target("rsync", TargetKind::Rsync, true),
+            target("off", TargetKind::Oci, false),
+        ]);
+
+        assert_eq!(
+            selected_targets(&config, &[]).expect("the default selection"),
+            vec!["oci"]
+        );
+    }
+
+    #[test]
+    fn selected_targets_dedups_and_follows_the_configuration_order() {
+        let config = config_of(vec![
+            target("a", TargetKind::Oci, true),
+            target("b", TargetKind::Oci, true),
+        ]);
+        let requested = vec!["b".to_string(), "a".to_string(), "b".to_string()];
+
+        assert_eq!(
+            selected_targets(&config, &requested).expect("the selection"),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn selected_targets_rejects_a_name_that_is_not_an_enabled_oci_target() {
+        let config = config_of(vec![
+            target("oci", TargetKind::Oci, true),
+            target("rsync", TargetKind::Rsync, true),
+            target("off", TargetKind::Oci, false),
+        ]);
+
+        for (name, reason) in [
+            ("rsync", "not an oci target"),
+            ("off", "not enabled"),
+            ("ghost", "not an enabled oci target"),
+        ] {
+            let error = selected_targets(&config, &[name.to_string()]).expect_err("a usage error");
+            let message = error.to_string();
+            assert!(
+                message.starts_with("usage: ")
+                    && message.contains(name)
+                    && message.contains(reason),
+                "{message}"
+            );
         }
     }
 

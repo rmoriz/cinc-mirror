@@ -142,6 +142,13 @@ pub enum PruneError {
         /// Why the configuration was rejected.
         reason: String,
     },
+
+    /// The command arguments cannot be used.
+    #[error("usage: {reason}")]
+    Usage {
+        /// What is wrong with the invocation.
+        reason: String,
+    },
 }
 
 /// A failed packages API answer, already redacted.

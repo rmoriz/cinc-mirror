@@ -852,6 +852,44 @@ fn usage_errors_exit_with_code_64() {
 }
 
 #[test]
+fn prune_names_a_target_that_is_not_an_oci_target() {
+    let root = tempfile::tempdir().expect("root");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let target_root = root.path().join("rsync");
+    std::fs::create_dir_all(&target_root).expect("target root");
+    let config = root.path().join("mirror.toml");
+    write!(
+        std::fs::File::create(&config).expect("config file"),
+        r#"state_dir = {state:?}
+
+[ledger]
+branch = "ledger"
+remote = "git@example.invalid:ledger.git"
+
+[[targets]]
+name = "rsync"
+kind = "rsync"
+url = {target_root:?}
+auth = "anonymous"
+"#
+    )
+    .expect("write config");
+
+    binary()
+        .arg("--config")
+        .arg(&config)
+        .args(["prune", "--target", "rsync"])
+        .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
+        .assert()
+        .code(64)
+        .stderr(
+            predicate::str::contains("rsync").and(predicate::str::contains("not an oci target")),
+        );
+}
+
+#[test]
 fn help_exits_with_code_0() {
     binary()
         .arg("--help")

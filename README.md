@@ -267,6 +267,10 @@ Run `cinc-mirror <command> --help` for the full flag set. Global options are
 - `repair` — re-publish or re-fetch artifacts that need repair:
   `cinc-mirror repair --target rsync`, optionally bounded with `--project`
   (repeatable) and `--limit`
+- `prune` — delete publications the policies no longer select, without
+  downloading or publishing: `cinc-mirror prune --dry-run`, then
+  `cinc-mirror prune` bounded with `--target` (repeatable oci targets),
+  `--project` and `--limit`
 - `incidents` — inspect and acknowledge integrity incidents:
   `cinc-mirror incidents list`, `cinc-mirror incidents show <id>`,
   `cinc-mirror incidents ack <id> [--republish]`
@@ -337,20 +341,37 @@ operator acknowledges it.
 ## Retention
 
 `[retention]` decides whether a run deletes publications the policies no longer
-select. It is off by default; `mirror --prune` turns it on for one run. The
-fields are not reachable through `--set`.
+select. It is off by default; `mirror --prune` turns it on for one run and
+`mirror.ci.toml` leaves it on. The fields are not reachable through `--set`.
 
 ```toml
 [retention]
-prune = false                       # the CI workflow sets true
+prune = false                       # mirror.ci.toml sets true
 delete = "auto"                     # auto | registry | packages-api
 api_base = "https://api.github.com" # packages path only
 max_deletions = 2000                # per target and run; the rest waits
 ```
 
 `auto` resolves to the GitHub Packages API on `ghcr.io`, which rejects deletes on
-the distribution API with `405`, and to the registry API elsewhere.
-`CINC_MIRROR_GHCR_API_TOKEN` authorizes the packages path.
+the distribution API with `405`, and to the registry API elsewhere. The packages
+path authenticates with `GHCR_TOKEN`, falling back to `GITHUB_TOKEN`
+(`CINC_MIRROR_GHCR_API_TOKEN` is not read).
+
+`cinc-mirror prune` runs the same pass on its own: it crawls to learn what is
+still wanted, but neither downloads nor publishes. `--dry-run` deletes the first
+candidate per target for real as a capability probe and lists the rest.
+
+A first prune is not a tidy-up of a stray tag; it removes whole old majors that
+the configured lines no longer cover. `max_deletions` spreads that over several
+runs — the remainder is reported as `deferred` and waits for the next one, so
+run `prune` until `deferred=0`. A removed major is not lost: the installers
+resolve a version upstream first and fall back to the upstream download URL when
+the mirror cannot serve it, so they can re-install it and a later `backfill`
+puts it back.
+
+Going back to a binary without `prune` needs both steps: remove the whole
+`[retention]` table (the older binary rejects the unknown keys) and delete the
+`pruned` events (an older ledger would read them as broken publications).
 
 ## CI and scheduled backfill
 

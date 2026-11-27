@@ -12,7 +12,7 @@
 //! another error), `4` a live foreign lease, `5` configuration or auth, `64`
 //! usage. `1` is the documented internal-error code for anything unclassified.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, ExitCode};
 use std::sync::Arc;
@@ -20,14 +20,16 @@ use std::time::Duration;
 
 use anyhow::bail;
 use chrono::{SecondsFormat, Utc};
+use cinc_mirror::artifact::Artifact;
 use cinc_mirror::cli::{
     BackfillArgs, Cli, Command, ConfigCommand, IncidentsCommand, LedgerCommand, LogFormat,
-    MirrorArgs, PlanArgs, PlanGrouping, RepairArgs, RunArgs, ScopeFilterArgs, TargetsCommand,
-    VerifyArgs,
+    MirrorArgs, PlanArgs, PlanGrouping, PruneArgs, RepairArgs, RunArgs, ScopeFilterArgs,
+    TargetsCommand, VerifyArgs,
 };
 use cinc_mirror::config::{
     Config, ConfigError, ProjectPolicy, TargetConfig, TargetKind, DEFAULT_CONFIG_FILE,
 };
+use cinc_mirror::crawl;
 use cinc_mirror::ctx::Ctx;
 use cinc_mirror::fsutil::expand_tilde;
 use cinc_mirror::hash::hash_reader;
@@ -38,7 +40,9 @@ use cinc_mirror::ledger::{
 };
 use cinc_mirror::net::RateLimiter;
 use cinc_mirror::oci::OciError;
+use cinc_mirror::packages_api::PruneError;
 use cinc_mirror::plan::{self, Plan};
+use cinc_mirror::prune::{self, Pass, PruneReport};
 use cinc_mirror::repair::{self, RepairError, RepairReport};
 use cinc_mirror::report::{
     redact_secrets, Summary, EXIT_CONFIG, EXIT_INCIDENTS, EXIT_LEASE_BUSY, EXIT_OK, EXIT_PARTIAL,
@@ -181,6 +185,12 @@ fn exit_code(error: &anyhow::Error) -> i32 {
             _ => 1,
         };
     }
+    if let Some(error) = error.downcast_ref::<PruneError>() {
+        return match error {
+            PruneError::Usage { .. } => EXIT_USAGE,
+            _ => 1,
+        };
+    }
     if let Some(error) = error.downcast_ref::<cinc_mirror::bootstrap::BootstrapError>() {
         return match error {
             cinc_mirror::bootstrap::BootstrapError::RunIdReused { .. } => EXIT_USAGE,
@@ -249,6 +259,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Plan(args) => plan_command(&config, args, allow_unleased).await,
         Command::Verify(args) => verify_command(&config, args, allow_unleased).await,
         Command::Repair(args) => repair_command(&config, args, allow_unleased).await,
+        Command::Prune(args) => prune_command(&config, args, allow_unleased).await,
         Command::Incidents { action } => incidents_command(&config, action, allow_unleased).await,
         Command::Ledger { action } => ledger_command(&config, action, allow_unleased).await,
     }
@@ -1271,6 +1282,229 @@ fn repair_json(report: &RepairReport) -> String {
         "actions": actions,
     }))
     .unwrap_or_else(|_| "{}".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// prune
+// ---------------------------------------------------------------------------
+
+/// Delete publications the resolved policies no longer select.
+///
+/// The command mirrors a mirror run's preamble — configuration, scope, ledger,
+/// lease — but neither downloads nor publishes. It crawls upstream once to learn
+/// what the policies still want and hands that to [`prune::prune_targets`]. A
+/// failed crawl prunes nothing.
+async fn prune_command(
+    base: &Config,
+    args: PruneArgs,
+    allow_unleased: bool,
+) -> anyhow::Result<i32> {
+    let (mut config, scope) = prepare_config(base, &args.filters)?;
+    // `prune_targets` walks `config.targets`, so the selection is applied there.
+    let selected: Vec<String> = prune::selected_targets(&config, &args.targets)?
+        .into_iter()
+        .map(ToString::to_string)
+        .collect();
+    config
+        .targets
+        .retain(|target| selected.contains(&target.name));
+
+    let run_id = new_run_id();
+    let mut env = open_ledger(&config, allow_unleased)?;
+    let guard = acquire_lease(&env, &run_id, allow_unleased).await?;
+    let recorder = RunRecorder::begin(env.ledger()?)?;
+    let ledger = env.take_ledger()?;
+    let budget = args.limit.unwrap_or(config.retention.max_deletions);
+    let sweep_orphans = args.filters.projects.is_empty() && args.filters.versions.is_empty();
+
+    let outcome = async {
+        let ctx = build_context(config, scope, ledger, run_id.clone())?;
+
+        // A dry run writes nothing at all: no `run_started`, no `run_finished`
+        // and `seq: None` into the pass, which suppresses the prune events.
+        let seq = if args.dry_run {
+            None
+        } else {
+            let seq = runner::Seq::new(1);
+            let started = Event::new(
+                run_id.clone(),
+                seq.next(),
+                Utc::now(),
+                EventKind::RunStarted,
+            )
+            .with_detail(json!({
+                "effective_policy": plan::policies_json(&ctx.scope),
+                "order": "prune",
+                "max_bytes": null,
+                "transport_order": ctx
+                    .config
+                    .transport
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                "host": cinc_mirror::hostname(),
+            }));
+            ctx.ledger.lock().await.append(&started)?;
+            Some(seq)
+        };
+
+        // The crawl happens here, not in a helper returning the pass: the pass
+        // borrows these sets, so they have to live in the same scope.
+        let overrides = {
+            let ledger = ctx.ledger.lock().await;
+            ledger.tag_overrides()?
+        };
+        let mut candidates: BTreeMap<String, (usize, Artifact)> = BTreeMap::new();
+        // A project that lost a metadata document keeps its entry, so a prune
+        // reads it as held back and not as empty.
+        let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
+        for (index, policy) in ctx.scope.policies.iter().enumerate() {
+            let crawled = crawl::crawl(&ctx.source, policy, &overrides).await?;
+            *skipped.entry(policy.project.clone()).or_insert(0) += crawled.skipped;
+            for artifact in crawled.artifacts {
+                candidates
+                    .entry(artifact.key())
+                    .or_insert((index, artifact));
+            }
+        }
+        // Two policies can map one tag onto different bytes; qualify the
+        // latecomers exactly like a mirror run, so the wanted tags match.
+        let _ = crawl::collect_tag_collisions(
+            candidates.values_mut().map(|(_, artifact)| artifact),
+            &overrides,
+        );
+
+        let projects: Vec<&str> = ctx
+            .scope
+            .policies
+            .iter()
+            .map(|policy| policy.project.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let wanted = prune::wanted(
+            &candidates
+                .values()
+                .map(|(_, artifact)| artifact)
+                .collect::<Vec<_>>(),
+        );
+        let mut crawled: BTreeMap<String, usize> = BTreeMap::new();
+        for (_, artifact) in candidates.values() {
+            *crawled.entry(artifact.project.clone()).or_insert(0) += 1;
+        }
+        let hold_back: HashSet<String> = skipped
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(project, _)| project.clone())
+            .collect();
+        let configured: HashSet<String> = ctx
+            .config
+            .projects
+            .iter()
+            .map(|policy| policy.project.clone())
+            .collect();
+
+        let report = prune::prune_targets(
+            &ctx,
+            &Pass {
+                projects: &projects,
+                wanted: &wanted,
+                crawled: &crawled,
+                hold_back: &hold_back,
+                configured: &configured,
+                sweep_orphans,
+                dry_run: args.dry_run,
+                budget,
+                seq: seq.as_ref(),
+            },
+        )
+        .await;
+
+        // A real run always closes with `run_finished`, success or partial.
+        if let Some(seq) = seq.as_ref() {
+            let outcome = if report.failed > 0 || !report.targets_skipped.is_empty() {
+                "partial"
+            } else {
+                "success"
+            };
+            let finished = Event::new(
+                run_id.clone(),
+                seq.next(),
+                Utc::now(),
+                EventKind::RunFinished,
+            )
+            .with_detail(json!({
+                "outcome": outcome,
+                "summary": {
+                    "pruned": report.pruned,
+                    "prune_failed": report.failed,
+                    "prune_deferred": report.deferred,
+                },
+            }));
+            ctx.ledger.lock().await.append(&finished)?;
+        }
+
+        env.restore(take_ledger(ctx));
+        Ok::<PruneReport, anyhow::Error>(report)
+    }
+    .await;
+
+    let report = match outcome {
+        Ok(report) => report,
+        Err(error) => {
+            recorder.finish_or_warn(&mut env, &run_id, &format!("prune {run_id} (incomplete)"));
+            return Err(error);
+        }
+    };
+
+    print_prune(&report, args.dry_run, args.json);
+    if !args.dry_run {
+        recorder.finish(&env, &run_id, &format!("prune {run_id}"))?;
+    }
+    if let Some(guard) = guard {
+        guard.release().await;
+    }
+    Ok(report.exit_code)
+}
+
+/// Print a prune report as JSON or as the text summary.
+///
+/// A dry run lists what it would delete first; on a dry run `pruned` counts the
+/// same lines, so the closing line needs no second source.
+fn print_prune(report: &PruneReport, dry_run: bool, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "pruned": report.pruned,
+                "failed": report.failed,
+                "deferred": report.deferred,
+                "skipped": report.targets_skipped.len(),
+                "targets_skipped": report.targets_skipped,
+                "exit_code": report.exit_code,
+            }))
+            .unwrap_or_else(|_| "{}".to_string())
+        );
+        return;
+    }
+
+    for line in &report.lines {
+        println!("{line}");
+    }
+    println!(
+        "pruned={} failed={} deferred={} skipped={} exit={}",
+        report.pruned,
+        report.failed,
+        report.deferred,
+        report.targets_skipped.len(),
+        report.exit_code
+    );
+    if !report.targets_skipped.is_empty() {
+        println!("skipped targets: {}", report.targets_skipped.join(", "));
+    }
+    if dry_run {
+        println!("dry run: {} reference(s) would be deleted", report.pruned);
+    }
 }
 
 // ---------------------------------------------------------------------------
