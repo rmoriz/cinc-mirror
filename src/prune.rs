@@ -329,8 +329,8 @@ pub struct Pass<'a> {
 /// What one prune pass did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PruneReport {
-    /// References deleted. A dry run deletes only the probe, so this is `1` at
-    /// most while [`PruneReport::lines`] carries the rest of the plan.
+    /// References deleted. A dry run lists these too, so this is always
+    /// [`PruneReport::lines`]`.len()`.
     pub pruned: usize,
     /// References or projects that failed; an unsupported target never bumps
     /// it and only lands in [`PruneReport::targets_skipped`].
@@ -341,8 +341,8 @@ pub struct PruneReport {
     /// Targets whose backend cannot delete; they are left alone.
     pub targets_skipped: Vec<String>,
     /// One `registry/repo:tag` (or `@digest`) line per planned deletion; filled
-    /// on a dry run only. A planned reference is never [deleted](Self::pruned),
-    /// so the two counts together are what the pass would delete.
+    /// on a dry run only. The probing deletion of a target is listed and
+    /// [counted](Self::pruned) like the rest of its plan, so the two agree.
     pub lines: Vec<String>,
     /// Process exit code implied by the counts.
     pub exit_code: i32,
@@ -459,15 +459,15 @@ pub fn backend_for(config: &Config, target: &TargetConfig) -> Option<Backend> {
 /// run.
 ///
 /// A dry run performs exactly one deletion per target: the first reference it
-/// would delete is deleted for real and doubles as the capability probe, only
-/// the references after it are planned. Without that probe an endpoint that
-/// answers `405` to `DELETE` would be planned in full — a dry run against GHCR
-/// with `delete = "registry"` would promise deletions that the real run then
-/// skips. The alternative, a separate `HEAD`-then-`DELETE` probe, costs an extra
-/// request and has to duplicate the budget and error handling; reusing the
-/// first candidate keeps both and reports what actually happens. An unsupported
-/// endpoint therefore lands in [`PruneReport::targets_skipped`] with nothing
-/// planned, and the rest of its references count as deferred.
+/// would delete is deleted for real and doubles as the capability probe, and it
+/// is listed and counted like the rest of the plan. Without that probe an
+/// endpoint that answers `405` to `DELETE` would be planned in full — a dry run
+/// against GHCR with `delete = "registry"` would promise deletions that the real
+/// run then skips. The alternative, a separate `HEAD`-then-`DELETE` probe, costs
+/// an extra request and has to duplicate the budget and error handling; reusing
+/// the first candidate keeps both and reports what actually happens. An
+/// unsupported endpoint therefore lands in [`PruneReport::targets_skipped`] with
+/// nothing planned, and the rest of its references count as deferred.
 pub async fn prune_targets(ctx: &Ctx, pass: &Pass<'_>) -> PruneReport {
     let mut report = PruneReport::default();
     let concurrency = usize::try_from(ctx.config.upload_concurrency)
@@ -715,8 +715,9 @@ async fn prune_target(
         if pass.dry_run {
             // The first reference of the target is deleted for real: it probes
             // whether the endpoint deletes at all, so a `405` reaches the
-            // report instead of turning into plans. Everything after it is
-            // planned only (`prune_targets` explains why).
+            // report instead of turning into plans. A probe that really went is
+            // counted and listed like any other deletion; everything after it
+            // is planned only (`prune_targets` explains why).
             if !probed {
                 probed = true;
                 let mut window = window.into_iter();
@@ -743,7 +744,16 @@ async fn prune_target(
                 }
                 match outcome {
                     Deleted::Missing => budget += 1,
-                    Deleted::Pruned(_) => report.pruned += 1,
+                    Deleted::Pruned(_) => {
+                        // The probe really went; it counts and is listed like
+                        // any other planned deletion, so count and lines agree.
+                        report.pruned += 1;
+                        report.lines.push(display_reference(
+                            &registry,
+                            &format!("{namespace}/{}", candidate.project),
+                            &candidate.reference,
+                        ));
+                    }
                     Deleted::Denied(reason) => {
                         report.failed += 1;
                         budget += 1;
@@ -759,6 +769,7 @@ async fn prune_target(
                     Deleted::Unsupported => {}
                 }
                 for (_, candidate) in window {
+                    report.pruned += 1;
                     report.lines.push(display_reference(
                         &registry,
                         &format!("{namespace}/{}", candidate.project),
@@ -766,7 +777,10 @@ async fn prune_target(
                     ));
                 }
             } else {
+                // Planned only, but each one counts like a deletion: the lines
+                // and the count describe the same plan.
                 for (_, candidate) in &window {
+                    report.pruned += 1;
                     report.lines.push(display_reference(
                         &registry,
                         &format!("{namespace}/{}", candidate.project),

@@ -2235,8 +2235,8 @@ async fn a_dry_run_deletes_the_probe_and_reports_the_rest() {
     .await
     .expect("run");
 
-    // The first candidate is deleted for real as the capability probe, the
-    // second is only reported.
+    // The first candidate is deleted for real as the capability probe; it is
+    // counted and listed exactly like the reference it leaves behind.
     assert_eq!(mock.delete_count(), 1);
     let doomed = [&first, &second]
         .into_iter()
@@ -2253,11 +2253,10 @@ async fn a_dry_run_deletes_the_probe_and_reports_the_rest() {
     );
     assert_eq!(
         summary.prune_lines,
-        vec![format!(
-            "{}/{}:{planned}",
-            mock.registry_name(),
-            repo_of("cinc")
-        )]
+        vec![
+            format!("{}/{}:{doomed}", mock.registry_name(), repo_of("cinc")),
+            format!("{}/{}:{planned}", mock.registry_name(), repo_of("cinc")),
+        ]
     );
     assert_eq!(summary.prune_skipped, 0);
     assert_eq!(summary.exit_code, EXIT_OK);
@@ -2435,19 +2434,26 @@ async fn a_collision_keeps_the_digest_qualified_tag_wanted() {
     .await
     .expect("run");
 
-    // One stale tag is the deleted probe, the other stays a plan; neither the
-    // descriptive nor the qualified tag may show up on either side.
+    // One stale tag is the deleted probe, the other stays a plan; both are
+    // counted and listed, and neither the descriptive nor the qualified tag may
+    // show up.
     for tag in [&descriptive, &qualified] {
         assert!(
             mock.manifest(&repo_of("cinc"), tag).is_some(),
             "{tag} stays"
         );
     }
-    assert_eq!(summary.prune_lines.len(), 1, "{:?}", summary.prune_lines);
+    assert_eq!(summary.prune_lines.len(), 2, "{:?}", summary.prune_lines);
     let remaining = [&stale, &planned]
         .into_iter()
         .find(|tag| mock.manifest(&repo_of("cinc"), tag).is_some())
         .expect("one stale tag survives to be planned");
-    assert!(summary.prune_lines[0].ends_with(&format!(":{remaining}")));
-    assert_eq!(summary.pruned, 2);
+    let probed = if remaining == &stale {
+        &planned
+    } else {
+        &stale
+    };
+    assert!(summary.prune_lines[0].ends_with(&format!(":{probed}")));
+    assert!(summary.prune_lines[1].ends_with(&format!(":{remaining}")));
+    assert_eq!(summary.pruned, summary.prune_lines.len());
 }

@@ -870,9 +870,9 @@ pub async fn run(ctx: &Ctx, mut opts: RunOpts) -> Result<Summary, RunError> {
             open_incidents: open_incident_count(ctx).await?,
             ..Summary::default()
         };
-        // Only the probed reference was really deleted; the planned lines stand
-        // in for the rest of the count.
-        summary.pruned = pruned.pruned + pruned.lines.len();
+        // A dry run counts the probed reference like the rest of the plan it
+        // lists, so the report's own count is the whole answer.
+        summary.pruned = pruned.pruned;
         summary.prune_failed = pruned.failed;
         summary.prune_deferred = pruned.deferred;
         summary.prune_skipped = pruned.targets_skipped.len();

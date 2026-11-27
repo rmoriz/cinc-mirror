@@ -162,11 +162,10 @@ pub struct Summary {
     /// Reported for the operator; only newly opened incidents drive the exit
     /// code.
     pub open_incidents: usize,
-    /// References the prune pass deleted.
+    /// References the prune pass removed, or would remove on a dry run.
     ///
-    /// On a dry run only the probing reference of each target is deleted, so the
-    /// count is what the pass really removed while
-    /// [`Summary::prune_lines`] carries what it only planned.
+    /// [`Summary::prune_lines`] carries the same references in order, so a dry
+    /// run lists exactly this many lines.
     pub pruned: usize,
     /// References or projects the prune pass failed on.
     pub prune_failed: usize,

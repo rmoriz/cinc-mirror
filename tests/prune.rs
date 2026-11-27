@@ -799,20 +799,34 @@ async fn a_dry_run_probes_one_delete_and_plans_the_rest() {
     .await;
 
     // The first candidate probes the capability and is deleted for real; the
-    // tail is only planned.
-    assert_eq!(report.pruned, 1, "{report:?}");
+    // tail is only planned. The probe is counted and listed like any other
+    // deletion, so the count and the lines agree.
     assert_eq!(report.targets_skipped, Vec::<String>::new());
     let remaining = [first, second]
         .into_iter()
         .find(|tag| mock.manifest(&repo(PROJECT), tag).is_some())
         .expect("the probe deleted one of the two");
+    let probed = if remaining == first { second } else { first };
+    assert_eq!(report.pruned, 2, "{report:?}");
     assert_eq!(
-        report.lines,
-        vec![format!(
-            "{}/{}:{remaining}",
+        report.pruned,
+        report.lines.len(),
+        "the probe counts and is listed: {report:?}"
+    );
+    assert!(
+        report.lines.contains(&format!(
+            "{}/{}:{probed}",
             mock.registry_name(),
             repo(PROJECT)
-        )]
+        )),
+        "the probed reference is listed: {report:?}"
+    );
+    assert_eq!(
+        report.lines,
+        vec![
+            format!("{}/{}:{probed}", mock.registry_name(), repo(PROJECT)),
+            format!("{}/{}:{remaining}", mock.registry_name(), repo(PROJECT)),
+        ]
     );
     assert_eq!(mock.delete_count(), 1);
     assert!(events(&ctx).await.is_empty(), "a dry run writes no events");
