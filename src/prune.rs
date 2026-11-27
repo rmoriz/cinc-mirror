@@ -339,7 +339,11 @@ pub struct PruneReport {
     /// References left for a later run: the budget, a failed listing, a denied
     /// delete and the tail of an abandoned project.
     pub deferred: usize,
-    /// Targets whose backend cannot delete; they are left alone.
+    /// Targets that could not be fully reconciled, by capability or by a
+    /// refusal; they are left alone and the run exits partially.
+    ///
+    /// A denied target is also counted in [`PruneReport::failed`] and raises
+    /// `prune_failed` in a run summary, where its exit code does not move.
     pub targets_skipped: Vec<String>,
     /// One `registry/repo:tag` (or `@digest`) line per planned deletion; filled
     /// on a dry run only. The probing deletion of a target is listed and
@@ -1179,6 +1183,7 @@ fn note_list_failure(
                 project, reason, "list denied; abandoning the project"
             );
             report.failed += 1;
+            note_skip(target, report);
             false
         }
         ListFailure::Failed(reason) => {

@@ -521,6 +521,11 @@ async fn a_403_aborts_the_project_and_leaves_the_budget_unspent() {
     assert_eq!(report.deferred, 0);
     assert_eq!(report.pruned, 0);
     assert_eq!(report.exit_code, EXIT_PARTIAL);
+    assert_eq!(
+        report.targets_skipped,
+        vec!["ghcr".to_string()],
+        "the refused listing names its target"
+    );
     assert!(mock.deleted().is_empty());
     assert_eq!(
         warnings().matches("abandoning the project").count(),
