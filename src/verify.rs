@@ -9,8 +9,9 @@
 //! The whole ledger is checked, including rows today's policies no longer
 //! select: narrowing `mirror` to 19+ must not silently stop checking the 18.x
 //! rows that were published earlier. A row whose publication to a target is
-//! `superseded` is skipped for that target — the canonical reference was
-//! deliberately retired by an acknowledged hash change.
+//! `superseded` or `pruned` is skipped for that target: the canonical reference
+//! was deliberately retired by an acknowledged hash change, or deleted on
+//! purpose by the prune.
 //!
 //! A row with no publication at all (a pending artifact, or one a tag
 //! collision excluded) has no remote state to compare against: it is not a
@@ -207,15 +208,22 @@ pub async fn run(ctx: &Ctx, opts: VerifyOpts) -> Result<VerifyReport, VerifyErro
         ledger.artifacts()?
     };
     // One pass over every selected target's publications learns two things:
-    // which (artifact, target) pairs were deliberately retired by an
-    // acknowledged hash change, and which artifacts were fanned out at all.
+    // which (artifact, target) pairs were deliberately retired and which
+    // artifacts were fanned out at all.
     let mut retired = HashSet::new();
     let mut fanned_out = HashSet::new();
     {
         let ledger = ctx.ledger.lock().await;
         for target in &targets {
             for publication in ledger.publications(target.name())? {
-                if publication.status == PublicationStatus::Superseded {
+                // Both statuses skip their target for different reasons:
+                // `superseded` because an acknowledged hash change retired the
+                // canonical reference, `pruned` because the prune deleted it on
+                // purpose. Neither is a mismatch to report.
+                if matches!(
+                    publication.status,
+                    PublicationStatus::Superseded | PublicationStatus::Pruned
+                ) {
                     retired.insert((publication.artifact_key.clone(), publication.target));
                 }
                 fanned_out.insert(publication.artifact_key);
@@ -242,6 +250,8 @@ pub async fn run(ctx: &Ctx, opts: VerifyOpts) -> Result<VerifyReport, VerifyErro
         }
 
         for target in &targets {
+            // `retired` holds both statuses: a target that lost its reference
+            // on purpose has nothing to compare.
             if retired.contains(&(artifact.key(), target.name().to_string())) {
                 continue;
             }

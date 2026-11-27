@@ -5,7 +5,8 @@ use std::path::Path;
 
 use assert_cmd::Command;
 use cinc_mirror::config::{
-    Config, ConfigError, ProjectPolicy, Selection, TargetAuth, TargetKind, TransportKind,
+    Config, ConfigError, DeleteMode, ProjectPolicy, Selection, TargetAuth, TargetKind,
+    TransportKind,
 };
 use predicates::prelude::*;
 
@@ -387,7 +388,7 @@ fn rejects_zero_concurrency() {
     assert!(
         matches!(
             error,
-            ConfigError::ZeroConcurrency {
+            ConfigError::ZeroValue {
                 field: "concurrency"
             }
         ),
@@ -681,6 +682,47 @@ fn unknown_toml_key_is_an_error() {
 }
 
 #[test]
+fn retention_defaults_are_off_and_automatic() {
+    let config = Config::default();
+    assert!(!config.retention.prune);
+    assert_eq!(config.retention.delete, DeleteMode::Auto);
+    assert_eq!(config.retention.max_deletions, 2000);
+    assert_eq!(config.retention.api_base, "https://api.github.com");
+}
+
+#[test]
+fn retention_delete_modes_parse_and_serialise() {
+    for (text, mode) in [
+        ("auto", DeleteMode::Auto),
+        ("registry", DeleteMode::Registry),
+        ("packages-api", DeleteMode::PackagesApi),
+    ] {
+        let config = validated(&format!("[retention]\ndelete = \"{text}\"\n"))
+            .expect("the delete mode must parse");
+        assert_eq!(config.retention.delete, mode);
+        assert_eq!(mode.to_string(), text);
+        let serialised = serde_json::to_value(&config.retention).expect("retention must serialise");
+        assert_eq!(serialised["delete"], text);
+    }
+}
+
+#[test]
+fn retention_rejects_an_unknown_delete_mode_and_a_zero_budget() {
+    for body in [
+        "[retention]\ndelete = \"s3\"\n",
+        "[retention]\nkeep_days = 3\n",
+    ] {
+        assert!(load_str(body).is_err(), "`{body}` must be rejected");
+    }
+    for body in [
+        "[retention]\nmax_deletions = 0\n",
+        "[retention]\napi_base = \" \"\n",
+    ] {
+        assert!(validated(body).is_err(), "`{body}` must be rejected");
+    }
+}
+
+#[test]
 fn missing_config_file_is_a_read_error() {
     let error = Config::load(Some(Path::new("definitely-not-a-config.toml")))
         .expect_err("an explicit config path must exist");
@@ -765,6 +807,9 @@ fn config_check_prints_policies_without_secrets() {
         .success()
         .stdout(predicate::str::contains("cinc-stable"))
         .stdout(predicate::str::contains("ghcr"))
+        .stdout(predicate::str::contains(
+            "retention: prune false, delete auto, max_deletions 2000",
+        ))
         .stdout(predicate::str::contains("password").not())
         .stdout(predicate::str::contains("token").not());
 }
@@ -812,6 +857,44 @@ fn usage_errors_exit_with_code_64() {
     binary().assert().code(64);
 
     binary().args(["config", "bogus"]).assert().code(64);
+}
+
+#[test]
+fn prune_names_a_target_that_is_not_an_oci_target() {
+    let root = tempfile::tempdir().expect("root");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let target_root = root.path().join("rsync");
+    std::fs::create_dir_all(&target_root).expect("target root");
+    let config = root.path().join("mirror.toml");
+    write!(
+        std::fs::File::create(&config).expect("config file"),
+        r#"state_dir = {state:?}
+
+[ledger]
+branch = "ledger"
+remote = "git@example.invalid:ledger.git"
+
+[[targets]]
+name = "rsync"
+kind = "rsync"
+url = {target_root:?}
+auth = "anonymous"
+"#
+    )
+    .expect("write config");
+
+    binary()
+        .arg("--config")
+        .arg(&config)
+        .args(["prune", "--target", "rsync"])
+        .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
+        .assert()
+        .code(64)
+        .stderr(
+            predicate::str::contains("rsync").and(predicate::str::contains("not an oci target")),
+        );
 }
 
 #[test]

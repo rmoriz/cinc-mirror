@@ -60,6 +60,12 @@ pub enum Command {
     Verify(VerifyArgs),
     /// Re-publish or re-fetch artifacts that need repair
     Repair(RepairArgs),
+    /// Delete publications the policy no longer selects
+    #[command(long_about = "Delete publications the policy no longer selects.\n\n\
+                      The command crawls upstream to learn what the policies still want, \
+                      then deletes what it still finds, at most `--limit` references per \
+                      target. It neither downloads nor publishes package bytes.")]
+    Prune(PruneArgs),
     /// Inspect and acknowledge integrity incidents
     Incidents {
         #[command(subcommand)]
@@ -92,6 +98,7 @@ impl Command {
             Self::Backfill(_) => "backfill",
             Self::Verify(_) => "verify",
             Self::Repair(_) => "repair",
+            Self::Prune(_) => "prune",
             Self::Incidents { .. } => "incidents",
             Self::Ledger { .. } => "ledger",
             Self::Targets { .. } => "targets",
@@ -226,7 +233,13 @@ pub struct RunArgs {
     #[arg(long)]
     pub gc_after: bool,
 
-    /// Report what would happen without downloading or publishing
+    /// Delete publications the policy no longer selects at the end of the run
+    /// (default: `[retention] prune`)
+    #[arg(long)]
+    pub prune: bool,
+
+    /// Report what would happen without downloading or publishing (a prune
+    /// deletes the first candidate per target as a capability probe)
     #[arg(long)]
     pub dry_run: bool,
 
@@ -244,6 +257,7 @@ impl RunArgs {
             max_bytes: self.limit_bytes,
             order: self.order.to_order(),
             gc_after: self.gc_after,
+            prune: self.prune,
             dry_run: self.dry_run,
             ..RunOpts::default()
         }
@@ -309,6 +323,11 @@ pub struct RepairArgs {
     #[arg(long = "limit", value_name = "N", value_parser = parse_positive)]
     pub limit: Option<usize>,
 
+    /// Also restore publications a prune deleted (re-downloads and re-publishes
+    /// them)
+    #[arg(long)]
+    pub include_pruned: bool,
+
     /// Print the report as JSON
     #[arg(long)]
     pub json: bool,
@@ -322,8 +341,35 @@ impl RepairArgs {
             targets: non_empty(&self.targets),
             projects: non_empty(&self.projects),
             limit: self.limit,
+            include_pruned: self.include_pruned,
         }
     }
+}
+
+/// Arguments to `prune`.
+#[derive(Debug, Args)]
+pub struct PruneArgs {
+    #[command(flatten)]
+    pub filters: ScopeFilterArgs,
+
+    /// Prune only these oci targets; repeatable (default: every enabled oci
+    /// target)
+    #[arg(long = "target", value_name = "NAME")]
+    pub targets: Vec<String>,
+
+    /// Delete at most this many references per target (default: `[retention]
+    /// max_deletions`)
+    #[arg(long = "limit", value_name = "N", value_parser = parse_positive)]
+    pub limit: Option<usize>,
+
+    /// Report what would be deleted without deleting (the first reference per
+    /// target is deleted for real to probe the endpoint)
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Print the report as JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `None` when the repeatable flag was not given at all.

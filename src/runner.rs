@@ -41,13 +41,18 @@
 //!
 //! The runner appends `run_started`, recovery, artifact, publication, incident
 //! and `run_finished` events to the in-memory ledger and returns a [`Summary`].
-//! It never takes the lease, writes the run file or pushes the ledger: the
-//! command layer owns the git commit (and can append its own lease metadata).
+//! A run that prunes reconciles the targets against the crawl after
+//! `collect_garbage`: it deletes the publications the policy no longer selects
+//! and appends `pruned`/`prune_failed` events. It never takes the lease, writes
+//! the run file or pushes the ledger: the command layer owns the git commit
+//! (and can append its own lease metadata).
 //! A dry run reads the ledger and the source, counts what it would do, and
-//! writes nothing at all.
+//! writes nothing at all. Its prune pass still lists every enabled target and
+//! deletes the first would-be deletion of each for real as a capability probe,
+//! so a dry run needs the target credentials and network access too.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering as Atomic};
 use std::sync::Arc;
 
@@ -66,6 +71,7 @@ use crate::ledger::{
     self, ArtifactRow, Event, EventKind, IncidentFilter, IncidentKind, Ledger, LedgerError,
     PublicationStatus,
 };
+use crate::prune::{self, Pass, PruneReport, Wanted};
 use crate::report::{Summary, EXIT_USAGE};
 use crate::source::metadata::Metadata;
 use crate::store::StoreError;
@@ -108,6 +114,13 @@ pub struct RunOpts {
     pub order: Order,
     /// Delete each blob once every enabled target reports success.
     pub gc_after: bool,
+    /// Delete publications the policy no longer selects at the end of the run;
+    /// a `[retention] prune` in the configuration is ORed in by [`run`].
+    pub prune: bool,
+    /// Also delete packages of projects no policy names any more. The command
+    /// layer sets it when neither a project nor a version filter narrows the
+    /// run.
+    pub sweep_orphans: bool,
     /// Plan and count without downloading, publishing or writing events.
     pub dry_run: bool,
     /// Start the queue just after this artifact key and wrap around. A backfill
@@ -179,15 +192,19 @@ impl RunError {
     }
 }
 
-/// Monotonic event sequence for one run.
-struct Seq(AtomicU64);
+/// Monotonic event sequence of one run.
+#[derive(Debug)]
+pub struct Seq(AtomicU64);
 
 impl Seq {
-    fn new(start: u64) -> Self {
+    /// Start at `start`.
+    #[must_use]
+    pub fn new(start: u64) -> Self {
         Self(AtomicU64::new(start))
     }
 
-    fn next(&self) -> u64 {
+    /// Hand out the next sequence number.
+    pub fn next(&self) -> u64 {
         self.0.fetch_add(1, Atomic::SeqCst)
     }
 }
@@ -740,7 +757,10 @@ impl Job<'_> {
 /// crawl, ledger, store or incident error that aborted the run. Other
 /// per-artifact download and target failures are counted in the summary instead
 /// of aborting.
-pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
+pub async fn run(ctx: &Ctx, mut opts: RunOpts) -> Result<Summary, RunError> {
+    // The CLI only fills the flag; the configuration switch is ORed in here so
+    // `backfill` inherits it as well.
+    opts.prune |= ctx.config.retention.prune;
     if opts.max_artifacts == Some(0) {
         return Err(RunError::Usage {
             reason: "--limit must be greater than zero".to_string(),
@@ -781,8 +801,11 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
         );
     }
 
-    let (candidates, collisions) = crawl_scope(ctx).await?;
+    let (candidates, collisions, crawl_skipped) = crawl_scope(ctx).await?;
     let discovered = candidates.len();
+    let prune_inputs = opts
+        .prune
+        .then(|| PruneInputs::collect(ctx, &candidates, &crawl_skipped, opts.sweep_orphans));
 
     let snapshot = {
         let ledger = ctx.ledger.lock().await;
@@ -835,15 +858,26 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
     }
 
     if opts.dry_run {
-        return Ok(Summary {
+        // The report-only pass runs before the return so the summary carries
+        // what a real run would delete; nothing is written, so it has no event
+        // sequence.
+        let pruned = prune_pass(ctx, None, &opts, prune_inputs.as_ref()).await;
+        let mut summary = Summary {
             discovered,
             satisfied,
             skipped,
             queued: queue.len(),
             open_incidents: open_incident_count(ctx).await?,
             ..Summary::default()
-        }
-        .finish());
+        };
+        // A dry run counts the probed reference like the rest of the plan it
+        // lists, so the report's own count is the whole answer.
+        summary.pruned = pruned.pruned;
+        summary.prune_failed = pruned.failed;
+        summary.prune_deferred = pruned.deferred;
+        summary.prune_skipped = pruned.targets_skipped.len();
+        summary.prune_lines = pruned.lines;
+        return Ok(summary.finish());
     }
 
     // A collision is an upstream anomaly, not a reason to stop the run: open
@@ -958,11 +992,20 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
     // Incidents opened by earlier runs still need a human; the summary names
     // them without changing the exit-code rule.
     summary.open_incidents = open_incident_count(ctx).await?;
-    let summary = summary.finish();
+    let mut summary = summary.finish();
 
     if opts.gc_after {
         collect_garbage(ctx, &seq, &snapshot, satisfied_gc, &reports, &queued_shas).await?;
     }
+
+    // The real pass runs on what is left after the local store was collected;
+    // its counts never move the exit code set above. It has to run before the
+    // `run_finished` event so the ledger carries the counts too.
+    let pruned = prune_pass(ctx, Some(&seq), &opts, prune_inputs.as_ref()).await;
+    summary.pruned = pruned.pruned;
+    summary.prune_failed = pruned.failed;
+    summary.prune_deferred = pruned.deferred;
+    summary.prune_skipped = pruned.targets_skipped.len();
 
     if !opts.dry_run {
         let outcome = if summary.incidents_opened > 0 {
@@ -1008,15 +1051,26 @@ pub async fn run(ctx: &Ctx, opts: RunOpts) -> Result<Summary, RunError> {
 
 /// Crawl every selected policy into a keyed candidate map, preserving the
 /// configuration order for tie-breaking, plus every tag collision found on
-/// the way.
+/// the way and the per-project count of skipped metadata documents.
 ///
 /// Two policies can still bring the same descriptive tag with different bytes
 /// (the same version number on two channels); the merged candidate set gets its
 /// own collision pass and the conflicting artifacts are excluded exactly like
 /// the ones a single crawl reported.
+///
+/// The skipped counts are kept per project, and a project that lost a document
+/// keeps its entry even when the crawl produced no artifacts for it: a prune
+/// must leave that project alone rather than read zero artifacts as "empty".
 async fn crawl_scope(
     ctx: &Ctx,
-) -> Result<(BTreeMap<String, (usize, Artifact)>, Vec<TagCollision>), RunError> {
+) -> Result<
+    (
+        BTreeMap<String, (usize, Artifact)>,
+        Vec<TagCollision>,
+        BTreeMap<String, usize>,
+    ),
+    RunError,
+> {
     // A qualified tag is a publication reference the ledger already knows: the
     // artifact was addressed under it by an earlier run. Handing the map to the
     // crawl keeps a published artifact where it is instead of moving it onto the
@@ -1028,8 +1082,10 @@ async fn crawl_scope(
     };
     let mut candidates = BTreeMap::new();
     let mut collisions = Vec::new();
+    let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
     for (index, policy) in ctx.scope.policies.iter().enumerate() {
         let outcome = crawl::crawl(&ctx.source, policy, &overrides).await?;
+        *skipped.entry(policy.project.clone()).or_insert(0) += outcome.skipped;
         for artifact in outcome.artifacts {
             candidates
                 .entry(artifact.key())
@@ -1046,7 +1102,106 @@ async fn crawl_scope(
     ) {
         collisions.push(collision);
     }
-    Ok((candidates, crawl::dedup_collisions(collisions)))
+    Ok((candidates, crawl::dedup_collisions(collisions), skipped))
+}
+
+/// The prune inputs a run derives from its crawl.
+///
+/// Both passes take them from the same value, so a report-only pass and the
+/// real pass that follows cannot disagree about what is wanted, held back or
+/// even in scope.
+struct PruneInputs<'a> {
+    /// Projects still in scope, deduplicated and sorted.
+    projects: Vec<&'a str>,
+    /// What the crawl still wants.
+    wanted: Wanted,
+    /// Crawled artifact count per project.
+    crawled: BTreeMap<String, usize>,
+    /// Projects whose crawl lost a document.
+    hold_back: HashSet<String>,
+    /// Every project the configuration names, enabled or not.
+    configured: HashSet<String>,
+    /// Whether packages of unconfigured projects are emptied too.
+    sweep_orphans: bool,
+}
+
+impl<'a> PruneInputs<'a> {
+    /// Derive the inputs from `candidates` and the per-project skipped counts.
+    fn collect(
+        ctx: &'a Ctx,
+        candidates: &BTreeMap<String, (usize, Artifact)>,
+        skipped: &BTreeMap<String, usize>,
+        sweep_orphans: bool,
+    ) -> Self {
+        let projects: Vec<&str> = ctx
+            .scope
+            .policies
+            .iter()
+            .map(|policy| policy.project.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut crawled = BTreeMap::new();
+        for (_, artifact) in candidates.values() {
+            *crawled.entry(artifact.project.clone()).or_insert(0) += 1;
+        }
+        let hold_back = skipped
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(project, _)| project.clone())
+            .collect();
+        let configured = ctx
+            .config
+            .projects
+            .iter()
+            .map(|policy| policy.project.clone())
+            .collect();
+        Self {
+            projects,
+            wanted: prune::wanted(
+                &candidates
+                    .values()
+                    .map(|(_, artifact)| artifact)
+                    .collect::<Vec<_>>(),
+            ),
+            crawled,
+            hold_back,
+            configured,
+            sweep_orphans,
+        }
+    }
+}
+
+/// Run the prune pass over the targets, unless the run does not prune.
+///
+/// `seq` is `None` for the report-only pass of a dry run, which must write no
+/// events. `skip` is `None` exactly when the run does not prune, so a plain run
+/// never builds the input sets. The returned report is folded into the summary
+/// by the caller.
+async fn prune_pass(
+    ctx: &Ctx,
+    seq: Option<&Seq>,
+    opts: &RunOpts,
+    skip: Option<&PruneInputs<'_>>,
+) -> PruneReport {
+    let Some(skip) = skip else {
+        return PruneReport::default();
+    };
+    prune::prune_targets(
+        ctx,
+        &Pass {
+            projects: &skip.projects,
+            wanted: &skip.wanted,
+            crawled: &skip.crawled,
+            hold_back: &skip.hold_back,
+            configured: &skip.configured,
+            sweep_orphans: skip.sweep_orphans,
+            dry_run: opts.dry_run,
+            budget: ctx.config.retention.max_deletions,
+            seq,
+        },
+    )
+    .await
 }
 
 /// How many incidents are still open, including the ones earlier runs opened.

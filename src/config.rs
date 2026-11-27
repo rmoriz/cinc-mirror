@@ -98,7 +98,7 @@ pub enum ConfigError {
     MetadataTransportNotHttps,
 
     #[error("`{field}` must be greater than zero")]
-    ZeroConcurrency { field: &'static str },
+    ZeroValue { field: &'static str },
 }
 
 /// Payload transports, in ladder order.
@@ -278,6 +278,87 @@ impl Default for IncidentConfig {
         Self {
             api_base: "https://api.github.com".to_string(),
             ignore_arch_collisions: Vec::new(),
+        }
+    }
+}
+
+/// How a deleted OCI publication is removed from a registry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeleteMode {
+    /// `packages-api` on GHCR and `registry` everywhere else.
+    #[default]
+    Auto,
+    /// The distribution API, which GHCR answers with `405`.
+    Registry,
+    /// The GitHub Packages API, the only delete path GHCR accepts.
+    #[serde(rename = "packages-api")]
+    PackagesApi,
+}
+
+impl fmt::Display for DeleteMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Auto => "auto",
+            Self::Registry => "registry",
+            Self::PackagesApi => "packages-api",
+        })
+    }
+}
+
+impl FromStr for DeleteMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "registry" => Ok(Self::Registry),
+            "packages-api" => Ok(Self::PackagesApi),
+            other => Err(format!(
+                "invalid delete mode `{other}`: expected auto, registry or packages-api"
+            )),
+        }
+    }
+}
+
+/// Deserialise a [`DeleteMode`] through its [`FromStr`] implementation.
+fn deserialize_delete_mode<'de, D>(deserializer: D) -> Result<DeleteMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    value.parse().map_err(de::Error::custom)
+}
+
+/// Which OCI publications the mirror keeps.
+///
+/// A publication is kept exactly while a policy still selects it; everything
+/// else in the crawl scope is deleted. Off by default, so an existing
+/// `mirror.toml` keeps publishing without ever deleting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RetentionConfig {
+    /// Delete publications the policy no longer selects.
+    pub prune: bool,
+    /// How a pruned publication is deleted.
+    #[serde(deserialize_with = "deserialize_delete_mode")]
+    pub delete: DeleteMode,
+    /// GitHub-compatible API root for the packages delete path.
+    ///
+    /// Like [`IncidentConfig::api_base`] it exists so a GitHub Enterprise
+    /// installation or a test can point somewhere else.
+    pub api_base: String,
+    /// Deletions allowed per target and run; the rest waits for the next run.
+    pub max_deletions: usize,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            prune: false,
+            delete: DeleteMode::Auto,
+            api_base: "https://api.github.com".to_string(),
+            max_deletions: 2000,
         }
     }
 }
@@ -550,6 +631,9 @@ pub struct Config {
     /// Incident issue filing endpoint.
     #[serde(default)]
     pub incident: IncidentConfig,
+    /// Retention policy for OCI publications.
+    #[serde(default)]
+    pub retention: RetentionConfig,
 }
 
 impl Default for Config {
@@ -571,6 +655,7 @@ impl Default for Config {
             targets: Vec::new(),
             issue_repo: None,
             incident: IncidentConfig::default(),
+            retention: RetentionConfig::default(),
         }
     }
 }
@@ -616,12 +701,12 @@ impl Config {
             });
         }
         if self.concurrency == 0 {
-            return Err(ConfigError::ZeroConcurrency {
+            return Err(ConfigError::ZeroValue {
                 field: "concurrency",
             });
         }
         if self.upload_concurrency == 0 {
-            return Err(ConfigError::ZeroConcurrency {
+            return Err(ConfigError::ZeroValue {
                 field: "upload_concurrency",
             });
         }
@@ -709,6 +794,29 @@ impl Config {
             }
         }
 
+        if self.retention.max_deletions == 0 {
+            return Err(ConfigError::ZeroValue {
+                field: "retention.max_deletions",
+            });
+        }
+        if self.retention.api_base.trim().is_empty() {
+            return Err(ConfigError::EmptyField {
+                context: "retention".to_string(),
+                field: "api_base",
+            });
+        }
+        if self.retention.prune
+            && !self
+                .targets
+                .iter()
+                .any(|target| target.enabled && target.kind == TargetKind::Oci)
+        {
+            tracing::warn!(
+                "`[retention] prune` is on but no enabled oci target exists; \
+                 this run deletes nothing"
+            );
+        }
+
         Ok(())
     }
 
@@ -717,7 +825,9 @@ impl Config {
     /// Policy ids are addressed as `<id>.<field>`; a bare key (or
     /// `ledger.<field>`) targets a global setting. An unknown policy id adds a
     /// policy that later overrides must complete. Values are syntax-checked but
-    /// the resulting configuration still needs [`Config::validate`].
+    /// the resulting configuration still needs [`Config::validate`]. The
+    /// `retention.*` fields are not settable this way; only a configuration
+    /// file or the `--prune` flag reaches them.
     pub fn apply_overrides(&mut self, overrides: &[String]) -> Result<(), ConfigError> {
         for raw in overrides {
             let (key, value) = raw

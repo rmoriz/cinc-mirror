@@ -19,12 +19,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use assert_cmd::Command as Binary;
 use async_trait::async_trait;
+use chrono::Utc;
 use cinc_mirror::artifact::Artifact;
 use cinc_mirror::config::{Config, Selection, TransportKind};
 use cinc_mirror::ctx::Ctx;
-use cinc_mirror::ledger::{Ledger, LedgerStore};
+use cinc_mirror::ledger::{EventKind, Ledger, LedgerStore};
 use cinc_mirror::net::RateLimiter;
+use cinc_mirror::prune;
 use cinc_mirror::repair::{self, RepairOpts};
 use cinc_mirror::runner::{self, RunOpts};
 use cinc_mirror::scope::{ResolvedPolicy, ResolvedScope};
@@ -36,6 +39,7 @@ use cinc_mirror::verify::{self, VerifyOpts};
 use common::mirror::{
     mock_registry, oci_target, package_artifact, raw_metadata, rsync_target, sha256_hex,
 };
+use common::packages::MockPackages;
 use serde_json::json;
 use url::Url;
 
@@ -302,6 +306,13 @@ async fn fixture() -> Fixture {
         state_dir: state.path().to_path_buf(),
         concurrency: 2,
         upload_concurrency: 2,
+        // `prune_targets` walks `config.targets`; the publishing `TargetSet`
+        // below is built separately.
+        targets: vec![common::mirror::oci_target_config(&mock, "oci")],
+        retention: cinc_mirror::config::RetentionConfig {
+            prune: true,
+            ..cinc_mirror::config::RetentionConfig::default()
+        },
         ..Config::default()
     };
     let scope = ResolvedScope {
@@ -467,6 +478,277 @@ async fn e2e_mirror_then_noop_then_repair() {
         .collect();
     assert_eq!(keys.len(), 2);
     let _ = json!({ "ok": true });
+}
+
+#[tokio::test]
+async fn e2e_prune_removes_a_stale_publication_a_denied_prune_exits_two() {
+    let mut fixture = fixture().await;
+    let repo = format!("{}/{}", common::mirror::NAMESPACE, common::mirror::PROJECT);
+
+    // A reference no policy selects any more: an old major line.
+    fixture
+        .mock
+        .store_manifest(&repo, "19.4.1", b"the package bytes of 19.4.1");
+
+    // The mirror run publishes both wanted artifacts and prunes the stale one.
+    let first = runner::run(&fixture.ctx, RunOpts::default())
+        .await
+        .expect("mirror run with prune");
+    assert_eq!(first.published, 4, "{first:?}");
+    assert_eq!(first.pruned, 1, "{first:?}");
+    assert_eq!(first.exit_code, 0, "{first:?}");
+    assert_eq!(fixture.mock.delete_count(), 1);
+    assert!(
+        fixture.mock.manifest(&repo, "19.4.1").is_none(),
+        "the stale reference is gone"
+    );
+    for spec in &fixture.specs {
+        let artifact = fixture.artifact(spec);
+        assert!(
+            fixture.mock.manifest(&repo, &artifact.tag()).is_some(),
+            "the wanted tag {} survives",
+            artifact.tag()
+        );
+    }
+
+    // A prune on its own, with the registry refusing deletes: one failure and
+    // exit code 2, and the stale reference stays.
+    fixture
+        .mock
+        .store_manifest(&repo, "19.4.1", b"the package bytes of 19.4.1");
+    fixture.mock.deny_deletes(&repo);
+
+    let artifacts: Vec<Artifact> = fixture
+        .specs
+        .iter()
+        .map(|spec| fixture.artifact(spec))
+        .collect();
+    let wanted = prune::wanted(&artifacts.iter().collect::<Vec<_>>());
+    let crawled = BTreeMap::from([(common::mirror::PROJECT.to_string(), artifacts.len())]);
+    let hold_back: HashSet<String> = HashSet::new();
+    let configured = HashSet::from([common::mirror::PROJECT.to_string()]);
+    let projects = vec![common::mirror::PROJECT];
+    let pass = prune::Pass {
+        projects: &projects,
+        wanted: &wanted,
+        crawled: &crawled,
+        hold_back: &hold_back,
+        configured: &configured,
+        sweep_orphans: false,
+        dry_run: false,
+        budget: 10,
+        seq: None,
+    };
+
+    fixture.start_run("e2e-prune-denied");
+    let denied = prune::prune_targets(&fixture.ctx, &pass).await;
+    assert_eq!(denied.pruned, 0, "{denied:?}");
+    assert!(denied.failed > 0, "{denied:?}");
+    assert_eq!(denied.exit_code, 2, "{denied:?}");
+    assert!(
+        fixture.mock.manifest(&repo, "19.4.1").is_some(),
+        "a denied prune leaves the reference alone"
+    );
+}
+
+/// A state directory with a bare ledger remote and a configuration for the
+/// binary `prune` command against `api_base`.
+///
+/// The configuration has no policies on purpose: the packages sweep then empties
+/// every package the mock holds and the command needs no upstream crawl, so the
+/// test stays offline. Returns the state directory (kept alive by the caller)
+/// and the configuration path.
+fn prune_layout(api_base: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let state = tempfile::tempdir().expect("state dir");
+    let remote = state.path().join("ledger.git");
+    let status = Process::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .arg(&remote)
+        .status()
+        .expect("run git init --bare");
+    assert!(status.success(), "git init --bare failed");
+
+    let config = state.path().join("mirror.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"state_dir = {state:?}
+
+[ledger]
+branch = "{LEDGER_BRANCH}"
+remote = "file://{remote}"
+
+[retention]
+delete = "packages-api"
+api_base = "{api_base}"
+
+[[targets]]
+name = "ghcr"
+kind = "oci"
+registry = "ghcr.io"
+namespace = "acme/mirror"
+auth = "anonymous"
+"#,
+            state = state.path(),
+            remote = remote.display(),
+        ),
+    )
+    .expect("write config");
+    (state, config)
+}
+
+/// Invoke the built binary on `config` and return its output.
+///
+/// The mock needs the runtime, so the tests use the multi-thread flavour: the
+/// blocking `output()` must not stop the only worker. Without `token` both
+/// credential variables are removed, so the target is ineligible.
+fn prune_binary(config: &Path, extra: &[&str], token: bool) -> std::process::Output {
+    let mut command = Binary::new(env!("CARGO_BIN_EXE_cinc-mirror"));
+    command
+        .arg("--config")
+        .arg(config)
+        .arg("--allow-unleased")
+        .arg("prune")
+        .args(extra);
+    if token {
+        command.env("GHCR_TOKEN", "ghcr-e2e-token");
+    } else {
+        command
+            .env_remove("GHCR_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("CINC_MIRROR_GHCR_API_TOKEN");
+    }
+    command.output().expect("run prune")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_binary_prune_reports_a_denied_delete_and_exits_two() {
+    let mock = MockPackages::start().await;
+    mock.seed_version("mirror/cinc", &["19.4.46"], Utc::now());
+    mock.seed_version("mirror/cinc", &["19.4.45"], Utc::now());
+    mock.fail_deletes_with(403);
+    let (state, config) = prune_layout(mock.base_url());
+
+    let output = prune_binary(&config, &[], true);
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert_eq!(output.status.code(), Some(2), "{stdout}{stderr}");
+    assert!(stdout.contains("pruned=0"), "{stdout}");
+    assert!(stdout.contains("failed=1"), "{stdout}");
+    assert!(
+        stdout.contains("skipped targets: ghcr"),
+        "a refused target is named:\n{stdout}"
+    );
+    assert_eq!(
+        mock.versions_for("mirror/cinc").len(),
+        2,
+        "a denied prune keeps both versions alive"
+    );
+    assert!(mock.deleted().is_empty());
+
+    // The run is committed and closed, so a denial is visible afterwards. A
+    // denied delete appends no per-reference event; the summary carries it.
+    let ledger = Ledger::open(state.path()).expect("ledger");
+    let events = ledger.events().expect("events");
+    let kinds: Vec<EventKind> = events.iter().map(|event| event.kind).collect();
+    assert!(kinds.contains(&EventKind::RunStarted), "{kinds:?}");
+    assert!(kinds.contains(&EventKind::RunFinished), "{kinds:?}");
+    let finished = events
+        .iter()
+        .find(|event| event.kind == EventKind::RunFinished)
+        .expect("a finished event");
+    assert_eq!(finished.detail["outcome"], json!("partial"));
+    assert_eq!(finished.detail["summary"]["prune_failed"], json!(1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_binary_prune_dry_run_plans_and_writes_no_event() {
+    let mock = MockPackages::start().await;
+    mock.seed_version("mirror/cinc", &["19.4.46"], Utc::now());
+    mock.seed_version("mirror/cinc", &["19.4.45"], Utc::now());
+    let (state, config) = prune_layout(mock.base_url());
+
+    let output = prune_binary(&config, &["--dry-run"], true);
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains("dry run: 2 reference(s) would be deleted"),
+        "the plan is listed and counted:\n{stdout}"
+    );
+    assert!(stdout.contains("ghcr.io/acme/mirror/cinc:"), "{stdout}");
+    assert_eq!(
+        mock.versions_for("mirror/cinc").len(),
+        1,
+        "the probe really deletes its first reference"
+    );
+
+    // Nothing is written: no run file, no event, no ledger row.
+    let ledger = Ledger::open(state.path()).expect("ledger");
+    assert!(
+        ledger.events().expect("events").is_empty(),
+        "a dry run writes no event"
+    );
+    let worktree = state.path().join("ledger-repo");
+    assert!(
+        worktree.join(".git").exists(),
+        "the ledger worktree exists:\n{stderr}"
+    );
+    assert!(
+        !worktree.join("runs").exists(),
+        "a dry run writes no run file"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_binary_prune_dry_run_json_carries_the_plan() {
+    let mock = MockPackages::start().await;
+    mock.seed_version("mirror/cinc", &["19.4.46"], Utc::now());
+    mock.seed_version("mirror/cinc", &["19.4.45"], Utc::now());
+    let (_state, config) = prune_layout(mock.base_url());
+
+    let output = prune_binary(&config, &["--dry-run", "--json"], true);
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("a JSON report");
+    assert_eq!(report["pruned"], json!(2), "{stdout}");
+    let references = report["references"].as_array().expect("the reference list");
+    assert_eq!(references.len(), 2, "{stdout}");
+    assert!(references.len() as u64 == report["pruned"].as_u64().unwrap_or(0));
+    assert!(
+        references.iter().all(|line| line
+            .as_str()
+            .is_some_and(|line| line.contains("mirror/cinc:"))),
+        "{stdout}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_binary_prune_without_a_token_stays_green_and_prunes_nothing() {
+    let mock = MockPackages::start().await;
+    mock.seed_version("mirror/cinc", &["19.4.46"], Utc::now());
+    let (_state, config) = prune_layout(mock.base_url());
+
+    let output = prune_binary(&config, &[], false);
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("pruned=0 failed=0 deferred=0 skipped=0 exit=0"),
+        "an ineligible target counts nowhere:\n{stdout}"
+    );
+    // Only the warning distinguishes it from a reconciled, empty target.
+    assert!(
+        stderr.contains(
+            "packages deletes need CINC_MIRROR_<TARGET>_API_TOKEN, GHCR_TOKEN or GITHUB_TOKEN"
+        ),
+        "{stderr}"
+    );
+    assert!(mock.versions_for("mirror/cinc").len() == 1);
 }
 
 #[tokio::test]

@@ -12,7 +12,7 @@ use std::process::Command;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use cinc_mirror::artifact::Artifact;
 use cinc_mirror::ledger::{
-    Event, EventKind, Ledger, LedgerFilesError, LedgerGitError, LedgerStore,
+    Event, EventKind, Ledger, LedgerFilesError, LedgerGitError, LedgerStore, PublicationStatus,
 };
 use serde_json::{json, Value};
 
@@ -393,6 +393,47 @@ fn load_all_reports_the_offending_line() {
         }
         other => panic!("expected a parse error, got {other:?}"),
     }
+}
+
+#[test]
+fn a_pruned_line_replays_and_stays_replayable() {
+    let fixture = Fixture::new();
+    let store = fixture.store("state");
+    store.sync().expect("bootstrap the ledger branch");
+
+    let artifact = artifact("19.5.0", 'a');
+    store
+        .write_run(&[
+            seen("run-1", 1, &artifact, 512),
+            published("run-1", 2, &artifact, "ghcr"),
+            Event::new("run-1", 3, ts_at(3), EventKind::Pruned)
+                .with_artifact(artifact.key())
+                .with_target("ghcr")
+                .with_detail(json!({
+                    "remote_ref": format!("ghcr.example/{}:tag", artifact.key()),
+                    "remote_digest": artifact.sha256,
+                })),
+        ])
+        .expect("write the run");
+
+    let state = fixture.state("state");
+    let mut ledger = Ledger::open(&state).expect("open the ledger");
+    assert_eq!(store.load_all(&mut ledger).expect("load"), 3);
+    let row = ledger
+        .publication(&artifact.key(), "ghcr")
+        .expect("publication query")
+        .expect("publication row");
+    assert_eq!(row.status, PublicationStatus::Pruned);
+
+    // Dropping the cache replays the same file, which must stay readable.
+    fs::remove_file(state.join("ledger.hwm")).expect("remove the high-water mark");
+    assert_eq!(store.load_all(&mut ledger).expect("replay"), 3);
+    let replayed = ledger
+        .publication(&artifact.key(), "ghcr")
+        .expect("publication query")
+        .expect("publication row");
+    assert_eq!(replayed.status, PublicationStatus::Pruned);
+    assert_eq!(replayed.remote_ref, row.remote_ref);
 }
 
 #[test]

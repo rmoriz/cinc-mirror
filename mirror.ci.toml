@@ -76,6 +76,10 @@ arches = "*"
 [incident]
 ignore_arch_collisions = ["omnibus-toolchain"]
 
+[retention]
+# Without this the registry only grows: the globs above are the policy.
+prune = true
+
 [ledger]
 branch = "ledger"
 remote = "origin"
